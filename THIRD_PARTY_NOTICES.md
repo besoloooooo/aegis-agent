@@ -54,9 +54,13 @@ licences:
 
 | Package   | License  |
 |-----------|----------|
+| openai    | MIT      |
 | typer     | MIT      |
 | rich      | MIT      |
 | pydantic  | MIT      |
+| pyfiglet  | MIT      |
+| prompt_toolkit | BSD-3-Clause |
+| wcwidth   | MIT      |
 
 Development-only dependencies (pytest, ruff, mypy, pytest-asyncio) are not
 distributed with the runtime and are listed under `[dependency-groups]`.

@@ -49,6 +49,22 @@ original work with no Hermes derivation.
 | `src/aegis_agent/tools/executor.py` (`_parse_arguments`) | **ADAPT** | `agent/message_sanitization.py` → `_repair_tool_call_arguments` (line 185) | Executor repairs malformed argument JSON before decoding instead of silently substituting `{}`. |
 | `src/aegis_agent/env.py` | **original** | — | Minimal `.env` loader (no dependency); used by CLI + `OpenAICompatibleProvider.from_env`. |
 
+## Stage 3 — live terminal UI & streaming output
+
+The streaming *plumbing* (provider → `ModelEvent` → `collect_response`) was
+already in place from Stage 2; the gap was that the runtime folded the whole
+stream into a final `ChatResponse` and the CLI only printed the assembled
+text after the turn ended.  This stage surfaces the in-flight stream to the
+terminal via an observer seam, and adds a presentation layer adapted from
+Hermes' UX.
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/events.py` (`collect_response` `on_event`) | **ADAPT** | `agent/chat_completion_helpers.py` (stream consumption) | Added a per-event `on_event` forwarder so a caller can observe the stream while it is still folded into one `ChatResponse`. Folding behaviour unchanged. |
+| `src/aegis_agent/runtime.py` (`TurnEvent`, `run_turn` `on_event`) | **REWRITE** | `agent/conversation_loop.py` (`_vprint`/`_buffer_vprint`/`_safe_print` live feedback) | A runtime-level `TurnEvent` stream (TEXT_DELTA / TOOL_CALL / TOOL_RESULT / TURN_END / ERROR) emitted alongside the existing loop. The runtime stays free of any UI dependency; it only calls an optional `on_event` callback. |
+| `src/aegis_agent/tui.py` (`_ThinkingRenderable`) | **ADAPT** | `agent/display.py` → `KawaiiSpinner` (lines 559-783) | Same kawaii data (braille frames + faces + "thinking verbs") but driven by a rich `Live` refresh loop via a `__rich__` renderable, instead of a daemon thread writing ``\r``. Skin engine + `patch_stdout` dropped. Attribution header retained. |
+| `src/aegis_agent/tui.py` (`Tui`, banner, `_render_tool_result`) | **REWRITE** | `hermes_cli/banner.py` (welcome banner), `agent/display.py` (tool preview lines), `cli.py` (prompt_toolkit `PromptSession` input) | Own ASCII block-letter "AEGIS" logo + teal palette (Hermes uses gold caduceus) so the two are visually distinct. Input uses a single prompt_toolkit `PromptSession` (full line editing: ←/→ cursor, Ctrl-A/E, ↑/↓ history) with a non-TTY `input()` fallback; no full-screen `Application`/`HSplit`/completion widget. Output via `rich` `Console` (panels, styled text). |
+
 ## Notes
 
 - Hermes files that were **inspected but not carried over** this stage

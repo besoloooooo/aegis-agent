@@ -16,7 +16,8 @@ import typer
 from aegis_agent import __version__
 from aegis_agent.env import load_dotenv
 from aegis_agent.exceptions import AegisError
-from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime, StopReason
+from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime
+from aegis_agent.tui import Tui
 
 app = typer.Typer(add_completion=False, help="Aegis Agent — minimal interactive agent runtime.")
 
@@ -61,7 +62,9 @@ def _main(
         max_iterations=max_iterations,
         allow_dangerous_shell=allow_dangerous_shell,
     )
-    _repl(runtime, session_id, label)
+    tui = Tui()
+    tui.banner(label=label, session_id=session_id)
+    _repl(runtime, session_id, tui)
 
 
 def _select_provider(model_flag: str):
@@ -69,7 +72,9 @@ def _select_provider(model_flag: str):
 
     'openai' forces the OpenAI-compatible provider (errors if unconfigured);
     'fake' forces the deterministic fake; 'auto' picks the real provider when
-    ``AEGIS_API_KEY`` and ``AEGIS_MODEL`` are set, otherwise the fake.
+    ``AEGIS_API_KEY`` and ``AEGIS_MODEL`` are set, otherwise the fake.  The
+    fake is built with ``chunk_text=True`` so the streaming path is visible in
+    the interactive demo (text arrives one character at a time).
     """
     from aegis_agent.models.openai_compat import ENV_API_KEY, ENV_MODEL
 
@@ -81,32 +86,28 @@ def _select_provider(model_flag: str):
 
         provider = OpenAICompatibleProvider.from_env()
         return provider, f"openai-compatible model '{provider.model}'"
-    return None, "fake model"  # None → AgentRuntime.with_defaults builds a FakeModelProvider
+    from aegis_agent.models.fake import FakeModelProvider
+
+    return FakeModelProvider(chunk_text=True), "fake model"
 
 
-def _repl(runtime: AgentRuntime, session_id: str, label: str) -> None:
-    """Read user lines, run turns, print replies until an exit command / EOF."""
-    typer.echo(f"Aegis Agent v{__version__} ({label}). Session '{session_id}'.")
-    typer.echo("Type a message, or 'read <path>' / 'list [dir]' / 'run <cmd>' to use tools. 'exit' to quit.")
+def _repl(runtime: AgentRuntime, session_id: str, tui: Tui) -> None:
+    """Read user lines, run turns, stream replies until an exit command / EOF."""
     while True:
-        try:
-            line = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            typer.echo("")
+        line = tui.prompt()
+        if line is None:  # EOF / Ctrl-C
             break
         if not line:
             continue
         if line.lower() in _EXIT_COMMANDS:
             break
         try:
-            result = runtime.run_turn(session_id, line)
+            state = tui.begin_turn()
+            runtime.run_turn(session_id, line, on_event=tui.on_event_factory(state))
         except AegisError as exc:
-            typer.echo(f"aegis> [error] {exc}")
+            tui.say(f"[error] {exc}")
             continue
-        typer.echo(f"aegis> {result.final_text}")
-        if result.stop_reason is StopReason.MAX_ITERATIONS:
-            typer.echo(f"       (stopped after {result.iterations} iterations)")
-    typer.echo("bye.")
+    tui.bye()
 
 
 def main() -> None:

@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
 from aegis_agent.context.builder import ContextBuilder
-from aegis_agent.events import collect_response
+from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
-from aegis_agent.models.base import Message, ModelProvider, Role
+from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.sessions.repository import SessionRepository
 from aegis_agent.tools.builtin import build_default_registry
@@ -93,6 +94,72 @@ class TurnResult:
     iterations: int = 0
     stop_reason: StopReason = StopReason.FINAL_ANSWER
     tool_calls_made: int = 0
+
+
+class TurnEventKind(str, Enum):
+    """The kinds of observable events emitted during one agent turn.
+
+    These are the runtime-level events a live UI subscribes to.  They wrap the
+    model-facing :class:`~aegis_agent.events.ModelEvent` stream (text deltas,
+    tool-call requests) and add tool-execution lifecycle events (a tool result
+    landing) plus a terminal ``TURN_END``.  The runtime emits them in order;
+    a UI that renders them as they arrive reproduces the streamed experience
+    without the runtime knowing anything about rendering.
+    """
+
+    TEXT_DELTA = "text_delta"        # incremental assistant text
+    TOOL_CALL = "tool_call"          # a complete tool-call request from the model
+    TOOL_RESULT = "tool_result"      # a tool finished (success or error)
+    TURN_END = "turn_end"            # the whole turn finished (stop reason set)
+    ERROR = "error"                  # a runtime/loop error occurred
+
+
+@dataclass
+class TurnEvent:
+    """One observable turn event.  Exactly one payload field is set per kind.
+
+    ``TEXT_DELTA``/``TOOL_CALL`` mirror the wrapped :class:`ModelEvent` so a UI
+    can treat them uniformly; ``TOOL_RESULT`` carries the executed
+    :class:`~aegis_agent.models.base.ToolResult`; ``TURN_END`` carries the
+    :class:`StopReason` name; ``ERROR`` carries a message.
+    """
+
+    kind: TurnEventKind
+    text: str = ""
+    tool_call: ToolCall | None = None
+    tool_result: ToolResult | None = None
+    stop_reason: str | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_model_event(cls, event: ModelEvent) -> TurnEvent | None:
+        """Map a model event to a turn event, or ``None`` to skip it.
+
+        ``TEXT_DELTA`` and ``TOOL_CALL`` are forwarded; ``ERROR`` becomes an
+        ``ERROR`` turn event.  The provider's terminal ``DONE`` event carries
+        only the finish reason, which the runtime surfaces itself as the final
+        ``TURN_END`` (with the resolved :class:`StopReason`) — so ``DONE`` maps
+        to ``None`` to avoid a spurious premature ``TURN_END``.
+        """
+        if event.kind is ModelEventKind.TEXT_DELTA:
+            return cls(kind=TurnEventKind.TEXT_DELTA, text=event.text)
+        if event.kind is ModelEventKind.TOOL_CALL:
+            return cls(kind=TurnEventKind.TOOL_CALL, tool_call=event.tool_call)
+        if event.kind is ModelEventKind.ERROR:
+            return cls(kind=TurnEventKind.ERROR, error=event.error)
+        return None  # DONE (and any future non-UI kind)
+
+    @classmethod
+    def from_tool_result(cls, result: ToolResult) -> TurnEvent:
+        return cls(kind=TurnEventKind.TOOL_RESULT, tool_result=result)
+
+    @classmethod
+    def turn_end(cls, stop_reason: StopReason) -> TurnEvent:
+        return cls(kind=TurnEventKind.TURN_END, stop_reason=stop_reason.value)
+
+    @classmethod
+    def failed(cls, error: str) -> TurnEvent:
+        return cls(kind=TurnEventKind.ERROR, error=error)
 
 
 class AgentRuntime:
@@ -169,6 +236,7 @@ class AgentRuntime:
         user_message: str,
         *,
         interrupt: threading.Event | None = None,
+        on_event: Callable[[TurnEvent], None] | None = None,
     ) -> TurnResult:
         """Run one user turn: persist input, loop model↔tools, return the result.
 
@@ -177,6 +245,11 @@ class AgentRuntime:
         history, calls the model, persists the assistant message, and either
         finishes (no tool calls) or executes the requested tools, persists
         their results, and loops.
+
+        When ``on_event`` is given it receives one :class:`TurnEvent` per
+        streamed model event (text deltas, tool-call requests) plus a
+        ``TOOL_RESULT`` event per executed tool and a terminal ``TURN_END``.
+        This is the seam the live TUI hooks into; it is otherwise inert.
         """
         if self._repository.get_session(session_id) is None:
             self._repository.create_session(session_id)
@@ -188,6 +261,12 @@ class AgentRuntime:
         tool_calls_made = 0
         final_text = ""
         stop_reason = StopReason.FINAL_ANSWER
+
+        def _emit(event: ModelEvent) -> None:
+            if on_event is not None:
+                te = TurnEvent.from_model_event(event)
+                if te is not None:
+                    on_event(te)
 
         while True:
             # Guard 1: cooperative interrupt.
@@ -211,6 +290,7 @@ class AgentRuntime:
                 response = collect_response(
                     self._provider.stream(api_messages, tools=self._registry.definitions()),
                     is_cancelled=is_cancelled,
+                    on_event=_emit,
                 )
             except OperationCancelled:
                 # Interrupt fired mid-stream: discard the partial response.
@@ -219,6 +299,8 @@ class AgentRuntime:
             except ModelProviderError as exc:
                 final_text = f"(model error: {exc})"
                 stop_reason = StopReason.ERROR
+                if on_event is not None:
+                    on_event(TurnEvent.failed(str(exc)))
                 break
 
             assistant = Message(role=Role.ASSISTANT, content=response.content, tool_calls=response.tool_calls)
@@ -232,9 +314,14 @@ class AgentRuntime:
 
             tool_calls_made += len(response.tool_calls)
             results = self._executor.execute(response.tool_calls)
-            for tool_message in self._executor.to_messages(results):
+            for tool_message, result in zip(self._executor.to_messages(results), results):
                 self._persist(session_id, tool_message)
+                if on_event is not None:
+                    on_event(TurnEvent.from_tool_result(result))
             # loop continues: the tool results are now in history for the next call
+
+        if on_event is not None:
+            on_event(TurnEvent.turn_end(stop_reason))
 
         return TurnResult(
             final_text=final_text,
@@ -256,5 +343,7 @@ __all__ = [
     "AgentRuntime",
     "IterationBudget",
     "StopReason",
+    "TurnEvent",
+    "TurnEventKind",
     "TurnResult",
 ]

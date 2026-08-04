@@ -62,6 +62,7 @@ def collect_response(
     events: Iterable[ModelEvent],
     *,
     is_cancelled: Callable[[], bool] | None = None,
+    on_event: Callable[[ModelEvent], None] | None = None,
 ) -> ChatResponse:
     """Fold a stream of events into one :class:`ChatResponse`.
 
@@ -75,11 +76,21 @@ def collect_response(
     is raised so the partially-streamed response is discarded rather than
     returned.  This lets a Ctrl+C / cancel event interrupt a long stream
     mid-flight, not just between model calls.
+
+    When ``on_event`` is provided, every event is forwarded to it *as it
+    arrives*, before being folded.  This is the seam a live UI hooks into to
+    render streamed text and tool calls incrementally — the runtime still
+    receives one fully-assembled :class:`ChatResponse` (so persistence/loop
+    logic is unchanged), but the caller can observe the flow.  ``on_event`` is
+    invoked *before* ``is_cancelled`` is polled for that event, and is NOT
+    invoked for the synthetic nothing-to-fold case.
     """
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     finish_reason = "stop"
     for event in events:
+        if on_event is not None:
+            on_event(event)
         if is_cancelled is not None and is_cancelled():
             raise OperationCancelled("model stream cancelled by interrupt")
         if event.kind is ModelEventKind.TEXT_DELTA:
