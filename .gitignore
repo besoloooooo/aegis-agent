@@ -11,3 +11,6 @@ wheels/
 
 # Local secrets / environment (never commit)
 .env
+
+# Windows NTFS alternate-data-stream artifacts that materialise as files in WSL
+*:Zone.Identifier
