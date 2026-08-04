@@ -1,0 +1,36 @@
+[project]
+name = "aegis-agent"
+version = "0.1.0"
+description = "Aegis Agent — a lightweight, recoverable, extensible Agent Runtime."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.52.0",
+    "pydantic>=2.13.4",
+    "rich>=15.0.0",
+    "typer>=0.27.0",
+]
+
+[project.scripts]
+aegis = "aegis_agent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so `import tests.fakes` (shared test doubles)
+# resolves without installing the tests package.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "integration: opt-in tests that hit a real model endpoint (need AEGIS_RUN_INTEGRATION + AEGIS_* config)",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.1",
+]
