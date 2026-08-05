@@ -5,19 +5,19 @@ extracting, simplifying, and modularizing the core runtime behaviour of
 [Hermes](https://github.com/NousResearch/hermes-agent) (© 2025 Nous Research,
 MIT — see `THIRD_PARTY_NOTICES.md`).
 
-## Status: Stage 5 — lightweight MCP client (all 5 planned stages complete)
+## Status: Stage 5 — core runtime complete with skills + MCP
 
-Five milestones have been delivered:
+Five milestones delivered; more planned (see `docs/extraction-plan.md` §7).
 
 | Stage | Theme | Highlights |
-|---|---|---|
+|---|---|---|---|
 | 1 | Minimal Agent Runtime skeleton | Fake provider, in-memory sessions, 3 builtin tools, Agent Loop |
 | 2 | OpenAI-compatible provider & streaming | Real provider, tool-call fragment assembly, dangerous-command guardrail, message sanitization |
 | 3 | Live terminal UI | prompt_toolkit input, rich output, pyfiglet banner, kaomoji spinner |
-| 4 | Skills subsystem | SKILL.md discovery/loading/routing, `skills_list`/`skill_view` tools, `/skill-name` slash commands, `SystemPromptBuilder` + `PromptContributor` dynamic prompt injection |
-| 5 | Lightweight MCP client | stdio + Streamable HTTP, three-stage schema normalization pipeline, `MCPToolWrapper` registered into the tool registry, `mcp` SDK as optional dependency |
+| 4 | Skills subsystem | SKILL.md discovery/loading/routing, `skills_list`/`skill_view` tools, slash commands, dynamic prompt injection |
+| 5 | Lightweight MCP client | stdio + HTTP transports, schema normalization, MCPToolWrapper, optional `mcp` SDK |
 
-Still planned (next milestone): SQLite session storage + checkpoint/tail recovery + leases.
+Still planned: SQLite persistence + checkpoint recovery, context compression, session leases, concurrent tool execution, oversized-tool-result storage, MCP reconnect & circuit breaker.
 
 ## What's here
 

@@ -385,72 +385,55 @@ Aegis 通过**依赖注入 + 单向分层**（§5 依赖方向）根除这些环
 
 ---
 
-## 7. 分阶段实施计划
+## 7. 未完成计划（文档顺序不代表完成顺序）
 
-> 原则：每个阶段独立可验证；一次只做当前阶段；不自动进入下一阶段。
 > 验收命令统一为 `uv run pytest -q` 与 `uv run ruff check .`（在 aegis-agent 目录）。
 
-### 阶段 1 — 最小垂直链路（Fake provider + 内存会话）
+### ✅ 已完成
 
-- **范围**：CLI（Typer 交互 + `--resume` 占位）、`ModelProvider` Protocol、`FakeModelProvider`、Agent Loop（守卫/预算/多轮/正常终止）、`ToolRegistry`、`ToolExecutor`、`read_file`/`list_directory`/`run_shell`、`InMemorySessionRepository`、数据结构（Message/ToolCall/ChatResponse）、`context.builder`（源→派生 api_messages）、端到端 Fake 测试。
-- **明确不做**：真实 provider、SQLite/Redis、压缩、超大结果外置、租约、Skill、并发工具、guardrails。
-- **输入**：用户一行文本；Fake provider 的脚本化响应。
-- **输出**：最终回复文本；内存中的持久化消息序列。
-- **验收命令**：`uv run pytest -q`、`uv run ruff check .`。
-- **验收测试**：① 单轮文本回复；② 一次工具调用→结果回灌→最终回复；③ 多轮工具循环直到无工具调用；④ max_iterations 触发即停；⑤ 幂等：同一 `client_msg_id` 只持久化一次；⑥ 源 messages 在构建 context 后不被修改。
-- **对下一阶段依赖**：定义稳定 `ModelProvider`/`Tool`/`SessionRepository` 接口与数据结构。
+| 阶段 | 内容 | 对应 milestone |
+|---|---|---|
+| 阶段 1 | 最小垂直链路（Fake + 内存会话 + Agent Loop + builtin tools） | Stage 1 |
+| 阶段 3 | OpenAI-compatible provider + 流式 + 消息净化 | Stage 2 |
+| — | 交互式终端 UI（prompt_toolkit + rich + 流式输出） | Stage 3（新增） |
+| 阶段 7 | Skills 子系统（SKILL.md 发现/加载/路由、`skills_list`/`skill_view`、`/skill-name` 斜杠命令、SystemPromptBuilder 动态注入） | Stage 4（超出原计划） |
+| — | 轻量 MCP 客户端（stdio + Streamable HTTP、schema adapter、MCPToolWrapper、PromptContributor） | Stage 5（新增） |
+| 阶段 4 | 危险命令护栏（`run_shell` 销毁性命令拦截） | Stage 2（部分，未全部完成） |
 
-### 阶段 2 — SQLite 会话持久化 + checkpoint/tail + resume
+### ❌ 未完成
+
+#### SQLite 会话持久化 + checkpoint/tail + resume
 
 - **范围**：`SessionRepository` 的 SQLite 实现（messages/sessions/snapshots 精简 schema）、`append_message` 幂等（`ON CONFLICT DO NOTHING`）、`seq` 单调、快照写/载（CRC+zlib+history_version）、`resume`（checkpoint+tail，损坏回退全量回放）、CLI `--resume` 真正接线。
 - **明确不做**：FTS、租约、压缩旋转、Redis。
-- **输入**：阶段 1 的接口；既有 session 文件。
-- **输出**：可重启恢复的会话。
-- **验收命令**：同上 + 针对 SQLite 的测试。
 - **验收测试**：① checkpoint 恢复 == 全量回放；② 损坏 checkpoint 安全回退；③ 单调 `seq`；④ 无跨会话历史；⑤ 重启后 `--resume` 恢复历史。
-- **对下一阶段依赖**：`SessionRepository` 持久化语义稳定。
 
-### 阶段 3 — OpenAI-compatible provider + 流式
+#### 工具增强：并发执行 + 超大结果外置
 
-- **范围**：`models/openai_compat.py`（真实 OpenAI 兼容端点）、`models/stream.py` 流式 assembler（文本 delta 累积 + tool_call name 赋值/args 拼接/Ollama slot 修复/JSON 修复）、统一 ChatResponse、流式文本回调到 CLI。
-- **明确不做**：多 provider、failover、aux client、prompt caching。
-- **输入**：`ModelProvider` 接口；base_url/api_key/model。
-- **输出**：流式文本 + 完整 tool calls。
-- **验收命令**：同上（provider 用 fake HTTP / 录制响应，不打真实付费 API；可选集成测试单独标记）。
-- **验收测试**：① tool_call 片段正确拼接成合法 JSON；② name 不被重复拼接；③ 流式与伪非流式产出等价；④ 中断时部分结果被丢弃且不污染历史。
-- **对下一阶段依赖**：真实模型可用 → 后续压缩/工具阶段可端到端。
+- **范围**：并发工具执行（ThreadPoolExecutor）、超大结果三层（工具内 cap → 外置存储 + 预览 → 聚合预算）、`_maybe_wrap_untrusted`。
+- **已做**：危险命令护栏（`tools/danger.py`）、参数 JSON 修复（`sanitize.py:repair_tool_call_arguments`）、异常→`{"error":...}` 结果（`ToolExecutor`）。
+- **未做**：并发执行、`ToolGuardrails`（重复工具/无进展熔断）、超大结果外置存储 + 预览、聚合预算。
 
-### 阶段 4 — 工具增强 + guardrails + 超大结果外置
+#### 层级上下文压缩
 
-- **范围**：参数矫正、并发执行（可选）、`ToolGuardrails`（重复工具/无进展熔断）、超大结果三层（工具内 cap → 外置存储 + 预览 → 聚合预算）、`_maybe_wrap_untrusted`。
-- **明确不做**：MCP、Tool Search、ACP 审批、其余 Hermes 工具。
-- **验收测试**：① 重复相同工具调用 N 次被熔断；② 超大结果被外置且上下文内是预览；③ 工具异常转为 `{"error":...}` 不中断 loop。
-- **对下一阶段依赖**：稳定 ToolExecutor 语义。
+- **范围**：`context/compression.py` 分阶段压缩（prune 旧 tool 结果 → token 边界 → 滚动摘要 → head+summary+tail）、token 阈值触发、**原文保留**、压缩只影响发给模型的 context。
+- **验收测试**：① 超过阈值触发压缩；② 原文 messages 不被修改；③ 压缩后恢复 == 全量回放；④ 摘要失败时不变更。
 
-### 阶段 5 — 层级上下文压缩
-
-- **范围**：`context/compression.py` 分阶段压缩（prune 旧 tool 结果 → token 边界 → 滚动摘要 → head+summary+tail）、token 阈值触发、**原文保留**（父会话/独立存储）、压缩只影响发给模型的 context。
-- **明确不做**：离线 trajectory 压缩、多 provider 摘要。
-- **验收测试**：① 超过阈值触发压缩；② 原文 messages 不被修改；③ 压缩后恢复 == 全量回放（不变量）；④ 摘要失败时不变更。
-- **对下一阶段依赖**：原文/派生分离不变量。
-
-### 阶段 6 — 会话租约（SQLite + Redis）
+#### 会话租约（SQLite + Redis）
 
 - **范围**：`LeaseBackend` Protocol、SQLite 租约（INSERT OR IGNORE + owner_token）、Redis 租约（SET NX PX + Lua）、`SessionLeaseManager` 心跳 + 熔断 + `switch_session`。
-- **明确不做**：压缩锁的高级用法。
 - **验收测试**：① 同一 session 仅一个 owner；② TTL 过期可回收；③ 心跳失败触发熔断并停止写入；④ Redis 不可用不静默回退 SQLite。
-- **对下一阶段依赖**：持久化层稳定。
 
-### 阶段 7 — 轻量 Skill 加载与路由
-
-- **范围**：SKILL.md frontmatter 解析、发现（排除 venv/VCS/cache）、`skills_list`/`skill_view` 工具、按需注入上下文。
-- **明确不做**：inline-shell、模板变量、telemetry、slash 命令、预载。
-- **验收测试**：① 发现并列出 skills；② `skill_view` 注入正文；③ 平台/环境过滤生效。
-
-### 阶段 8 — 可靠性与并发测试
+#### 可靠性与并发测试（不完全——核心不变量测试已有，非核心未补）
 
 - **范围**：不变量测试套件（CLAUDE.md §9）：单消息幂等、会话内单调、无重复模型请求、无重复工具结果、无跨会话历史、单一租约 owner、checkpoint 恢复 == 全量回放、损坏 checkpoint 安全回退、压缩后原文不变。
-- **验收命令**：`uv run pytest -q`。
+- **已做**：幂等、单调、会话隔离、context 不改原文、provider 不污染 runtime（守卫测试）。
+- **未做**：租约/checkpoint/压缩相关——需等对应功能实现后才能测。
+
+#### MCP 增强（新增需求）
+
+- **范围**：重连机制（server 断开后自动恢复）、断路器（连续失败降级）、`tools/list_changed` 动态刷新。
+- **当前**：连接成功时工具固定，server 断开后调用直接报错。
 
 ---
 
