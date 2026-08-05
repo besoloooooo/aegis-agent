@@ -59,6 +59,8 @@ licences:
 | rich      | MIT      |
 | pydantic  | MIT      |
 | pyfiglet  | MIT      |
+| pyyaml    | MIT      |
+| mcp (optional) | MIT      |
 | prompt_toolkit | BSD-3-Clause |
 | wcwidth   | MIT      |
 

@@ -14,41 +14,63 @@ fresh, derived view on every model call — prepending the system prompt and
 dropping internal bookkeeping fields (``client_msg_id``, ``seq``) that must not
 leak to the model.  Context compression (a later stage) will only ever alter
 this derived view, never the originals.
+
+The system prompt is produced by a :class:`SystemPromptBuilder` (see
+``system_prompt.py``), re-rendered on every call so contributed sections (e.g.
+the skills index) stay in sync with current state.  For back-compatibility the
+constructor still accepts a plain string.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+from aegis_agent.context.system_prompt import DEFAULT_IDENTITY, SystemPromptBuilder
 from aegis_agent.models.base import Message, Role
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are Aegis Agent, a helpful assistant. You can call the provided "
-    "tools to read files, list directories, and run shell commands when that "
-    "helps answer the user. Otherwise answer directly."
-)
+#: Retained for back-compatibility (older callers/tests import this name).
+#: Identical to :data:`~aegis_agent.context.system_prompt.DEFAULT_IDENTITY`.
+DEFAULT_SYSTEM_PROMPT = DEFAULT_IDENTITY
 
 
 class ContextBuilder:
     """Derive the per-call message list from the source-of-truth history."""
 
-    def __init__(self, system_prompt: str | None = None) -> None:
-        self._system_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+    def __init__(self, system_prompt: str | SystemPromptBuilder | None = None) -> None:
+        """Configure the system-prompt source.
+
+        Accepts a :class:`SystemPromptBuilder` (the dynamic path), a plain
+        string (wrapped into a builder with no contributors), or ``None`` (the
+        default identity).  An empty string disables the system message.
+        """
+        if isinstance(system_prompt, SystemPromptBuilder):
+            self._prompt_builder = system_prompt
+        elif system_prompt is None:
+            self._prompt_builder = SystemPromptBuilder()
+        else:
+            self._prompt_builder = SystemPromptBuilder(identity=system_prompt)
+
+    @property
+    def prompt_builder(self) -> SystemPromptBuilder:
+        return self._prompt_builder
 
     @property
     def system_prompt(self) -> str:
-        return self._system_prompt
+        """The system prompt as it renders right now (identity + contributors)."""
+        return self._prompt_builder.build()
 
     def build(self, messages: Sequence[Message]) -> list[Message]:
         """Return a new derived list: system prompt + cleaned copies of history.
 
         The input sequence and its messages are left untouched.  Each returned
         message is a copy with internal fields (``client_msg_id``, ``seq``)
-        cleared.
+        cleared.  The system prompt is rendered fresh so any dynamic
+        contributor sections reflect current state.
         """
         derived: list[Message] = []
-        if self._system_prompt:
-            derived.append(Message(role=Role.SYSTEM, content=self._system_prompt))
+        system_prompt = self._prompt_builder.build()
+        if system_prompt:
+            derived.append(Message(role=Role.SYSTEM, content=system_prompt))
         for message in messages:
             derived.append(self._derive(message))
         return derived
@@ -67,4 +89,4 @@ class ContextBuilder:
         )
 
 
-__all__ = ["DEFAULT_SYSTEM_PROMPT", "ContextBuilder"]
+__all__ = ["DEFAULT_SYSTEM_PROMPT", "ContextBuilder", "SystemPromptBuilder"]

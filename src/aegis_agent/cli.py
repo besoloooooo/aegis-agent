@@ -41,6 +41,18 @@ def _main(
         "--allow-dangerous-shell",
         help="Operator-only: allow run_shell to execute commands matching the dangerous list. Use with care.",
     ),
+    skills_dir: str = typer.Option(
+        None,
+        "--skills-dir",
+        help="Directory to load skills from (default: $AEGIS_SKILLS_DIR or ~/.aegis/skills).",
+    ),
+    no_skills: bool = typer.Option(False, "--no-skills", help="Disable skill loading and routing."),
+    mcp_config: str = typer.Option(
+        None,
+        "--mcp-config",
+        help="Path to MCP server config (default: ~/.aegis/config.yaml).",
+    ),
+    no_mcp: bool = typer.Option(False, "--no-mcp", help="Disable MCP server discovery."),
     version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
 ) -> None:
     """Start the interactive Aegis Agent REPL (default action)."""
@@ -61,9 +73,13 @@ def _main(
         provider=provider,
         max_iterations=max_iterations,
         allow_dangerous_shell=allow_dangerous_shell,
+        enable_skills=not no_skills,
+        skills_dir=skills_dir,
+        enable_mcp=not no_mcp,
+        mcp_config_path=mcp_config,
     )
     tui = Tui()
-    tui.banner(label=label, session_id=session_id)
+    tui.banner(label=label, session_id=session_id, startup_info=runtime.startup_info)
     _repl(runtime, session_id, tui)
 
 
@@ -101,13 +117,33 @@ def _repl(runtime: AgentRuntime, session_id: str, tui: Tui) -> None:
             continue
         if line.lower() in _EXIT_COMMANDS:
             break
+        turn_input = _maybe_route_skill(runtime, line, tui)
         try:
             state = tui.begin_turn()
-            runtime.run_turn(session_id, line, on_event=tui.on_event_factory(state))
+            runtime.run_turn(session_id, turn_input, on_event=tui.on_event_factory(state))
         except AegisError as exc:
             tui.say(f"[error] {exc}")
             continue
     tui.bye()
+
+
+def _maybe_route_skill(runtime: AgentRuntime, line: str, tui: Tui) -> str:
+    """Expand a ``/skill-name [instruction]`` line into the skill's activation message.
+
+    A leading ``/`` whose first token resolves to a known skill is replaced by
+    the router's invocation message (activation note + skill body).  Anything
+    else — including a ``/token`` that matches no skill — is passed through
+    unchanged so the model sees exactly what the user typed.
+    """
+    router = runtime.skill_router
+    if router is None or not line.startswith("/"):
+        return line
+    token, _, instruction = line[1:].partition(" ")
+    skill = router.resolve(token)
+    if skill is None:
+        return line
+    tui.say(f"[skill] activating '{skill.name}'")
+    return router.invocation_message(skill, instruction)
 
 
 def main() -> None:

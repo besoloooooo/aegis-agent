@@ -5,24 +5,21 @@ extracting, simplifying, and modularizing the core runtime behaviour of
 [Hermes](https://github.com/NousResearch/hermes-agent) (© 2025 Nous Research,
 MIT — see `THIRD_PARTY_NOTICES.md`).
 
-## Status: Stage 2 — real model provider & streaming tool calls
+## Status: Stage 5 — lightweight MCP client (all 5 planned stages complete)
 
-The runtime drives a full model↔tool loop.  Stage 1 delivered the minimal
-vertical slice (fake provider, in-memory sessions); Stage 2 adds a real
-OpenAI-compatible provider and streaming with tool-call fragment assembly:
+Five milestones have been delivered:
 
-```
-user input
-  → ModelProvider produces a tool call (streaming, args assembled from fragments)
-  → ToolExecutor runs the tool(s)
-  → tool result(s) are back-filled into history
-  → ModelProvider continues, eventually producing the final answer
-```
+| Stage | Theme | Highlights |
+|---|---|---|
+| 1 | Minimal Agent Runtime skeleton | Fake provider, in-memory sessions, 3 builtin tools, Agent Loop |
+| 2 | OpenAI-compatible provider & streaming | Real provider, tool-call fragment assembly, dangerous-command guardrail, message sanitization |
+| 3 | Live terminal UI | prompt_toolkit input, rich output, pyfiglet banner, kaomoji spinner |
+| 4 | Skills subsystem | SKILL.md discovery/loading/routing, `skills_list`/`skill_view` tools, `/skill-name` slash commands, `SystemPromptBuilder` + `PromptContributor` dynamic prompt injection |
+| 5 | Lightweight MCP client | stdio + Streamable HTTP, three-stage schema normalization pipeline, `MCPToolWrapper` registered into the tool registry, `mcp` SDK as optional dependency |
 
-Still out of scope (later stages): SQLite/Redis, resume/checkpoint, context
-compression, skills.
+Still planned (next milestone): SQLite session storage + checkpoint/tail recovery + leases.
 
-### What's here
+## What's here
 
 | Area | Module | Notes |
 |---|---|---|
@@ -37,9 +34,12 @@ compression, skills.
 | Builtin tools | `read_file`, `list_directory`, `run_shell` | minimal, controlled |
 | Dangerous-command guardrail | `aegis_agent.tools.danger` | `run_shell` blocks destructive commands by default; operator-only override |
 | Context builder | `aegis_agent.context.builder.ContextBuilder` | derived view; source messages never mutated |
+| Dynamic prompt | `aegis_agent.context.system_prompt` | `SystemPromptBuilder` + `PromptContributor` seam |
 | Sessions | `aegis_agent.sessions` | `SessionRepository` Protocol + in-memory store |
 | Agent loop | `aegis_agent.runtime.AgentRuntime` | guard → context → model → tools → loop; budget, interrupt, timeout, error |
-| CLI | `aegis_agent.cli` | interactive REPL, `aegis` command, backend selection |
+| Skills | `aegis_agent.skills` | SKILL.md discovery, loading, routing, progressive-disclosure tools, prompt index injection |
+| MCP client | `aegis_agent.mcp` | stdio + Streamable HTTP, schema adapter, Tool Protocol wrappers, optional `mcp` SDK |
+| CLI | `aegis_agent.cli` | interactive REPL, `aegis` command, backend/skills/MCP configuration |
 
 ## Model configuration
 
@@ -55,10 +55,6 @@ The CLI picks the backend with `--model-backend auto|fake|openai` (default
 `auto`): real provider when `AEGIS_API_KEY` and `AEGIS_MODEL` are set,
 otherwise the deterministic fake.
 
-Verified end-to-end against a real endpoint (Qwen via DashScope's
-OpenAI-compatible mode): a real turn drove `list_directory`, the result was
-back-filled, and the model produced the final answer.
-
 ### Dangerous-command guardrail
 
 `run_shell` refuses commands matching a destructive-pattern list (recursive
@@ -66,6 +62,67 @@ delete, `mkfs`/`dd`, SQL `DROP`/`DELETE`-without-`WHERE`, fork bomb,
 pipe-to-shell, destructive git, service/process kill).  The model cannot bypass
 it — only the operator can, via `--allow-dangerous-shell` (CLI) or
 `ToolContext(allow_dangerous_shell=True)`.
+
+## Skills
+
+Skills are reusable instruction sets for specific tasks.  A skill is a
+directory containing a `SKILL.md` file with YAML frontmatter:
+
+```yaml
+---
+name: my-skill
+description: What this skill does.
+---
+# Instructions
+...
+```
+
+Skills are discovered from `~/.aegis/skills/` (or `$AEGIS_SKILLS_DIR`):
+
+```bash
+mkdir -p ~/.aegis/skills/my-skill
+# write SKILL.md there
+```
+
+A compact index is injected into the system prompt.  The model can browse
+skills via the `skills_list` tool and load full instructions via `skill_view`.
+Users can activate a skill directly with `/skill-name`.
+
+```bash
+uv run aegis --skills-dir ~/my-skills   # custom directory
+uv run aegis --no-skills                # disable skills
+```
+
+## MCP (Model Context Protocol)
+
+Aegis can connect to external MCP servers and use their tools as native tools.
+The `mcp` Python SDK is an **optional** dependency:
+
+```bash
+uv sync --extra mcp                      # install with MCP support
+```
+
+Configure servers in `~/.aegis/config.yaml`:
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+  remote-api:
+    url: "https://example.com/mcp"
+    headers:
+      Authorization: "Bearer ${MY_TOKEN}"
+```
+
+Supported transports: stdio and Streamable HTTP.  MCP tools are registered
+alongside builtin and skills tools and are available to the model.  A brief
+guidance note is injected into the system prompt.
+
+```bash
+uv run aegis --mcp-config ~/my-config.yaml   # custom config path
+uv run aegis --no-mcp                         # disable MCP
+```
 
 ## Install & run
 
@@ -87,6 +144,7 @@ aegis> Echo: hello
 you> list .                  # triggers the list_directory tool
 you> read README.md          # triggers the read_file tool
 you> run echo hi             # triggers the run_shell tool
+you> /skill-name do X        # activates a skill
 you> exit
 ```
 
@@ -97,8 +155,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-Default tests never touch a real paid API (the provider tests inject a fake
-client).  One smoke test against a real endpoint is opt-in:
+Default tests never touch a real paid API.  One smoke test is opt-in:
 
 ```bash
 AEGIS_RUN_INTEGRATION=1 AEGIS_API_KEY=... AEGIS_MODEL=... uv run pytest -m integration
@@ -106,7 +163,8 @@ AEGIS_RUN_INTEGRATION=1 AEGIS_API_KEY=... AEGIS_MODEL=... uv run pytest -m integ
 
 ## Provenance
 
-See `docs/extraction-plan.md` (the phased plan) and `docs/source-map.md`
-(which Aegis modules derive from which Hermes sources, and how).  No Hermes
-code is described as wholly original; adapted files carry an attribution
-header and retain the Hermes MIT copyright.
+See `docs/extraction-plan.md` (the phased plan), `docs/development-log.md`
+(interview-oriented technical log), and `docs/source-map.md` (which Aegis
+modules derive from which Hermes sources, and how).  No Hermes code is
+described as wholly original; adapted files carry an attribution header and
+retain the Hermes MIT copyright.

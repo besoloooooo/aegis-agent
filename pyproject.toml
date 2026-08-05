@@ -9,12 +9,18 @@ dependencies = [
     "prompt-toolkit>=3.0.53",
     "pydantic>=2.13.4",
     "pyfiglet>=1.0.4",
+    "pyyaml>=6.0.3",
     "rich>=15.0.0",
     "typer>=0.27.0",
 ]
 
 [project.scripts]
 aegis = "aegis_agent.cli:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2.0.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]

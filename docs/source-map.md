@@ -73,3 +73,31 @@ Hermes' UX.
   `docs/extraction-plan.md` §3 and §7.
 - No Hermes file was modified.  All Aegis code lives under
   `/home/administrator/projects/aegis-agent`.
+
+## Stage 4 — skills subsystem & dynamic prompt injection
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/context/system_prompt.py` | **ADAPT** | `agent/system_prompt.py` → `build_system_prompt_parts` (line 61) | Ordered-section assembly with empty-section omission; reduced from 3-tier (stable/context/volatile) to a flat `PromptContributor` list — the minimal seam for subsystem injection. |
+| `src/aegis_agent/context/builder.py` (updated) | **ADAPT** | — | `ContextBuilder` now accepts a `SystemPromptBuilder` (backward-compatible: plain `str` wraps into one). `build()` calls `prompt_builder.build()` per turn, making the prompt dynamic. |
+| `src/aegis_agent/skills/models.py` | **REWRITE** | `agent/skill_utils.py` → `SkillInfo` (skill metadata struct) | Lightweight dataclasses: `Skill` (full parse + frontmatter + body + directory) and `SkillMeta` (name/description/category for the tier-1 index). |
+| `src/aegis_agent/skills/frontmatter.py` | **ADAPT** | `agent/skill_utils.py` → `parse_frontmatter` (line 88) | YAML `---` fence split + `yaml.safe_load`; malformed YAML → naive `key: value` scan fallback. Dropped the Hermes `CSafeLoader` variant. |
+| `src/aegis_agent/skills/loader.py` | **ADAPT** | `agent/skill_utils.py` → `iter_skill_index_files` (line 632), `skill_matches_platform` (line 128) | Walks a user dir for `SKILL.md`; enforces name/description length caps; platform gating (macos→darwin, windows→win32); prunes excluded dirs; name-collision dedupe. Dropped: bundled skills, external-dir config, plugin namespaces, mtime-cached per-dir indices. |
+| `src/aegis_agent/skills/router.py` | **ADAPT** | `agent/skill_commands.py` → `resolve_skill_command_key` (line 413), `build_skill_invocation_message` (line 432), `_build_skill_message` (line 160) | Slug normalisation + resolution + activation-message wrapper (activation note + body + directory + supporting-files listing + trailing instruction). Dropped: template-var substitution, inline-shell expansion, config resolution, platform-keyed command cache. |
+| `src/aegis_agent/skills/prompt.py` | **ADAPT** | `agent/prompt_builder.py` → `build_skills_system_prompt` (line 1053) | Compact `<available_skills>` index grouped by category; progressive-disclosure instruction to call `skill_view`. Dropped: two-layer prompt-snapshot cache, conditional fallback/requires visibility rules. |
+| `src/aegis_agent/skills/tools.py` | **ADAPT** | `tools/skills_tool.py` → `skills_list` (line 653), `skill_view` (line 828) | Two progressive-disclosure tools implementing Aegis's `Tool` Protocol: `skills_list` returns the tier-1 index as JSON; `skill_view` returns a skill's full body or a supporting file (path-traversal guarded). Dropped: prompt-injection scanner, credential/setup checks, collision reporting across dirs, plugin-namespace handling, usage telemetry. |
+| `src/aegis_agent/runtime.py` (updated) | **REWRITE** | — | `with_defaults` now discovers skills, registers skill tools, builds a `SystemPromptBuilder` with `SkillsIndexContributor`, and exposes a `SkillRouter` for CLI slash routing. |
+| `src/aegis_agent/cli.py` (updated) | **original** | — | `--skills-dir` / `--no-skills` flags; `/skill-name` slash routing in the REPL (`_maybe_route_skill`). |
+| `src/aegis_agent/context/__init__.py` (updated) | **original** | — | Re-exports `SystemPromptBuilder`, `PromptContributor`, `DEFAULT_IDENTITY`. |
+
+## Stage 5 — lightweight MCP client
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/mcp/schema_adapter.py` | **ADAPT** | `tools/mcp_tool.py` → `_normalize_mcp_input_schema` (line 3001), `_convert_mcp_schema` (line 3120), `sanitize_mcp_name_component` (line 3109); `tools/schema_sanitizer.py` → `strip_nullable_unions` (line 131) | Three-stage pipeline (definitions→$defs + nullable-union collapse + object-shape repair) inlined into one module. `strip_nullable_unions` inlined (~50 lines) to avoid depending on Hermes' `schema_sanitizer`. |
+| `src/aegis_agent/mcp/config.py` | **ADAPT** | `tools/mcp_tool.py` → `_load_mcp_config` (line 2537), `_interpolate_env_vars` (line 2524) | YAML config (`mcp_servers:` key, `${ENV}` interpolation, defaults merge). Dropped: Hermes-specific config backend (`hermes_cli.config`), dotenv side-load. |
+| `src/aegis_agent/mcp/client.py` | **ADAPT** | `tools/mcp_tool.py` → `_ensure_mcp_loop` (line 2442), `_run_on_mcp_loop` (line 2458), `_connect_stdio` / `_connect_http`, `_make_tool_handler` (line 2590) | Background daemon-thread event loop; cross-thread coroutine scheduling; stdio + Streamable HTTP connect; `call_tool` with text-block collection + credential-stripped errors. Dropped: interrupt-aware polling, OAuth recovery, session-expiry retry, circuit breaker, reconnect backoff, SSE transport, content-type preflight, image-block caching, MCP notification handler, sampling. |
+| `src/aegis_agent/mcp/tools.py` | **REWRITE** | — | `MCPToolWrapper` implementing Aegis's `Tool` Protocol; `build_wrappers` factory. New code for Aegis's register-then-run pipeline (Hermes registers handler functions directly via the singleton registry). |
+| `src/aegis_agent/mcp/guidance.py` | **original** | — | `MCPToolsGuidance` implementing Milestone A's `PromptContributor` Protocol. |
+| `src/aegis_agent/runtime.py` (updated) | **REWRITE** | — | `with_defaults` now discovers and connects MCP servers, registers their tools, and adds the MCP guidance contributor. |
+| `src/aegis_agent/cli.py` (updated) | **original** | — | `--mcp-config` / `--no-mcp` flags. |

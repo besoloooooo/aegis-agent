@@ -26,11 +26,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from aegis_agent.context.builder import ContextBuilder
+from aegis_agent.context.system_prompt import DEFAULT_IDENTITY, SystemPromptBuilder
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
 from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.sessions.repository import SessionRepository
+from aegis_agent.skills.loader import SkillLoader
+from aegis_agent.skills.prompt import SkillsIndexContributor
+from aegis_agent.skills.router import DefaultSkillRouter, SkillRouter
+from aegis_agent.skills.tools import SkillsListTool, SkillViewTool
 from aegis_agent.tools.builtin import build_default_registry
 from aegis_agent.tools.executor import ToolExecutor
 from aegis_agent.tools.registry import ToolContext, ToolRegistry
@@ -173,6 +178,8 @@ class AgentRuntime:
         repository: SessionRepository,
         context_builder: ContextBuilder | None = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        skill_router: SkillRouter | None = None,
+        startup_info: dict[str, int] | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -180,6 +187,8 @@ class AgentRuntime:
         self._repository = repository
         self._context = context_builder or ContextBuilder()
         self._max_iterations = max_iterations
+        self._skill_router = skill_router
+        self._startup_info = startup_info or {}
 
     @classmethod
     def with_defaults(
@@ -191,6 +200,10 @@ class AgentRuntime:
         system_prompt: str | None = None,
         cwd: str | None = None,
         allow_dangerous_shell: bool = False,
+        enable_skills: bool = True,
+        skills_dir: str | None = None,
+        enable_mcp: bool = True,
+        mcp_config_path: str | None = None,
     ) -> AgentRuntime:
         """Build a runtime wired with builtin tools and sensible defaults.
 
@@ -198,6 +211,18 @@ class AgentRuntime:
         to the in-memory repository and (via the caller) the fake provider.
         ``allow_dangerous_shell`` is an operator-only switch passed to the tool
         context (the model cannot enable it).
+
+        When ``enable_skills`` is True (the default) skills are discovered from
+        ``skills_dir`` (or the default user dir), the ``skills_list`` /
+        ``skill_view`` tools are registered, and the skills index is injected
+        into the system prompt via a :class:`SystemPromptBuilder`.  When no
+        skills are found the tools are still registered but the index renders
+        nothing, so behaviour matches the pre-skills default.
+
+        When ``enable_mcp`` is True (the default), MCP servers are discovered
+        from ``mcp_config_path`` (or ``~/.aegis/config.yaml``) and their tools
+        are registered into the tool registry.  If the ``mcp`` SDK is not
+        installed this is a no-op.
         """
         if provider is None:
             from aegis_agent.models.fake import FakeModelProvider
@@ -212,7 +237,71 @@ class AgentRuntime:
         )
         executor = ToolExecutor(registry, context)
         repo = repository or InMemorySessionRepository()
-        builder = ContextBuilder(system_prompt)
+
+        identity = system_prompt if system_prompt is not None else DEFAULT_IDENTITY
+        prompt_builder = SystemPromptBuilder(identity=identity)
+        skill_router: SkillRouter | None = None
+        builtin_count = len(registry.names())
+        skills_count = 0
+        mcp_server_count = 0
+        mcp_tool_count = 0
+        if enable_skills:
+            loader = SkillLoader([skills_dir] if skills_dir else None)
+            loader.discover()
+            skills_count = len(loader.metas())
+            registry.register(SkillsListTool(loader))
+            registry.register(SkillViewTool(loader))
+            prompt_builder.add(SkillsIndexContributor(loader))
+            skill_router = DefaultSkillRouter(loader)
+
+        # ---- MCP ----------------------------------------------------------
+        mcp_guidance = None
+        if enable_mcp:
+            try:
+                from aegis_agent.mcp import is_available as _mcp_available
+
+                if _mcp_available():
+                    from aegis_agent.mcp.client import (
+                        connect_server,
+                        get_server_tool_timeout,
+                        get_server_tools,
+                    )
+                    from aegis_agent.mcp.config import load_mcp_config
+                    from aegis_agent.mcp.guidance import MCPToolsGuidance
+                    from aegis_agent.mcp.tools import build_wrappers
+
+                    servers = load_mcp_config(mcp_config_path)
+                    connected = 0
+                    tool_total = 0
+                    for name, cfg in servers.items():
+                        if connect_server(name, cfg):
+                            tools_list = get_server_tools(name)
+                            if tools_list:
+                                timeout = get_server_tool_timeout(name)
+                                wrappers = build_wrappers(name, tools_list, timeout)
+                                for w in wrappers:
+                                    registry.register(w)
+                                connected += 1
+                                tool_total += len(tools_list)
+                    if connected > 0:
+                        mcp_guidance = MCPToolsGuidance()
+                        mcp_guidance.set_servers(connected)
+                        prompt_builder.add(mcp_guidance)
+                    mcp_server_count = connected
+                    mcp_tool_count = tool_total
+            except Exception:
+                # MCP is optional — a config parse error or connection failure
+                # should not prevent Aegis from starting.
+                import logging
+                logging.getLogger(__name__).warning("MCP discovery failed", exc_info=True)
+
+        builder = ContextBuilder(prompt_builder)
+        startup_info = {
+            "builtin_tools": builtin_count,
+            "skills": skills_count,
+            "mcp_servers": mcp_server_count,
+            "mcp_tools": mcp_tool_count,
+        }
         return cls(
             provider=provider,
             registry=registry,
@@ -220,11 +309,22 @@ class AgentRuntime:
             repository=repo,
             context_builder=builder,
             max_iterations=max_iterations,
+            skill_router=skill_router,
+            startup_info=startup_info,
         )
 
     @property
     def repository(self) -> SessionRepository:
         return self._repository
+
+    @property
+    def skill_router(self) -> SkillRouter | None:
+        return self._skill_router
+
+    @property
+    def startup_info(self) -> dict[str, int]:
+        """Counts of loaded subsystems: skills, MCP servers/tools, builtin tools."""
+        return dict(self._startup_info)
 
     @property
     def max_iterations(self) -> int:
