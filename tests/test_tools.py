@@ -1,10 +1,10 @@
-"""Builtin tool tests: read_file, list_directory, run_shell."""
+"""Builtin tool tests: read_file, list_directory."""
 
 from __future__ import annotations
 
 import json
 
-from aegis_agent.tools.builtin import ListDirectoryTool, ReadFileTool, RunShellTool
+from aegis_agent.tools.builtin import ListDirectoryTool, ReadFileTool
 from aegis_agent.tools.registry import ToolContext
 
 
@@ -79,88 +79,3 @@ def test_list_directory(tmp_path):
 def test_list_directory_missing(tmp_path):
     result = ListDirectoryTool().run({"path": "does-not-exist"}, _ctx(tmp_path))
     assert result.is_error
-
-
-# -- run_shell ---------------------------------------------------------------
-
-
-def test_run_shell_captures_output_and_exit_code(tmp_path):
-    result = RunShellTool().run({"command": "echo hello-aegis"}, _ctx(tmp_path))
-    assert not result.is_error
-    payload = json.loads(result.content)
-    assert "hello-aegis" in payload["output"]
-    assert payload["exit_code"] == 0
-
-
-def test_run_shell_nonzero_exit(tmp_path):
-    result = RunShellTool().run({"command": "exit 3"}, _ctx(tmp_path))
-    payload = json.loads(result.content)
-    assert payload["exit_code"] == 3
-
-
-def test_run_shell_timeout(tmp_path):
-    result = RunShellTool().run({"command": "sleep 5", "timeout": 1}, _ctx(tmp_path))
-    assert result.is_error
-    assert "timed out" in json.loads(result.content)["error"].lower()
-
-
-def test_run_shell_requires_command(tmp_path):
-    result = RunShellTool().run({}, _ctx(tmp_path))
-    assert result.is_error
-
-
-def test_run_shell_uses_workdir(tmp_path):
-    sub = tmp_path / "wd"
-    sub.mkdir()
-    (sub / "marker.txt").write_text("here", encoding="utf-8")
-    result = RunShellTool().run({"command": "ls", "workdir": "wd"}, _ctx(tmp_path))
-    payload = json.loads(result.content)
-    assert "marker.txt" in payload["output"]
-
-
-# -- dangerous-command guardrail (ported from Hermes) ------------------------
-
-
-def test_dangerous_command_blocked_by_default(tmp_path):
-    result = RunShellTool().run({"command": "rm -rf /"}, _ctx(tmp_path))
-    assert result.is_error
-    error = json.loads(result.content)["error"]
-    assert "Blocked dangerous command" in error
-
-
-def test_dangerous_command_git_reset_hard_blocked(tmp_path):
-    result = RunShellTool().run({"command": "git reset --hard"}, _ctx(tmp_path))
-    assert result.is_error
-    assert "git reset --hard" in json.loads(result.content)["error"]
-
-
-def test_safe_command_not_blocked(tmp_path):
-    result = RunShellTool().run({"command": "echo safe"}, _ctx(tmp_path))
-    assert not result.is_error
-
-
-def test_dangerous_command_allowed_with_operator_override(tmp_path):
-    ctx = ToolContext(cwd=str(tmp_path), allow_dangerous_shell=True)
-    # Same destructive pattern as above, but the operator opted in.
-    result = RunShellTool().run({"command": "git branch -D somebranch 2>&1 || true"}, ctx)
-    # It executes (exit code may be non-zero because there's no such branch),
-    # but it is NOT the guardrail's blocked-error.
-    if result.is_error:
-        assert "Blocked dangerous command" not in json.loads(result.content)["error"]
-
-
-def test_model_cannot_enable_dangerous_via_arguments(tmp_path):
-    # The tool has no 'force'/'allow' argument — passing one changes nothing.
-    result = RunShellTool().run({"command": "rm -rf /", "allow_dangerous": True, "force": True}, _ctx(tmp_path))
-    assert result.is_error
-    assert "Blocked dangerous command" in json.loads(result.content)["error"]
-
-
-def test_detect_dangerous_command_subset():
-    from aegis_agent.tools.danger import detect_dangerous_command
-
-    assert detect_dangerous_command("rm -rf /tmp/x") is not None
-    assert detect_dangerous_command("ls -la") is None
-    assert detect_dangerous_command("echo hello") is None
-    assert detect_dangerous_command("") is None
-

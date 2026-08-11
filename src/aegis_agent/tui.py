@@ -361,9 +361,11 @@ def _tool_result_summary(name: str, content: str) -> str:
     if name == "list_directory" and "count" in data:
         return f" — {data['count']} entries"
 
-    # run_shell
-    if name == "run_shell" and "exit_code" in data:
+    # terminal
+    if name == "terminal" and "exit_code" in data:
         code = data["exit_code"]
+        if "session_id" in data:  # background launch
+            return f" — background {data['session_id']}"
         output = str(data.get("output", "")).strip()
         if output:
             return f" — exit {code}, {_truncate(output, 50)}"

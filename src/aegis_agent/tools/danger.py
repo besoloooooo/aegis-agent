@@ -10,11 +10,11 @@
 # Only the *generic* destructive patterns are ported.  Hermes-specific entries
 # (Hermes config/env paths, gateway lifecycle, docker compose, sudo-askpass
 # chaining) are intentionally omitted as out of scope for Aegis.
-"""Dangerous-shell-command detection for the ``run_shell`` guardrail.
+"""Dangerous-shell-command detection for the ``terminal`` guardrail.
 
 ``detect_dangerous_command`` returns a human-readable description of the first
 matched destructive pattern, or ``None`` when the command looks safe.  The
-``run_shell`` tool blocks matching commands by default; an operator can allow
+``terminal`` tool blocks matching commands by default; an operator can allow
 them explicitly (never the model — mirroring Hermes' internal ``force`` flag).
 """
 

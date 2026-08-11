@@ -23,7 +23,7 @@ class ToolContext:
 
     ``cwd`` is the working directory used to resolve relative paths.
     ``allow_dangerous_shell`` is an *operator-only* switch: when False (the
-    default) the ``run_shell`` tool refuses commands that match the dangerous
+    default) the ``terminal`` tool refuses commands that match the dangerous
     pattern list.  It is intentionally NOT a tool argument, so the model can
     never enable it — only the embedding application / CLI can (mirroring
     Hermes' internal ``force`` flag).  Kept frozen so tools cannot mutate
