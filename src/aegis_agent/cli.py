@@ -18,6 +18,7 @@ import typer
 from aegis_agent import __version__
 from aegis_agent.env import load_dotenv
 from aegis_agent.exceptions import AegisError
+from aegis_agent.models.base import Message, Role
 from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime
 from aegis_agent.tui import Tui
 
@@ -169,6 +170,7 @@ def _main(
         if resume:
             tui.say(f"Resumed session {session_id} "
                     f"({repository.message_count(session_id)} messages).")
+            _print_resume_preview(repository, session_id)
         _repl(
             runtime,
             session_id,
@@ -264,7 +266,48 @@ def _build_repository(db_path: str | None, ephemeral: bool):
     return SQLiteSessionRepository(db_path)
 
 
-def _print_session_list(repository) -> None:
+def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> None:
+    """Print the last few exchanges so the user can see what was discussed.
+
+    Mirrors Hermes' resumed-session preview: last N user messages and
+    the corresponding assistant first line, showing enough to recognise
+    the conversation without scrolling.
+    """
+    try:
+        msgs = repository.list_messages(session_id)
+    except Exception:  # noqa: BLE001 — preview failure must not block resume
+        return
+    # Build pairs of (user_msg, assistant_msg_or_none).
+    pairs: list[tuple[Message, Message | None]] = []
+    current_user = None
+    current_assistant = None
+    for m in msgs:
+        if m.role is Role.USER:
+            if current_user is not None:
+                pairs.append((current_user, current_assistant))
+            current_user = m
+            current_assistant = None
+        elif m.role is Role.ASSISTANT and current_assistant is None and m.content.strip():
+            current_assistant = m
+    if current_user is not None:
+        pairs.append((current_user, current_assistant))
+    # Show the last N exchanges.
+    to_show = pairs[-exchanges:] if len(pairs) > exchanges else pairs
+    if not to_show:
+        return
+
+    typer.echo("─" * 70)
+    for user, assistant in to_show:
+        u_text = user.content.strip()
+        # Collapse to one line, truncate.
+        u_line = u_text.replace("\n", " ")[:120]
+        typer.echo(f"  you> {u_line}{'…' if len(u_text) > 120 else ''}")
+        if assistant is not None:
+            a_text = assistant.content.strip()
+            a_line = a_text.replace("\n", " ")[:120]
+            typer.echo(f"aegis> {a_line}{'…' if len(a_text) > 120 else ''}")
+        typer.echo()
+    typer.echo("─" * 70)
     """Print a human-readable session table and exit."""
     import datetime
 

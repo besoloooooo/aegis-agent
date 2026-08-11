@@ -127,9 +127,11 @@ def _run_on_loop(coro_factory, timeout: float) -> Any:
 
 
 def connect_server(name: str, config: dict) -> bool:
-    """Connect to one MCP server.  Returns ``True`` on success.
+    """Connect to one MCP server (convenience wrapper).  Returns ``True`` on success.
 
-    ``config`` is a server entry from :func:`~aegis_agent.mcp.config.load_mcp_config`.
+    For multiple servers, prefer :func:`connect_servers_parallel` — it runs them
+    concurrently so total wall-clock time is bounded by the slowest server, not
+    the sum of timeouts.
     """
     if not _SDK_AVAILABLE:
         logger.warning("MCP SDK not installed — skipping server %r", name)
@@ -138,12 +140,8 @@ def connect_server(name: str, config: dict) -> bool:
         logger.debug("MCP server %r is disabled", name)
         return False
 
-    if "command" in config:
-        transport = "stdio"
-    elif "url" in config:
-        transport = "http"
-    else:
-        logger.warning("MCP server %r: missing 'command' or 'url' — skipping", name)
+    transport = _resolve_transport(name, config)
+    if transport is None:
         return False
 
     logger.info("Connecting MCP server %r (%s)...", name, transport)
@@ -154,6 +152,72 @@ def connect_server(name: str, config: dict) -> bool:
         logger.error("MCP server %r: connection failed: %s", name, exc, exc_info=False)
         return False
     return True
+
+
+def connect_servers_parallel(
+    servers: dict[str, dict],
+    overall_timeout: float = 120,
+) -> dict[str, bool]:
+    """Connect to multiple MCP servers **concurrently**.
+
+    Each server keeps its own ``connect_timeout`` deadline (from config,
+    default 60s), but all live inside one asyncio event loop so they progress
+    in parallel.  Total wall-clock time is bounded by the slowest reachable
+    server (or ``overall_timeout``), not the sum.  Mirrors Hermes' parallel
+    ``asyncio.wait_for(_connect_server, timeout=ct)`` gather.
+
+    Returns a mapping of server name → connected.
+    """
+    if not _SDK_AVAILABLE:
+        return {name: False for name in servers}
+    _ensure_loop()
+    assert _loop is not None
+
+    # Submit one task per enabled server.
+    futures: dict[str, concurrent.futures.Future | None] = {}
+    for name, cfg in servers.items():
+        if not cfg.get("enabled", True):
+            futures[name] = None  # disabled — skip
+            continue
+        transport = _resolve_transport(name, cfg)
+        if transport is None:
+            futures[name] = None
+            continue
+        logger.info("Connecting MCP server %r (%s)...", name, transport)
+        ct = float(cfg.get("connect_timeout", 60))
+        # _connect_async already has its own asyncio.wait_for(ready.wait(), timeout=ct).
+        # We submit as-is; each self-times-out within its configured deadline.
+        futures[name] = asyncio.run_coroutine_threadsafe(
+            _connect_async(name, cfg, transport), _loop,
+        )
+
+    # Poll with an overall deadline (safety net).
+    deadline = time.monotonic() + overall_timeout
+    results: dict[str, bool] = {}
+    for name, future in futures.items():
+        if future is None:
+            results[name] = False
+            continue
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                raise TimeoutError(f"overall MCP connection deadline ({overall_timeout:.0f}s) exceeded")
+            future.result(timeout=max(0.1, remaining))
+            results[name] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("MCP server %r: connection failed: %s", name, exc, exc_info=False)
+            results[name] = False
+    return results
+
+
+def _resolve_transport(name: str, config: dict) -> str | None:
+    if "command" in config:
+        return "stdio"
+    if "url" in config:
+        return "http"
+    logger.warning("MCP server %r: missing 'command' or 'url' — skipping", name)
+    return None
 
 
 async def _connect_async(name: str, config: dict, transport: str) -> None:
@@ -394,6 +458,7 @@ def connected_server_names() -> list[str]:
 __all__ = [
     "call_tool",
     "connect_server",
+    "connect_servers_parallel",
     "connected_server_names",
     "disconnect_all",
     "get_server_tool_timeout",

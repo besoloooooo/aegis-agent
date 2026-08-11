@@ -18,7 +18,7 @@ def test_cli_version():
 def test_cli_repl_processes_input_and_exits(tmp_path, monkeypatch):
     # Feed one message then the exit command; the fake echoes the message.
     monkeypatch.setenv("AEGIS_DB_PATH", str(tmp_path / "state.db"))
-    result = runner.invoke(app, ["--model-backend", "fake"], input="hello aegis\nexit\n")
+    result = runner.invoke(app, ["--model-backend", "fake", "--no-mcp"], input="hello aegis\nexit\n")
     assert result.exit_code == 0
     assert "Echo: hello aegis" in result.output
     assert "bye." in result.output
@@ -27,7 +27,7 @@ def test_cli_repl_processes_input_and_exits(tmp_path, monkeypatch):
 def test_cli_repl_tool_command(tmp_path, monkeypatch):
     # 'list' triggers the list_directory tool via the rule-based fake.
     monkeypatch.setenv("AEGIS_DB_PATH", str(tmp_path / "state.db"))
-    result = runner.invoke(app, ["--model-backend", "fake"], input="list .\nexit\n")
+    result = runner.invoke(app, ["--model-backend", "fake", "--no-mcp"], input="list .\nexit\n")
     assert result.exit_code == 0
     # After the tool runs, the fake summarises the tool result.
     assert "list_directory" in result.output
@@ -36,7 +36,7 @@ def test_cli_repl_tool_command(tmp_path, monkeypatch):
 def test_cli_repl_eof_exits_cleanly(tmp_path, monkeypatch):
     # No exit command — EOF on stdin must still terminate the loop.
     monkeypatch.setenv("AEGIS_DB_PATH", str(tmp_path / "state.db"))
-    result = runner.invoke(app, ["--model-backend", "fake"], input="")
+    result = runner.invoke(app, ["--model-backend", "fake", "--no-mcp"], input="")
     assert result.exit_code == 0
 
 

@@ -289,7 +289,7 @@ class AgentRuntime:
 
                 if _mcp_available():
                     from aegis_agent.mcp.client import (
-                        connect_server,
+                        connect_servers_parallel,
                         get_server_tool_timeout,
                         get_server_tools,
                     )
@@ -300,8 +300,9 @@ class AgentRuntime:
                     servers = load_mcp_config(mcp_config_path)
                     connected = 0
                     tool_total = 0
-                    for name, cfg in servers.items():
-                        if connect_server(name, cfg):
+                    results = connect_servers_parallel(servers)
+                    for name, ok in results.items():
+                        if ok:
                             tools_list = get_server_tools(name)
                             if tools_list:
                                 timeout = get_server_tool_timeout(name)
