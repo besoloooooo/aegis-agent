@@ -26,13 +26,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from aegis_agent.context.builder import ContextBuilder
+from aegis_agent.context.compress import compress_context
 from aegis_agent.context.system_prompt import DEFAULT_IDENTITY, SystemPromptBuilder
+from aegis_agent.context.tool_budget import ContentReplacementState, create_state
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
 from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.sessions.repository import SessionRepository
 from aegis_agent.skills.loader import SkillLoader
+from aegis_agent.skills.manage_tool import SkillManageTool
 from aegis_agent.skills.prompt import SkillsIndexContributor
 from aegis_agent.skills.router import DefaultSkillRouter, SkillRouter
 from aegis_agent.skills.tools import SkillsListTool, SkillViewTool
@@ -180,6 +183,9 @@ class AgentRuntime:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         skill_router: SkillRouter | None = None,
         startup_info: dict[str, int] | None = None,
+        context_token_budget: int | None = None,
+        compress_storage_dir: str | None = None,
+        summary_provider: ModelProvider | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -189,6 +195,16 @@ class AgentRuntime:
         self._max_iterations = max_iterations
         self._skill_router = skill_router
         self._startup_info = startup_info or {}
+        # Context compression (Stage 11).  ``context_token_budget=None`` disables
+        # compression entirely; when set, the derived context is compressed
+        # before every model call.  ``_budget_states`` holds one
+        # ContentReplacementState per session so phase-A replacement decisions
+        # are frozen across turns and the on-wire prompt prefix stays
+        # byte-stable (prompt-cache friendly).
+        self._context_token_budget = context_token_budget
+        self._compress_storage_dir = compress_storage_dir
+        self._summary_provider = summary_provider
+        self._budget_states: dict[str, ContentReplacementState] = {}
 
     @classmethod
     def with_defaults(
@@ -204,6 +220,9 @@ class AgentRuntime:
         skills_dir: str | None = None,
         enable_mcp: bool = True,
         mcp_config_path: str | None = None,
+        context_token_budget: int | None = None,
+        compress_storage_dir: str | None = None,
+        summary_provider: ModelProvider | None = None,
     ) -> AgentRuntime:
         """Build a runtime wired with builtin tools and sensible defaults.
 
@@ -223,6 +242,13 @@ class AgentRuntime:
         from ``mcp_config_path`` (or ``~/.aegis/config.yaml``) and their tools
         are registered into the tool registry.  If the ``mcp`` SDK is not
         installed this is a no-op.
+
+        When ``context_token_budget`` is set, the derived context is compressed
+        (``context.compress_context``) before every model call — oversized tool
+        results are offloaded to ``compress_storage_dir`` (default
+        ``~/.aegis/tool-result-cache``), old rounds are summarised with
+        ``summary_provider`` (default: the main provider).  The source history
+        is never modified; compression only affects the derived view.
         """
         if provider is None:
             from aegis_agent.models.fake import FakeModelProvider
@@ -251,6 +277,7 @@ class AgentRuntime:
             skills_count = len(loader.metas())
             registry.register(SkillsListTool(loader))
             registry.register(SkillViewTool(loader))
+            registry.register(SkillManageTool(loader))
             prompt_builder.add(SkillsIndexContributor(loader))
             skill_router = DefaultSkillRouter(loader)
 
@@ -311,6 +338,9 @@ class AgentRuntime:
             max_iterations=max_iterations,
             skill_router=skill_router,
             startup_info=startup_info,
+            context_token_budget=context_token_budget,
+            compress_storage_dir=compress_storage_dir,
+            summary_provider=summary_provider,
         )
 
     @property
@@ -384,6 +414,16 @@ class AgentRuntime:
             iterations += 1
             source = self._repository.list_messages(session_id)
             api_messages = self._context.build(source)
+            if self._context_token_budget is not None:
+                # Compress the DERIVED view only; the source history is untouched.
+                api_messages = compress_context(
+                    api_messages,
+                    self._provider,
+                    self._context_token_budget,
+                    storage_dir=self._compress_storage_dir,
+                    budget_state=self._budget_state_for(session_id),
+                    summary_provider=self._summary_provider,
+                )
 
             is_cancelled = (lambda: interrupt.is_set()) if interrupt is not None else None
             try:
@@ -403,7 +443,12 @@ class AgentRuntime:
                     on_event(TurnEvent.failed(str(exc)))
                 break
 
-            assistant = Message(role=Role.ASSISTANT, content=response.content, tool_calls=response.tool_calls)
+            assistant = Message(
+                role=Role.ASSISTANT,
+                content=response.content,
+                tool_calls=response.tool_calls,
+                reasoning_content=response.reasoning_content,
+            )
             self._persist(session_id, assistant)
 
             if not response.tool_calls:
@@ -436,6 +481,18 @@ class AgentRuntime:
         if message.client_msg_id is None:
             message.client_msg_id = uuid.uuid4().hex
         return self._repository.append_message(session_id, message)
+
+    def _budget_state_for(self, session_id: str) -> ContentReplacementState:
+        """Return the per-session tool-budget state, creating it on first use.
+
+        The state lives as long as the runtime and is keyed by session so two
+        sessions never share replacement decisions (no cross-session leakage).
+        """
+        state = self._budget_states.get(session_id)
+        if state is None:
+            state = create_state()
+            self._budget_states[session_id] = state
+        return state
 
 
 __all__ = [

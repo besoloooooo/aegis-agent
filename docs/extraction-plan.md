@@ -399,36 +399,40 @@ Aegis 通过**依赖注入 + 单向分层**（§5 依赖方向）根除这些环
 | 阶段 7 | Skills 子系统（SKILL.md 发现/加载/路由、`skills_list`/`skill_view`、`/skill-name` 斜杠命令、SystemPromptBuilder 动态注入） | Stage 4（超出原计划） |
 | — | 轻量 MCP 客户端（stdio + Streamable HTTP、schema adapter、MCPToolWrapper、PromptContributor） | Stage 5（新增） |
 | 阶段 4 | 危险命令护栏（`run_shell` 销毁性命令拦截） | Stage 2（部分，未全部完成） |
+| — | 文件编辑工具（write_file / patch / search_files，fuzzy 替换链 + 原子写 + CRLF/BOM 保留） | Stage 6（新增） |
+| — | 终端与后台进程工具（terminal / process，ProcessRegistry） | Stage 7（新增） |
+| — | Web 工具（web_search / web_extract，SSRF 门 + ddgs/Tavily/Exa 后端） | Stage 8（新增） |
+| — | 技能管理工具（skill_manage：install/uninstall/update/list + 锁文件溯源） | Stage 9（新增） |
+| 阶段 6 | 层级上下文压缩（移植 `ctx-compress-opt` 三阶段管线：超大工具结果转存+预览 → micro_compact 本地清理 → 按轮 LLM 摘要 → 单轮兜底；含超大结果外置存储） | Stage 10（移植）+ Stage 11（接入 Loop，跨轮 ContentReplacementState、reasoning_content、tiktoken、确定性摘要 provider） |
+| 阶段 5 | SQLite 会话持久化 + 消息级幂等落盘 + checkpoint/tail 快照快速恢复 + 会话租约（SQLite/Redis 双后端、心跳熔断、CLI `--resume`） | Stage 12 |
 
 ### ❌ 未完成
 
-#### SQLite 会话持久化 + checkpoint/tail + resume
+#### 历史改写路径与 history_version 失效链
 
-- **范围**：`SessionRepository` 的 SQLite 实现（messages/sessions/snapshots 精简 schema）、`append_message` 幂等（`ON CONFLICT DO NOTHING`）、`seq` 单调、快照写/载（CRC+zlib+history_version）、`resume`（checkpoint+tail，损坏回退全量回放）、CLI `--resume` 真正接线。
-- **明确不做**：FTS、租约、压缩旋转、Redis。
-- **验收测试**：① checkpoint 恢复 == 全量回放；② 损坏 checkpoint 安全回退；③ 单调 `seq`；④ 无跨会话历史；⑤ 重启后 `--resume` 恢复历史。
+- **现状**：Stage 12 已把 `history_version` 机制完整移植（`bump_history_version` /
+  快照版本校验），但 Aegis 目前**没有任何历史改写路径**（无 /undo、/retry、
+  压缩旋转分叉会话），因此没有 bump 调用方，该失效链处于"就绪但未接线"状态。
+- **触发条件**：未来引入任何改写源历史的功能时，必须挂 `bump_history_version`
+  使旧快照自动失效；若引入压缩分叉会话，还需带回 Hermes
+  `resolve_resume_session_id` 的 parent 链行走逻辑（Stage 12 明确未移植）。
+- **验收测试**：改写后旧快照拒绝加载、resume 结果 == 改写后的全量重放。
 
-#### 工具增强：并发执行 + 超大结果外置
+#### 工具增强：并发执行 + 熔断（超大结果外置已完成）
 
-- **范围**：并发工具执行（ThreadPoolExecutor）、超大结果三层（工具内 cap → 外置存储 + 预览 → 聚合预算）、`_maybe_wrap_untrusted`。
-- **已做**：危险命令护栏（`tools/danger.py`）、参数 JSON 修复（`sanitize.py:repair_tool_call_arguments`）、异常→`{"error":...}` 结果（`ToolExecutor`）。
-- **未做**：并发执行、`ToolGuardrails`（重复工具/无进展熔断）、超大结果外置存储 + 预览、聚合预算。
+- **范围**：并发工具执行（ThreadPoolExecutor）、`ToolGuardrails`（重复工具/无进展熔断）、`_maybe_wrap_untrusted`。
+- **已做**：危险命令护栏（`tools/danger.py`）、参数 JSON 修复（`sanitize.py:repair_tool_call_arguments`）、异常→`{"error":...}` 结果（`ToolExecutor`）、**超大结果外置存储 + 预览 + 两级聚合预算**（Stage 10，`context/tool_budget.py`）。
+- **未做**：并发执行、`ToolGuardrails`（重复工具/无进展熔断）、`_maybe_wrap_untrusted`。
 
-#### 层级上下文压缩
+#### 可靠性与并发测试（核心不变量已全部建立，增强项未补）
 
-- **范围**：`context/compression.py` 分阶段压缩（prune 旧 tool 结果 → token 边界 → 滚动摘要 → head+summary+tail）、token 阈值触发、**原文保留**、压缩只影响发给模型的 context。
-- **验收测试**：① 超过阈值触发压缩；② 原文 messages 不被修改；③ 压缩后恢复 == 全量回放；④ 摘要失败时不变更。
-
-#### 会话租约（SQLite + Redis）
-
-- **范围**：`LeaseBackend` Protocol、SQLite 租约（INSERT OR IGNORE + owner_token）、Redis 租约（SET NX PX + Lua）、`SessionLeaseManager` 心跳 + 熔断 + `switch_session`。
-- **验收测试**：① 同一 session 仅一个 owner；② TTL 过期可回收；③ 心跳失败触发熔断并停止写入；④ Redis 不可用不静默回退 SQLite。
-
-#### 可靠性与并发测试（不完全——核心不变量测试已有，非核心未补）
-
-- **范围**：不变量测试套件（CLAUDE.md §9）：单消息幂等、会话内单调、无重复模型请求、无重复工具结果、无跨会话历史、单一租约 owner、checkpoint 恢复 == 全量回放、损坏 checkpoint 安全回退、压缩后原文不变。
-- **已做**：幂等、单调、会话隔离、context 不改原文、provider 不污染 runtime（守卫测试）。
-- **未做**：租约/checkpoint/压缩相关——需等对应功能实现后才能测。
+- **已做**：幂等、单调、会话隔离、context 不改原文、provider 不污染 runtime、
+  checkpoint 恢复 == 全量回放、损坏 checkpoint 安全回退、压缩后原文不变、
+  单一租约 owner（含 8 连接竞态与**真实子进程双进程测试**）、租约熔断后不交叉写。
+- **未做**：真 Redis 集成测试已存在（`tests/test_session_lease_redis_live.py`，
+  `integration` marker + `AEGIS_TEST_REDIS_URL` 门控，配
+  `tests/docker-compose.redis.yml`）但**默认不跑**——需手动起 docker 执行；
+  无重复模型请求/无重复工具结果的端到端故障注入测试可继续加强。
 
 #### MCP 增强（新增需求）
 

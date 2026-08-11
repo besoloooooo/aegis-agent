@@ -101,3 +101,93 @@ Hermes' UX.
 | `src/aegis_agent/mcp/guidance.py` | **original** | — | `MCPToolsGuidance` implementing Milestone A's `PromptContributor` Protocol. |
 | `src/aegis_agent/runtime.py` (updated) | **REWRITE** | — | `with_defaults` now discovers and connects MCP servers, registers their tools, and adds the MCP guidance contributor. |
 | `src/aegis_agent/cli.py` (updated) | **original** | — | `--mcp-config` / `--no-mcp` flags. |
+
+## Stage 6 — file-editing tools (write_file / patch / search_files)
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/tools/fuzzy_match.py` | **PORT** | `tools/fuzzy_match.py` → `fuzzy_find_and_replace`, `format_no_match_hint`, `find_closest_lines` | Near-verbatim port of the 9-strategy fuzzy find/replace chain (exact → line-trimmed → whitespace → indentation → escape → trimmed-boundary → unicode → block-anchor → context-aware). Self-contained (only `re`+`difflib`); escape-drift guard, re-indentation, `\t`/`\r` unescape and "did you mean?" hints all retained. Attribution header retained. |
+| `src/aegis_agent/tools/fsutil.py` | **ADAPT** | `tools/file_operations.py` → `_detect_line_ending`, `_normalize_line_endings`, `_strip_bom`/`_has_bom`, `_atomic_write`, `_unified_diff`, `_is_write_denied`; `tools/path_security.py` → `has_traversal_component` | Generic file helpers: BOM detect/strip, line-ending detect/normalize, atomic temp+`os.replace` write, unified diff, sensitive-path refusal (generic subset), traversal check. The multi-backend shell `execute()` layer is replaced with direct Python I/O (`pathlib`/`os.replace`); a binary `read_text_raw` is added so CRLF/BOM survive the round-trip (text-mode I/O would translate `\r\n`→`\n`). Attribution header retained. |
+| `src/aegis_agent/tools/builtin/write_file.py` | **REWRITE** | `tools/file_tools.py` → `write_file_tool`; `tools/file_operations.py` → `ShellFileOperations.write_file` | Behaviour-equivalent minimal surface: `{path, content}` → `{path, bytes_written, created, dirs_created}` / `{error}`; auto-create parents, full overwrite, atomic write, BOM/CRLF preservation, sensitive-path refusal. Dropped: cross-profile, file-state, lint/LSP, redaction. |
+| `src/aegis_agent/tools/builtin/patch.py` | **ADAPT** | `tools/file_operations.py` → `ShellFileOperations.patch_replace` | Replace mode only: read → `fuzzy_find_and_replace` → write → **re-read verify**; unique-match requirement, `replace_all`, empty `new_string`=delete, "did you mean?" no-match hint, CRLF/BOM preserved. V4A multi-file diff mode (`patch_parser.py`/`patch_v4a`) intentionally NOT ported. |
+| `src/aegis_agent/tools/builtin/search_files.py` | **REWRITE** | `tools/file_tools.py` → `search_tool`; `tools/file_operations.py` → `ShellFileOperations.search` | `{pattern, target=content\|files, path, file_glob, limit, offset, output_mode, context}` → `{total_count, matches\|files\|counts, truncated}` / `{error}`. Prefers `rg` on PATH, else a pure-`os.walk`/`re`/`fnmatch` fallback with equivalent behaviour; prunes hidden/VCS dirs. Dropped: search loop-breaking, redaction, backend routing. |
+| `src/aegis_agent/tools/schemas.py` (updated), `tools/builtin/__init__.py` (updated) | **original** | — | Registered the three new tool definitions and wired them into `build_default_registry()`. |
+
+## Stage 7 — terminal & background-process tools (terminal / process)
+
+`terminal` **replaces** the Stage-1 `run_shell` (removed this stage): it is the
+full-featured execution tool (foreground + background launch), and `process`
+manages the background processes it spawns.
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/tools/process_registry.py` | **ADAPT** | `tools/process_registry.py` → `ProcessRegistry`, `ProcessSession`, `spawn_local`, `_reader_loop`, `_reconcile_local_exit`, `poll`/`read_log`/`wait`/`kill_process`/`write_stdin`/`submit_stdin`/`close_stdin`/`list_sessions`, `_prune_if_needed` | Local-only port of the in-memory background-process registry: `_running`/`_finished` dicts + lock, per-session rolling 200KB `output_buffer` + daemon reader thread, `subprocess.Popen` + `os.setsid` process group, TTL + LRU pruning, orphaned-pipe reconcile fix, psutil / `taskkill /T /F` tree-kill, ANSI strip. Dropped: sandbox backends (`spawn_via_env`), ptyprocess PTY, watch-pattern rate limiting + global circuit breaker, gateway notification routing, crash-recovery checkpoint file, per-profile HOME isolation, provider-secret env scrubbing. Shell wrapper simplified to `/bin/sh -c` / `cmd /c`. Attribution header retained. |
+| `src/aegis_agent/tools/builtin/terminal.py` | **REWRITE** | `tools/terminal_tool.py` → `terminal_tool` | `{command, timeout, workdir, background, pty}` → foreground `{output, exit_code, error}` (timeout → exit_code 124, head/tail truncation, grep/diff exit-code-meaning note, server-command → background hint) or background `{session_id, pid, ...}`. Dangerous-command guardrail retained (operator-only `allow_dangerous_shell`). Dropped: sandbox backends, approval/`force`, watch patterns, notify_on_complete framing. |
+| `src/aegis_agent/tools/builtin/process.py` | **REWRITE** | `tools/terminal_tool.py` process actions (delegating to `process_registry`) | Thin wrapper mapping `action ∈ {list, poll, log, wait, kill, write, submit, close}` onto the shared `ProcessRegistry`; unknown id → `{status: "not_found"}`. |
+| `src/aegis_agent/tools/builtin/run_shell.py` | **removed** | — | Superseded by `terminal`. Its schema/registration and `RunShellTool` references removed; `tools/schemas.RUN_SHELL` deleted. |
+| `src/aegis_agent/models/fake.py`, `tui.py`, `cli.py`, `tools/danger.py`, `tools/registry.py` (docstrings/help) | **original** | — | Updated `run_shell` → `terminal` references (demo shorthand, result renderer, CLI help, guardrail docstrings). |
+| `src/aegis_agent/tools/schemas.py`, `tools/builtin/__init__.py` (updated) | **original** | — | `TERMINAL` + `PROCESS` schemas; `build_default_registry()` constructs one shared `ProcessRegistry` injected into both `TerminalTool` and `ProcessTool`. |
+
+## Stage 8 — web tools (web_search / web_extract)
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/tools/web/url_safety.py` | **ADAPT** | `tools/url_safety.py` → `is_safe_url`, `_is_blocked_ip`, `_ALWAYS_BLOCKED_IPS`/`_ALWAYS_BLOCKED_NETWORKS`, `_BLOCKED_HOSTNAMES`, `_CGNAT_NETWORK` | The SSRF gate, verbatim in substance: http/https scheme allowlist, cloud-metadata + link-local always-blocked floor (with IPv4-mapped IPv6 variants), private/loopback/reserved/multicast/CGNAT blocking, fail-closed on DNS error. Dropped: the `security.allow_private_urls` config/env toggle + cache, the QQ trusted-host allowlist, the async wrapper. Aegis always enforces private-IP blocking; synchronous only. Attribution header retained. |
+| `src/aegis_agent/tools/web/backends.py` | **original** | — | New, dependency-light backend seam (Hermes dispatches through a plugin registry of paid SDKs). Search: DuckDuckGo via `ddgs` by default (no key), Tavily/Exa via direct `httpx` REST when `TAVILY_API_KEY`/`EXA_API_KEY` is set. Extract: `httpx` GET + `trafilatura` HTML→markdown, base64-image stripping, tag-strip fallback. Monkeypatchable module-level functions. |
+| `src/aegis_agent/tools/builtin/web_search.py` | **REWRITE** | `tools/web_tools.py` → `web_search_tool` | `{query, limit=5}` → `{results: [{title, url, description, position}], count, backend}` / `{error}`. Never raises. |
+| `src/aegis_agent/tools/builtin/web_extract.py` | **REWRITE** | `tools/web_tools.py` → `web_extract_tool` | `{urls: [...]}` (≤5) → `{results: [{url, title, content, error}], count}`. Per-URL SSRF gate before fetch; per-URL errors inline. Hermes' optional LLM summarisation not ported. |
+| `pyproject.toml` | **original** | — | Added `httpx` (core dep) and a `web` optional extra (`ddgs`, `trafilatura`), mirroring the existing `mcp` extra pattern. |
+
+## Stage 9 — skill management tool (skill_manage)
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/skills/install.py` | **ADAPT** | `tools/skills_hub.py` → `HubLockFile`, `record_install`/`record_uninstall`/`list_installed`, `install_from_quarantine`, `uninstall_skill`, `bundle_content_hash`, `_validate_skill_name`, `_resolve_lock_install_path`, `_is_path_redirect` | Core install/uninstall/update primitives. Lock file (`<skills_dir>/.aegis-lock.json`) provenance model, two-layer symlink/junction rejection, `rmtree` guard (must be within skills_dir AND must not be skills_dir root), `_dir_hash` (sorted-relpath + content SHA-256). Install source: local directory copy, or URL fetch (single SKILL.md). Update = re-fetch source + hash-compare + reinstall. Dropped: quarantine, scan verdict/trust level, multi-source hub routing, audit log, website policy, SSRF redirect chaining, provenance signing, telemetry. Attribution header retained. |
+| `src/aegis_agent/skills/manage_tool.py` | **REWRITE** | `tools/skill_manager_tool.py` → `skill_manage` (hub actions) | `{action ∈ install\|uninstall\|update\|list, source?, name?, force?}` → `{success, ...}` / `{success:false, error}`. Delegates to `skills/install.py`; calls `loader.discover(force=True)` after mutations so the index refreshes. Registered in `runtime.with_defaults` (enable_skills branch) alongside `skills_list` / `skill_view`. |
+| `src/aegis_agent/runtime.py` (updated) | **original** | — | Registered `SkillManageTool` in the `enable_skills` branch. |
+
+## Stage 10 — context compression pipeline (three-phase trimming & per-round summary)
+
+Whole-unit port of the cohesive four-file prototype in `hermes-agent/ctx-compress-opt/`
+(the dependency closure of `compress.py`).  The algorithm core still operates on
+OpenAI-shaped dicts, byte-faithful to the prototype; the only new code is the
+`Message`↔dict boundary layer and the public entry point.  Dropped prototype dead
+code (documented in the module header): `_handle_single_round_overflow_v1`/`_v2`,
+`_truncate_oversized_tools` (never called), and the `__main__` self-test block.
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/context/compress_config.py` | **PORT** | `ctx-compress-opt/compress_config.py` (entire file) | Near-verbatim: every threshold / placeholder / marker string / compactable-tool allowlist. Tool names absent from Aegis (browser/vision/amap MCP) intentionally retained for upstream parity. Attribution header retained. |
+| `src/aegis_agent/context/tool_budget.py` | **PORT** | `ctx-compress-opt/tool_budget.py` (entire file) | Phase A: two-level tool-result budget (per-result + per-turn aggregate), persist-to-disk + preview replacement, cross-turn `ContentReplacementState`, read_file read-back loop guard + third-level hard truncate. Stdlib-only by design. Attribution header retained. |
+| `src/aegis_agent/context/micro_compact.py` | **PORT** | `ctx-compress-opt/micro_compact.py` (entire file) | Phase B: threshold-triggered progressive micro-compaction (dedup → informative one-line summaries → JSON-aware arg truncation → history reasoning clear). Only the import style adapted (flat same-dir → absolute package imports). Attribution header retained. |
+| `src/aegis_agent/context/compress.py` | **PORT + ADAPT** | `ctx-compress-opt/compress.py` → `_compress_context`, `_handle_single_round_overflow`, `_split_into_rounds`, `_is_complete_round`, `_serialize_round_for_summary`, `_summarize_round`, `_estimate_tokens` | Three-phase pipeline + single-round overflow fallback. Adaptations: stdlib `logging` (was `configs.config`/`utils.log_utils`); synchronous `ModelProvider.stream()` + `collect_response` for summaries (was async `llm_provider.chat(..., model, temperature, max_tokens)` — sampling params now provider-owned); injectable `storage_dir` defaulting to `~/.aegis/tool-result-cache` (was hard-coded `ROOT_PATH/tool-budget-cache`); regex-only redaction (dropped optional `agent.redact`); absolute package imports; `len>1`/None guards around the runtime-context-marker probe (prototype could `IndexError`). Attribution header retained. |
+| `src/aegis_agent/context/compress.py` (`message_to_dict`, `dict_to_message`, `compress_context`, `estimate_tokens`) | **original** | — | Aegis boundary layer: `Message`↔OpenAI-dict converters + public entry point. Keeps the ported dict-based core untouched and enforces the "source messages never mutated" invariant. |
+| `src/aegis_agent/context/__init__.py` (updated) | **original** | — | Exports `compress_context` / `estimate_tokens` / `message_to_dict` / `dict_to_message`. |
+| `tests/test_context_compress.py` | **original** | — | 17 deterministic tests over all three phases + single-round fallback + boundary adapters; fake/exploding providers only. |
+
+## Stage 11 — wire compression into the Agent Loop + reasoning_content plumbing
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/runtime.py` (compression wiring) | **REWRITE** | `agent/conversation_loop.py` (per-call `api_messages` build feeding the model) | `run_turn` compresses the *derived* context before each model call when `context_token_budget` is set; per-session `ContentReplacementState` held in `_budget_states` (frozen cross-turn replacement decisions → byte-stable prompt prefix); source history untouched. |
+| `src/aegis_agent/context/compress.py` (`budget_state` / `summary_provider` params) | **original** | — | Threads the cross-turn budget state and an optional deterministic summary provider through the ported pipeline (prototype used one-shot state and the main LLM client). |
+| `src/aegis_agent/models/base.py` (`Message.reasoning_content`, `ChatResponse.reasoning_content`) | **ADAPT** | `ctx-compress-opt/compress.py` (`reasoning_content` dict field handling) | The compression pipeline accounts for/clears chain-of-thought; the field is now carried by Aegis messages end-to-end so those steps are live. Persisted, but never echoed onto the wire. |
+| `src/aegis_agent/events.py` (`REASONING_DELTA`), `models/stream.py` (capture), `models/openai_compat.py` (one-shot capture + `temperature` param), `models/fake.py` (`FakeReply.reasoning`) | **ADAPT** | Hermes reasoner providers' `delta.reasoning_content` streaming behaviour | Reasoning deltas folded into `ChatResponse.reasoning_content`; `OpenAICompatibleProvider` gains `temperature`/`max_tokens` pinning (used to build the deterministic summary provider). Also fixed the pre-existing `sanitize_surrogates(str \| None)` mypy error in `_to_wire_message`. |
+| `src/aegis_agent/cli.py` (`--context-max-tokens` / `--no-compress`, `_build_summary_provider`) | **original** | — | CLI-side budget config (env `AEGIS_CONTEXT_MAX_TOKENS`, default 120_000) and deterministic summary provider construction (`temperature=0.0`, `max_tokens=SUMMARY_MAX_TOKENS`, non-streaming). |
+| `src/aegis_agent/context/compress_config.py` (`list_directory` in MICRO list) | **original** | — | Aegis builtin added to the compactable set; upstream-only names retained for parity. |
+| `tests/test_runtime_compression.py` | **original** | — | 10 tests: loop wiring, per-session state stability/isolation, reasoning capture/persistence/wire-stripping, summary-provider seam. |
+
+## Stage 12 — session recovery (SQLite store + snapshot fast-resume + cross-process leases)
+
+Ports the user's own Hermes session-recovery commits (`5a51f55` message-level
+idempotent persistence, `181e078` session_snapshots fast resume, `03e5adc`
+pluggable leases).  Design reference: `hermes_state_核心机制.md`.
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/sessions/sqlite_store.py` | **ADAPT** | `hermes_state.py` → connection setup, `apply_wal_with_fallback`, `_execute_write`, `_try_wal_checkpoint`, `append_message` (idempotency), `write_snapshot`/`load_latest_snapshot`/`get_messages_after_seq`/`resume_conversation`, `get_history_version`/`bump_history_version`, `try_acquire_session_lease`/`renew_session_lease`/`release_session_lease`/`is_session_lease_owner`/`get_session_lease_info` | Transaction machinery and recovery algorithms ported 1:1; schema trimmed to the Aegis `Message` fields (dropped FTS5, titles/archives, rewind, token billing, platform/codex columns). Implements the `SessionRepository` Protocol and stores `Message` dataclasses instead of OpenAI dicts. `parent_session_id` lineage walking NOT ported (Aegis compression never forks sessions). `history_version` kept for future history-rewrite invalidation. `list_messages` internally uses the snapshot+tail fast path. Attribution header retained. |
+| `src/aegis_agent/sessions/lease.py` | **PORT** | `session_lease.py` (entire file, 573 lines) | Near-verbatim: backend interface, SQLite/Redis backends, heartbeat manager with `on_lost` circuit breaker, backend factory. Adapted: `AEGIS_*` env vars, `aegis:session_lease:` Redis key prefix, SQLite backend wraps `SQLiteSessionRepository`. Attribution header retained. |
+| `src/aegis_agent/cli.py` (updated) | **original** | — | `--db`/`--ephemeral`/`--resume`/`--no-lease`/`--snapshot-every-n` flags; `_build_repository`, `_start_lease` (lease-loss → `run_turn` interrupt event), `_maybe_snapshot` after each turn; resume display line. |
+| `src/aegis_agent/sessions/__init__.py` (updated) | **original** | — | Exports the SQLite store and lease components. |
+| `pyproject.toml` | **original** | — | New `redis` optional extra (lease backend only). |
+| `tests/test_sessions_sqlite.py`, `tests/test_session_lease.py` | **ADAPT** | `tests/run_agent/test_idempotent_persistence.py`, `tests/hermes_state/test_session_snapshots.py`, `tests/test_session_lease.py` (behavioural reference) | Same invariants re-expressed against the Aegis Protocol/`Message` surface: idempotency, monotonic seq, isolation, crash durability, snapshot==full-replay + corruption fallbacks, resume-continue no-dup, single lease winner incl. 8-way race, TTL takeover, stale-owner rejection, heartbeat/on_lost/switch, Redis via in-memory fake client. Dual-process subprocess tests (hermes `tests/lease_worker.py`) replaced by multi-connection in-process contenders. |

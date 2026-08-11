@@ -1,0 +1,17 @@
+# Redis for the Aegis session-lease integration tests
+# (tests/test_session_lease_redis_live.py).
+#
+# Usage:
+#   docker compose -f tests/docker-compose.redis.yml up -d
+#   uv add --optional redis   # or: uv sync --extra redis
+#   AEGIS_TEST_REDIS_URL=redis://localhost:6379/0 uv run pytest -m integration
+#   docker compose -f tests/docker-compose.redis.yml down
+#
+# This file is test-only.  Redis itself is an OPTIONAL lease backend selected
+# via AEGIS_SESSION_LEASE_BACKEND=redis — the default remains SQLite.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-test-redis
+    ports:
+      - "6379:6379"

@@ -10,6 +10,8 @@ imported by the runtime (one-way dependency cli → runtime).
 from __future__ import annotations
 
 import os
+import threading
+from pathlib import Path
 
 import typer
 
@@ -22,6 +24,9 @@ from aegis_agent.tui import Tui
 app = typer.Typer(add_completion=False, help="Aegis Agent — minimal interactive agent runtime.")
 
 _EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+#: Default token budget for the derived model context (compression target).
+DEFAULT_CONTEXT_MAX_TOKENS = 120_000
 
 
 @app.callback(invoke_without_command=True)
@@ -39,7 +44,7 @@ def _main(
     allow_dangerous_shell: bool = typer.Option(
         False,
         "--allow-dangerous-shell",
-        help="Operator-only: allow run_shell to execute commands matching the dangerous list. Use with care.",
+        help="Operator-only: allow terminal to execute commands matching the dangerous list. Use with care.",
     ),
     skills_dir: str = typer.Option(
         None,
@@ -53,6 +58,37 @@ def _main(
         help="Path to MCP server config (default: ~/.aegis/config.yaml).",
     ),
     no_mcp: bool = typer.Option(False, "--no-mcp", help="Disable MCP server discovery."),
+    context_max_tokens: int | None = typer.Option(
+        None,
+        "--context-max-tokens",
+        envvar="AEGIS_CONTEXT_MAX_TOKENS",
+        help=f"Token budget for the model context; the derived context is compressed before each model call "
+        f"(default: {DEFAULT_CONTEXT_MAX_TOKENS}).",
+    ),
+    no_compress: bool = typer.Option(
+        False, "--no-compress", help="Disable context compression entirely."
+    ),
+    db_path: str | None = typer.Option(
+        None,
+        "--db",
+        envvar="AEGIS_DB_PATH",
+        help="SQLite session store path (default: ~/.aegis/state.db).",
+    ),
+    ephemeral: bool = typer.Option(
+        False, "--ephemeral", help="Use the in-memory session store (nothing is persisted)."
+    ),
+    resume: str | None = typer.Option(
+        None, "--resume", "-r", help="Resume an existing session id from the session store."
+    ),
+    no_lease: bool = typer.Option(
+        False,
+        "--no-lease",
+        help="Disable the cross-process session lease (not recommended: two processes "
+        "running the same session duplicate model requests and interleave history).",
+    ),
+    snapshot_every_n: int = typer.Option(
+        20, "--snapshot-every-n", help="Write a fast-resume snapshot every N messages (0=off)."
+    ),
     version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
 ) -> None:
     """Start the interactive Aegis Agent REPL (default action)."""
@@ -61,26 +97,80 @@ def _main(
         raise typer.Exit()
     if ctx.invoked_subcommand is not None:
         return
-    # Load a project-local .env (if any) before backend auto-detection, so
-    # AEGIS_* saved there is picked up without exporting it each run.
+    # Load project-local .env first, then the user-level ~/.aegis/.env
+    # (mirrors Hermes' ~/.hermes/.env pattern for secrets like TAVILY_API_KEY).
     load_dotenv()
+    load_dotenv(Path.home() / ".aegis" / ".env")
     try:
         provider, label = _select_provider(model_flag)
     except AegisError as exc:
         typer.echo(f"[error] {exc}")
         raise typer.Exit(code=1) from exc
-    runtime = AgentRuntime.with_defaults(
-        provider=provider,
-        max_iterations=max_iterations,
-        allow_dangerous_shell=allow_dangerous_shell,
-        enable_skills=not no_skills,
-        skills_dir=skills_dir,
-        enable_mcp=not no_mcp,
-        mcp_config_path=mcp_config,
-    )
-    tui = Tui()
-    tui.banner(label=label, session_id=session_id, startup_info=runtime.startup_info)
-    _repl(runtime, session_id, tui)
+    context_budget: int | None = None
+    summary_provider = None
+    if not no_compress:
+        context_budget = context_max_tokens or DEFAULT_CONTEXT_MAX_TOKENS
+        summary_provider = _build_summary_provider(provider)
+
+    # ---- session store (persistence + resume) ---------------------------
+    repository = _build_repository(db_path, ephemeral)
+    session_id = resume or session_id
+    if resume and repository.get_session(resume) is None:
+        typer.echo(f"[error] session not found: {resume}")
+        raise typer.Exit(code=1)
+
+    # ---- cross-process session lease ------------------------------------
+    # With the in-memory store there is no cross-process shared state, so a
+    # lease has nothing to protect — skip it rather than falling back to the
+    # default-path SQLite lock namespace.  An operator who explicitly sets
+    # AEGIS_SESSION_LEASE_BACKEND still gets a lease (explicit intent wins).
+    lease_manager = None
+    lease_lost = threading.Event()
+    lease_backend_env_set = bool(os.environ.get("AEGIS_SESSION_LEASE_BACKEND"))
+    skip_lease = no_lease or (ephemeral and not lease_backend_env_set)
+    if ephemeral and not no_lease and not lease_backend_env_set:
+        typer.echo("[note] ephemeral store: session lease skipped "
+                   "(nothing is shared across processes).")
+    if not skip_lease:
+        lease_manager = _start_lease(repository, session_id, lease_lost)
+        if lease_manager is None:
+            typer.echo(
+                f"[error] session '{session_id}' is currently owned by another process. "
+                "Wait for its lease to expire or use a different --session."
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        runtime = AgentRuntime.with_defaults(
+            provider=provider,
+            repository=repository,
+            max_iterations=max_iterations,
+            allow_dangerous_shell=allow_dangerous_shell,
+            enable_skills=not no_skills,
+            skills_dir=skills_dir,
+            enable_mcp=not no_mcp,
+            mcp_config_path=mcp_config,
+            context_token_budget=context_budget,
+            summary_provider=summary_provider,
+        )
+        tui = Tui()
+        tui.banner(label=label, session_id=session_id, startup_info=runtime.startup_info)
+        if resume:
+            tui.say(f"Resumed session {session_id} "
+                    f"({repository.message_count(session_id)} messages).")
+        _repl(
+            runtime,
+            session_id,
+            tui,
+            interrupt=lease_lost if lease_manager is not None else None,
+            snapshot_every_n=snapshot_every_n,
+        )
+    finally:
+        if lease_manager is not None:
+            lease_manager.stop()
+        close = getattr(repository, "close", None)
+        if callable(close):
+            close()
 
 
 def _select_provider(model_flag: str):
@@ -107,7 +197,90 @@ def _select_provider(model_flag: str):
     return FakeModelProvider(chunk_text=True), "fake model"
 
 
-def _repl(runtime: AgentRuntime, session_id: str, tui: Tui) -> None:
+def _build_summary_provider(provider):
+    """Build the deterministic provider used for context-compression summaries.
+
+    Returns ``None`` (fall back to the main provider) unless the main provider
+    is OpenAI-compatible — in that case a sibling provider is built with
+    ``temperature=0`` and the summary token budget pinned, mirroring the Hermes
+    prototype's ``temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS`` summary call.
+    Construction failure (e.g. missing env) falls back to ``None`` so the CLI
+    never fails to start over a summariser.
+    """
+    from aegis_agent.models.openai_compat import OpenAICompatibleProvider
+
+    if not isinstance(provider, OpenAICompatibleProvider):
+        return None
+    from aegis_agent.context.compress_config import SUMMARY_MAX_TOKENS
+
+    try:
+        return OpenAICompatibleProvider.from_env(
+            stream=False, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS
+        )
+    except AegisError:
+        return None
+
+
+def _build_repository(db_path: str | None, ephemeral: bool):
+    """Resolve the session store: in-memory (--ephemeral) or SQLite (default)."""
+    if ephemeral:
+        from aegis_agent.sessions.memory_store import InMemorySessionRepository
+
+        return InMemorySessionRepository()
+    from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
+
+    return SQLiteSessionRepository(db_path)
+
+
+def _start_lease(repository, session_id: str, lease_lost: threading.Event):
+    """Acquire the cross-process session lease; None when it is already held.
+
+    The lease backend comes from ``AEGIS_SESSION_LEASE_BACKEND`` (default
+    sqlite, sharing the session store DB; redis when configured).  When the
+    configured backend is unreachable the error is surfaced (never a silent
+    fallback).  Callers using the in-memory store are expected to skip this
+    entirely (see ``_main``) — an in-memory session has no cross-process
+    shared state to protect.
+
+    ``on_lost`` sets ``lease_lost`` — the event is passed to
+    ``run_turn(interrupt=...)``, so a lost lease stops the agent loop at the
+    next guard instead of risking dual writers.
+    """
+    from aegis_agent.sessions.lease import (
+        SessionLeaseManager,
+        SessionLeaseUnavailableError,
+        get_lease_backend,
+    )
+    from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
+
+    repo_for_lease = repository if isinstance(repository, SQLiteSessionRepository) else None
+    try:
+        backend = get_lease_backend(repo_for_lease)
+    except SessionLeaseUnavailableError as exc:
+        typer.echo(f"[error] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    def _on_lost(lost_session: str) -> None:
+        lease_lost.set()
+        typer.echo(
+            f"\n[warning] session lease for '{lost_session}' was lost — "
+            "another process took over; stopping to avoid duplicate writes."
+        )
+
+    manager = SessionLeaseManager(backend, on_lost=_on_lost)
+    if not manager.acquire(session_id):
+        return None
+    return manager
+
+
+def _repl(
+    runtime: AgentRuntime,
+    session_id: str,
+    tui: Tui,
+    *,
+    interrupt: threading.Event | None = None,
+    snapshot_every_n: int = 20,
+) -> None:
     """Read user lines, run turns, stream replies until an exit command / EOF."""
     while True:
         line = tui.prompt()
@@ -120,11 +293,28 @@ def _repl(runtime: AgentRuntime, session_id: str, tui: Tui) -> None:
         turn_input = _maybe_route_skill(runtime, line, tui)
         try:
             state = tui.begin_turn()
-            runtime.run_turn(session_id, turn_input, on_event=tui.on_event_factory(state))
+            runtime.run_turn(
+                session_id, turn_input, interrupt=interrupt, on_event=tui.on_event_factory(state)
+            )
         except AegisError as exc:
             tui.say(f"[error] {exc}")
             continue
+        _maybe_snapshot(runtime, session_id, snapshot_every_n)
     tui.bye()
+
+
+def _maybe_snapshot(runtime: AgentRuntime, session_id: str, every_n: int) -> None:
+    """Write a fast-resume snapshot when the store supports it (SQLite repo).
+
+    Best-effort and cadence-gated (every N new messages); the full-replay
+    resume path is always correct on its own, snapshots only skip re-decoding
+    the snapshotted prefix.
+    """
+    if every_n <= 0:
+        return
+    maybe = getattr(runtime.repository, "maybe_write_snapshot", None)
+    if callable(maybe):
+        maybe(session_id, every_n=every_n)
 
 
 def _maybe_route_skill(runtime: AgentRuntime, line: str, tui: Tui) -> str:
