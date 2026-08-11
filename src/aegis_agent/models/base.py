@@ -92,6 +92,12 @@ class Message:
     ``seq`` is the per-session monotonic position, assigned by the repository
     on append.  Both are *internal* fields: the context builder strips them
     from the derived view sent to the model.
+
+    ``reasoning_content`` carries the model's chain-of-thought when the
+    provider returns one (e.g. DeepSeek-style reasoners).  It is persisted with
+    the message so the context compressor can account for (and progressively
+    clear) it, but it is never echoed back onto the wire — see
+    ``openai_compat._to_wire_message``.
     """
 
     role: Role
@@ -99,6 +105,7 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    reasoning_content: str = ""
     client_msg_id: str | None = None
     seq: int | None = None
 
@@ -130,11 +137,14 @@ class ChatResponse:
     ``content`` is the concatenated assistant text; ``tool_calls`` the parsed
     tool requests (empty for a plain final answer); ``finish_reason`` mirrors
     the provider's stop reason ("stop", "tool_calls", "length", ...).
+    ``reasoning_content`` is the concatenated chain-of-thought when the
+    provider streams one (empty otherwise).
     """
 
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
+    reasoning_content: str = ""
 
 
 @runtime_checkable

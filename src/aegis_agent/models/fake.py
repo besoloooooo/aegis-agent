@@ -36,6 +36,7 @@ class FakeReply:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
+    reasoning: str = ""  # optional chain-of-thought, emitted as REASONING_DELTA
 
     @classmethod
     def tool(cls, name: str, arguments: dict | str, *, call_id: str = "call_0") -> FakeReply:
@@ -74,6 +75,8 @@ class FakeModelProvider:
     ) -> Iterator[ModelEvent]:
         self.calls += 1
         reply = self._next_reply(messages)
+        if reply.reasoning:
+            yield ModelEvent.reasoning_delta(reply.reasoning)
         if reply.text:
             if self._chunk_text:
                 for ch in reply.text:
@@ -120,7 +123,7 @@ class FakeModelProvider:
             if command in ("list", "ls"):
                 return FakeReply.tool("list_directory", {"path": rest or "."}, call_id=self._next_id())
             if command in ("run", "shell") and rest:
-                return FakeReply.tool("run_shell", {"command": rest}, call_id=self._next_id())
+                return FakeReply.tool("terminal", {"command": rest}, call_id=self._next_id())
             return FakeReply(text=f"Echo: {text}")
 
         return FakeReply(text="OK.")

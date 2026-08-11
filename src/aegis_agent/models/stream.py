@@ -92,6 +92,11 @@ class StreamAssembler:
         if content:
             yield ModelEvent.text_delta(content)
 
+        # 思维链增量（DeepSeek 等 reasoner 的 delta.reasoning_content）。
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            yield ModelEvent.reasoning_delta(reasoning)
+
         tool_call_deltas = getattr(delta, "tool_calls", None)
         if tool_call_deltas:
             for tc_delta in tool_call_deltas:

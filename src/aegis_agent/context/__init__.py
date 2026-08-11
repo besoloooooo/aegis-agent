@@ -1,8 +1,14 @@
-"""Context subsystem: build the derived model-facing context."""
+"""Context subsystem: build the derived model-facing context, compress it."""
 
 from __future__ import annotations
 
 from aegis_agent.context.builder import DEFAULT_SYSTEM_PROMPT, ContextBuilder
+from aegis_agent.context.compress import (
+    compress_context,
+    dict_to_message,
+    estimate_tokens,
+    message_to_dict,
+)
 from aegis_agent.context.system_prompt import (
     DEFAULT_IDENTITY,
     PromptContributor,
@@ -15,4 +21,8 @@ __all__ = [
     "ContextBuilder",
     "PromptContributor",
     "SystemPromptBuilder",
+    "compress_context",
+    "dict_to_message",
+    "estimate_tokens",
+    "message_to_dict",
 ]

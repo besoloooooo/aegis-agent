@@ -26,6 +26,7 @@ class ModelEventKind(str, Enum):
     """The kinds of events a provider can emit during one model call."""
 
     TEXT_DELTA = "text_delta"      # incremental assistant text
+    REASONING_DELTA = "reasoning_delta"  # incremental chain-of-thought text
     TOOL_CALL = "tool_call"        # a complete tool-call request
     DONE = "done"                  # terminal event carrying the finish reason
     ERROR = "error"                # terminal event carrying an error message
@@ -36,7 +37,7 @@ class ModelEvent:
     """One streamed model event. Exactly one payload field is set per kind."""
 
     kind: ModelEventKind
-    text: str = ""                 # TEXT_DELTA payload
+    text: str = ""                 # TEXT_DELTA / REASONING_DELTA payload
     tool_call: ToolCall | None = None  # TOOL_CALL payload
     finish_reason: str | None = None   # DONE payload
     error: str | None = None           # ERROR payload
@@ -44,6 +45,10 @@ class ModelEvent:
     @classmethod
     def text_delta(cls, text: str) -> ModelEvent:
         return cls(kind=ModelEventKind.TEXT_DELTA, text=text)
+
+    @classmethod
+    def reasoning_delta(cls, text: str) -> ModelEvent:
+        return cls(kind=ModelEventKind.REASONING_DELTA, text=text)
 
     @classmethod
     def tool(cls, tool_call: ToolCall) -> ModelEvent:
@@ -86,6 +91,7 @@ def collect_response(
     invoked for the synthetic nothing-to-fold case.
     """
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     finish_reason = "stop"
     for event in events:
@@ -95,6 +101,8 @@ def collect_response(
             raise OperationCancelled("model stream cancelled by interrupt")
         if event.kind is ModelEventKind.TEXT_DELTA:
             text_parts.append(event.text)
+        elif event.kind is ModelEventKind.REASONING_DELTA:
+            reasoning_parts.append(event.text)
         elif event.kind is ModelEventKind.TOOL_CALL:
             if event.tool_call is not None:
                 tool_calls.append(event.tool_call)
@@ -106,6 +114,7 @@ def collect_response(
         content="".join(text_parts),
         tool_calls=tool_calls,
         finish_reason=finish_reason,
+        reasoning_content="".join(reasoning_parts),
     )
 
 

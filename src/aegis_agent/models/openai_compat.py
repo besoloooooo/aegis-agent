@@ -60,6 +60,7 @@ class OpenAICompatibleProvider:
         stream: bool = True,
         client: Any | None = None,
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url
@@ -67,17 +68,26 @@ class OpenAICompatibleProvider:
         self._timeout = timeout
         self._stream = stream
         self._max_tokens = max_tokens
+        self._temperature = temperature
         self._client = client  # lazily built from env/args when None
 
     @classmethod
-    def from_env(cls, *, stream: bool = True, timeout: float = DEFAULT_TIMEOUT) -> OpenAICompatibleProvider:
+    def from_env(
+        cls,
+        *,
+        stream: bool = True,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> OpenAICompatibleProvider:
         """Build a provider from the ``AEGIS_*`` environment variables.
 
         A project-local ``.env`` file is loaded first (the real environment
         still wins), so configuration saved in ``.env`` is picked up without
         being exported.  Raises :class:`ModelProviderError` when required
         configuration is missing, with an actionable message naming the
-        variable.
+        variable.  ``max_tokens`` / ``temperature`` pin sampling parameters for
+        every call (used e.g. to build a deterministic summary provider).
         """
         from aegis_agent.env import load_dotenv
 
@@ -89,7 +99,15 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(f"{ENV_API_KEY} is not set; export it to use the OpenAI-compatible provider.")
         if not model:
             raise ModelProviderError(f"{ENV_MODEL} is not set; export it (e.g. 'gpt-4o-mini').")
-        return cls(api_key=api_key, base_url=base_url, model=model, stream=stream, timeout=timeout)
+        return cls(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            stream=stream,
+            timeout=timeout,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     @property
     def name(self) -> str:
@@ -140,6 +158,8 @@ class OpenAICompatibleProvider:
             kwargs["tools"] = [t.to_openai() for t in tools]
         if self._max_tokens is not None:
             kwargs["max_tokens"] = self._max_tokens
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
         return kwargs
 
     def _ensure_client(self) -> Any:
@@ -163,6 +183,12 @@ def _to_wire_message(message: Message) -> dict[str, Any]:
     models that produce invalid UTF-8 content (e.g. certain DashScope / Qwen
     responses) do not break subsequent turns when the contaminated history
     is sent back as context.  See :mod:`aegis_agent.models.sanitize`.
+
+    ``reasoning_content`` is deliberately NOT echoed back onto the wire:
+    reasoner providers (DeepSeek-style) either reject it in history or ignore
+    it, and the canonical behaviour is to not replay chain-of-thought.  It is
+    still persisted on the message so the context compressor can account for
+    and progressively clear it.
     """
     wire: dict[str, Any] = {"role": message.role.value}
     wire["content"] = sanitize_surrogates(message.content) or ""
@@ -179,7 +205,7 @@ def _to_wire_message(message: Message) -> dict[str, Any]:
             for tc in message.tool_calls
         ]
     if message.role is Role.TOOL:
-        wire["tool_call_id"] = sanitize_surrogates(message.tool_call_id) or ""
+        wire["tool_call_id"] = sanitize_surrogates(message.tool_call_id or "")
         if message.name:
             wire["name"] = sanitize_surrogates(message.name)
     return wire
@@ -195,6 +221,9 @@ def _events_from_response(response: Any) -> Iterator[ModelEvent]:
     content = getattr(message, "content", None) if message is not None else None
     if content:
         yield ModelEvent.text_delta(content)
+    reasoning = getattr(message, "reasoning_content", None) if message is not None else None
+    if reasoning:
+        yield ModelEvent.reasoning_delta(reasoning)
     tool_calls = getattr(message, "tool_calls", None) if message is not None else None
     for tc in tool_calls or []:
         function = getattr(tc, "function", None)

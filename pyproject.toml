@@ -5,12 +5,14 @@ description = "Aegis Agent — a lightweight, recoverable, extensible Agent Runt
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.28.0",
     "openai>=2.52.0",
     "prompt-toolkit>=3.0.53",
     "pydantic>=2.13.4",
     "pyfiglet>=1.0.4",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
+    "tiktoken>=0.13.0",
     "typer>=0.27.0",
 ]
 
@@ -20,6 +22,13 @@ aegis = "aegis_agent.cli:main"
 [project.optional-dependencies]
 mcp = [
     "mcp>=2.0.0",
+]
+web = [
+    "ddgs>=9.0.0",
+    "trafilatura>=2.0.0",
+]
+redis = [
+    "redis>=5.0.0",
 ]
 
 [build-system]
