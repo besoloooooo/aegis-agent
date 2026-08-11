@@ -32,7 +32,12 @@ DEFAULT_CONTEXT_MAX_TOKENS = 120_000
 @app.callback(invoke_without_command=True)
 def _main(
     ctx: typer.Context,
-    session_id: str = typer.Option("default", "--session", "-s", help="Session id for this run."),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session id for this run (default: auto-generated timestamp+hex).",
+    ),
     max_iterations: int = typer.Option(
         DEFAULT_MAX_ITERATIONS, "--max-iterations", "-n", help="Max model/tool iterations per turn."
     ),
@@ -89,6 +94,9 @@ def _main(
     snapshot_every_n: int = typer.Option(
         20, "--snapshot-every-n", help="Write a fast-resume snapshot every N messages (0=off)."
     ),
+    list_sessions: bool = typer.Option(
+        False, "--list", "-l", help="List all recorded sessions and exit."
+    ),
     version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
 ) -> None:
     """Start the interactive Aegis Agent REPL (default action)."""
@@ -114,7 +122,10 @@ def _main(
 
     # ---- session store (persistence + resume) ---------------------------
     repository = _build_repository(db_path, ephemeral)
-    session_id = resume or session_id
+    if list_sessions:
+        _print_session_list(repository)
+        raise typer.Exit()
+    session_id = resume or session_id or _new_session_id()
     if resume and repository.get_session(resume) is None:
         typer.echo(f"[error] session not found: {resume}")
         raise typer.Exit(code=1)
@@ -168,9 +179,22 @@ def _main(
     finally:
         if lease_manager is not None:
             lease_manager.stop()
+        # Snapshot final state before closing the store.
+        show_resume = not ephemeral and not list_sessions
+        msg_count = 0
+        if show_resume:
+            try:
+                msg_count = repository.message_count(session_id)
+            except Exception:  # noqa: BLE001 — session may not exist yet (empty REPL)
+                show_resume = False
         close = getattr(repository, "close", None)
         if callable(close):
             close()
+        if show_resume:
+            typer.echo(
+                f"\nSession {session_id} — {msg_count} messages.\n"
+                f"Resume: aegis --resume {session_id}"
+            )
 
 
 def _select_provider(model_flag: str):
@@ -221,6 +245,14 @@ def _build_summary_provider(provider):
         return None
 
 
+def _new_session_id() -> str:
+    """Auto-generate a session id (timestamp + random hex, like Hermes)."""
+    import datetime
+    import uuid
+
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+
+
 def _build_repository(db_path: str | None, ephemeral: bool):
     """Resolve the session store: in-memory (--ephemeral) or SQLite (default)."""
     if ephemeral:
@@ -230,6 +262,28 @@ def _build_repository(db_path: str | None, ephemeral: bool):
     from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
 
     return SQLiteSessionRepository(db_path)
+
+
+def _print_session_list(repository) -> None:
+    """Print a human-readable session table and exit."""
+    import datetime
+
+    if not hasattr(repository, "list_sessions"):
+        typer.echo("(this session store does not support listing)")
+        return
+    sessions = repository.list_sessions()
+    if not sessions:
+        typer.echo("(no sessions recorded)")
+        return
+    typer.echo(f"{'SESSION ID':<32} {'TITLE':<20} {'MSGS':>5}  {'CREATED'}")
+    typer.echo("-" * 80)
+    for s in sessions:
+        sid = s["id"][:32]
+        title = (s.get("title") or "")[:20]
+        count = s.get("message_count", 0)
+        ts = s.get("created_at")
+        created = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+        typer.echo(f"{sid:<32} {title:<20} {count:>5}  {created}")
 
 
 def _start_lease(repository, session_id: str, lease_lost: threading.Event):

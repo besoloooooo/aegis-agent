@@ -44,14 +44,16 @@ def test_cli_resume_restores_session(tmp_path, monkeypatch):
     """First run persists a turn; --resume picks the same session up."""
     db = str(tmp_path / "state.db")
     monkeypatch.setenv("AEGIS_DB_PATH", db)
-    first = runner.invoke(app, ["--model-backend", "fake"], input="hello aegis\nexit\n")
+    first = runner.invoke(
+        app, ["--model-backend", "fake", "--session", "my-session"], input="hello aegis\nexit\n"
+    )
     assert first.exit_code == 0
 
     resumed = runner.invoke(
-        app, ["--model-backend", "fake", "--resume", "default"], input="again\nexit\n"
+        app, ["--model-backend", "fake", "--resume", "my-session"], input="again\nexit\n"
     )
     assert resumed.exit_code == 0
-    assert "Resumed session default (2 messages)." in resumed.output
+    assert "Resumed session my-session (2 messages)." in resumed.output
     assert "Echo: again" in resumed.output
 
 
@@ -83,17 +85,21 @@ def test_cli_lease_blocks_second_owner(tmp_path, monkeypatch):
     db = str(tmp_path / "state.db")
     monkeypatch.setenv("AEGIS_DB_PATH", db)
     holder_repo = SQLiteSessionRepository(db)
-    holder_repo.create_session("default")
+    holder_repo.create_session("held-session")
     holder = SessionLeaseManager(get_lease_backend(holder_repo), ttl_s=30.0)
-    assert holder.acquire("default")
+    assert holder.acquire("held-session")
     try:
-        result = runner.invoke(app, ["--model-backend", "fake"], input="exit\n")
+        result = runner.invoke(
+            app, ["--model-backend", "fake", "--session", "held-session"], input="exit\n"
+        )
         assert result.exit_code == 1
         assert "owned by another process" in result.output
     finally:
         holder.stop()
         holder_repo.close()
 
-    # After the holder releases, the session is resumable again.
-    result = runner.invoke(app, ["--model-backend", "fake"], input="exit\n")
+    # After the holder releases, the session is free again.
+    result = runner.invoke(
+        app, ["--model-backend", "fake", "--session", "held-session"], input="exit\n"
+    )
     assert result.exit_code == 0

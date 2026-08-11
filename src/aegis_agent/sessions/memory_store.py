@@ -60,6 +60,20 @@ class InMemorySessionRepository:
         with self._lock:
             return len(self._messages_for(session_id))
 
+    def list_sessions(self) -> list[dict]:
+        """Return all sessions with their message counts (newest first)."""
+        with self._lock:
+            result = []
+            for sid, session in self._sessions.items():
+                result.append({
+                    "id": sid,
+                    "title": session.title,
+                    "message_count": len(self._messages.get(sid, [])),
+                    "created_at": session.created_at,
+                })
+            result.sort(key=lambda s: s["created_at"], reverse=True)
+            return result
+
     def _messages_for(self, session_id: str) -> list[Message]:
         if session_id not in self._sessions:
             raise SessionNotFoundError(f"session not found: {session_id}")

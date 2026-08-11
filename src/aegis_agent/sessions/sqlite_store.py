@@ -552,6 +552,24 @@ class SQLiteSessionRepository:
             logger.warning("write_snapshot failed for %s: %s", session_id, exc)
             return None
 
+    def list_sessions(self) -> list[dict]:
+        """Return all sessions with message counts, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, source, title, message_count, created_at FROM sessions "
+                "ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "source": r["source"],
+                "title": r["title"],
+                "message_count": r["message_count"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
     def load_latest_snapshot(
         self, session_id: str, expected_history_version: int
     ) -> dict | None:
