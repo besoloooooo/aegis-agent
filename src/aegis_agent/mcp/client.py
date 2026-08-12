@@ -158,13 +158,16 @@ def connect_servers_parallel(
     servers: dict[str, dict],
     overall_timeout: float = 120,
 ) -> dict[str, bool]:
-    """Connect to multiple MCP servers **concurrently**.
+    """Connect to multiple MCP servers **concurrently** via ``asyncio.gather``.
 
-    Each server keeps its own ``connect_timeout`` deadline (from config,
-    default 60s), but all live inside one asyncio event loop so they progress
-    in parallel.  Total wall-clock time is bounded by the slowest reachable
-    server (or ``overall_timeout``), not the sum.  Mirrors Hermes' parallel
-    ``asyncio.wait_for(_connect_server, timeout=ct)`` gather.
+    Per-server ``connect_timeout`` deadlines are enforced inside
+    :func:`_connect_async` (``asyncio.wait_for(ready.wait(), timeout=ct)``);
+    ``overall_timeout`` is a generous safety ceiling.  Total wall-clock time
+    is bounded by the slowest reachable server, not the sum.
+
+    Ported from Hermes' ``register_mcp_servers`` parallel gather pattern:
+    ``asyncio.gather(*coros, return_exceptions=True)``, single outer
+    ``_run_on_mcp_loop(_discover_all, timeout=120)``.
 
     Returns a mapping of server name → connected.
     """
@@ -173,42 +176,44 @@ def connect_servers_parallel(
     _ensure_loop()
     assert _loop is not None
 
-    # Submit one task per enabled server.
-    futures: dict[str, concurrent.futures.Future | None] = {}
+    # Collect eligible servers.
+    enabled: list[tuple[str, dict, str]] = []  # (name, config, transport)
     for name, cfg in servers.items():
         if not cfg.get("enabled", True):
-            futures[name] = None  # disabled — skip
             continue
         transport = _resolve_transport(name, cfg)
         if transport is None:
-            futures[name] = None
             continue
-        logger.info("Connecting MCP server %r (%s)...", name, transport)
-        ct = float(cfg.get("connect_timeout", 60))
-        # _connect_async already has its own asyncio.wait_for(ready.wait(), timeout=ct).
-        # We submit as-is; each self-times-out within its configured deadline.
-        futures[name] = asyncio.run_coroutine_threadsafe(
-            _connect_async(name, cfg, transport), _loop,
-        )
+        enabled.append((name, cfg, transport))
+    if not enabled:
+        return {name: False for name in servers}
 
-    # Poll with an overall deadline (safety net).
-    deadline = time.monotonic() + overall_timeout
-    results: dict[str, bool] = {}
-    for name, future in futures.items():
-        if future is None:
-            results[name] = False
-            continue
-        try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                future.cancel()
-                raise TimeoutError(f"overall MCP connection deadline ({overall_timeout:.0f}s) exceeded")
-            future.result(timeout=max(0.1, remaining))
-            results[name] = True
-        except Exception as exc:  # noqa: BLE001
-            logger.error("MCP server %r: connection failed: %s", name, exc, exc_info=False)
-            results[name] = False
-    return results
+    for name, _, transport in enabled:
+        logger.info("Connecting MCP server %r (%s)...", name, transport)
+
+    async def _connect_all() -> dict[str, bool]:
+        names = [n for n, _, _ in enabled]
+        coros = [_connect_async(name, cfg, transport) for name, cfg, transport in enabled]
+        gathered = await asyncio.gather(*coros, return_exceptions=True)
+        result: dict[str, bool] = {}
+        for name, outcome in zip(names, gathered):
+            if outcome is None:
+                result[name] = True  # success (coroutine returned None)
+            else:
+                # Per-server deadline or connection error captured as exception.
+                logger.error(
+                    "MCP server %r: connection failed: %s", name, outcome, exc_info=False
+                )
+                result[name] = False
+        return result
+
+    try:
+        return _run_on_loop(_connect_all, overall_timeout)
+    except TimeoutError:
+        logger.warning(
+            "MCP parallel discovery: overall deadline exceeded (%ss)", overall_timeout
+        )
+        return {name: False for name in servers}
 
 
 def _resolve_transport(name: str, config: dict) -> str | None:
