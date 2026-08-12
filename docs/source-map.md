@@ -191,3 +191,23 @@ pluggable leases).  Design reference: `hermes_state_核心机制.md`.
 | `src/aegis_agent/sessions/__init__.py` (updated) | **original** | — | Exports the SQLite store and lease components. |
 | `pyproject.toml` | **original** | — | New `redis` optional extra (lease backend only). |
 | `tests/test_sessions_sqlite.py`, `tests/test_session_lease.py` | **ADAPT** | `tests/run_agent/test_idempotent_persistence.py`, `tests/hermes_state/test_session_snapshots.py`, `tests/test_session_lease.py` (behavioural reference) | Same invariants re-expressed against the Aegis Protocol/`Message` surface: idempotency, monotonic seq, isolation, crash durability, snapshot==full-replay + corruption fallbacks, resume-continue no-dup, single lease winner incl. 8-way race, TTL takeover, stale-owner rejection, heartbeat/on_lost/switch, Redis via in-memory fake client. Dual-process subprocess tests (hermes `tests/lease_worker.py`) replaced by multi-connection in-process contenders. |
+
+## Stage 13 — dynamic system-prompt sections (identity / behaviour / model / environment)
+
+Fills in the actual prompt content behind the existing `SystemPromptBuilder` +
+`PromptContributor` seam (Milestone A).  Hermes composes its prompt in three
+tiers (stable / context / volatile) via `build_system_prompt_parts`; Aegis
+reproduces the subset of sections it has subsystems for and drops the rest
+(memory, `session_search`, USER.md, SOUL.md, context files, kanban,
+computer-use, platform hints, Nous branding + docs URL).
+
+| Aegis file | Relationship | Hermes source → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/context/system_prompt.py` (`DEFAULT_IDENTITY`) | **ADAPT** | `agent/prompt_builder.py` → `DEFAULT_AGENT_IDENTITY` | De-branded: same helpful/direct/uncertainty-admitting/targeted persona, Nous branding and docs-site pointer removed. Symbol name unchanged so existing imports/tests are unaffected. |
+| `src/aegis_agent/context/prompt_sections.py` (`TaskCompletionContributor`, `ToolUseEnforcementContributor` + their text) | **ADAPT** | `agent/prompt_builder.py` → `TASK_COMPLETION_GUIDANCE`, `TOOL_USE_ENFORCEMENT_GUIDANCE` | Text adapted (de-branded). Rendered only when the tool registry is non-empty. Unlike Hermes these are NOT model-family-gated — the model-substring matching table (`TOOL_USE_ENFORCEMENT_MODELS`) is out of scope. |
+| `src/aegis_agent/context/prompt_sections.py` (`ModelIdentityContributor`) | **ADAPT** | `agent/system_prompt.py` → alibaba model-name line | Renders "You are powered by the model named …" only when the provider exposes a truthy `model` (read via `getattr`); fake provider → nothing. |
+| `src/aegis_agent/context/prompt_sections.py` (`EnvironmentContributor`, `_is_wsl`, `_WSL_ENVIRONMENT_HINT`) | **ADAPT** | `agent/prompt_builder.py` → `build_environment_hints` (local branch), `WSL_ENVIRONMENT_HINT`; `hermes_constants.py` → `is_wsl` | Host OS line (WSL/Windows/macOS/Linux) + home + cwd (the ToolContext cwd) + WSL filesystem hint. Remote-backend branch dropped (Aegis has no docker/ssh/modal terminals). |
+| `src/aegis_agent/context/prompt_sections.py` (`TimestampContributor`) | **ADAPT** | `agent/system_prompt.py` → volatile timestamp line | Date-only "Conversation started: …" for prompt-cache byte-stability (Hermes PR #20451 rationale). Session-id/model/provider sub-lines dropped. |
+| `src/aegis_agent/runtime.py` (`with_defaults` wiring) | **original** | — | Registers the five contributors on `prompt_builder` in Hermes' section order (identity → task-completion → tool-use → skills → mcp → model-identity → environment → timestamp). No change to `run_turn` or the source-of-truth invariant. |
+| `src/aegis_agent/context/__init__.py` (updated) | **original** | — | Re-exports the new contributors. |
+| `tests/test_prompt_sections.py` | **original** | — | 14 tests: per-contributor render/drop conditions + composed-prompt ordering and exclusion of unsupported-subsystem terms (`memory`, `session_search`, `SOUL`, `Hermes`). |

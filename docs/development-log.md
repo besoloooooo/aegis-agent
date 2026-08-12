@@ -1676,3 +1676,93 @@ Hermes skills 是 agentskills.io / Anthropic Claude Skills 兼容格式：
 一个 `SystemPromptBuilder`（或普通 str 保持向后兼容），每轮 `build()` 实时调用
 `prompt_builder.build()` 渲染系统提示——所以技能索引会随加载的技能集合变化，但原始的会话
 消息列表完全不碰，source-of-truth 不变式不改。"
+
+## Milestone 5 — 动态系统提示词的实际内容（identity / behaviour / model / environment）
+
+### Problem and goal
+
+Milestone 4 把 `ContextBuilder` 升级成了 `SystemPromptBuilder` + `PromptContributor`
+的缝，但真正的系统提示词内容一直是残缺的：`DEFAULT_IDENTITY` 只有一句话
+（"You are Aegis Agent, a helpful assistant…"），除了技能索引和 MCP 提示，没有任何
+行为准则、模型身份、运行环境信息。目标是参照 Hermes 的动态组合方式，把 Aegis
+**真正拥有的能力对应的那几段** 补齐，其余（长期记忆、session_search、USER.md、SOUL.md、
+context files、kanban、computer-use、平台提示、Nous 品牌）坚决不写进去。
+
+### Relevant Hermes behavior and source
+
+Hermes 在 `agent/system_prompt.py:build_system_prompt_parts` 里把提示词分成三层
+（stable / context / volatile），每层用"条件 append + 丢空串 + `\n\n` join"的方式组装：
+
+- stable：`DEFAULT_AGENT_IDENTITY` → `TASK_COMPLETION_GUIDANCE` →
+  `TOOL_USE_ENFORCEMENT_GUIDANCE`（按模型家族门控）→ 技能索引 → 模型身份行 →
+  `build_environment_hints`（Host/home/cwd + `WSL_ENVIRONMENT_HINT`）→ 平台提示；
+- volatile：memory、USER profile、时间戳（date-only，PR #20451 为了 prompt cache 稳定）。
+
+Aegis 的 `SystemPromptBuilder` 本质就是这套"有序 contributor + 丢空 + join"的泛化版。
+
+### Migration decision: ADAPT
+
+文本块（finishing the job / tool-use enforcement / WSL hint / 模型身份行）从 Hermes
+**改写去品牌**后照搬语义；identity 是 REWRITE（去掉 Nous 和 docs URL）；`_is_wsl`
+从 `hermes_constants.is_wsl` 适配（读 `/proc/version` 找 microsoft 标记，进程内缓存）。
+组装 wiring 是 Aegis 原创。刻意的简化：tool-use enforcement **不按模型家族门控**
+（Hermes 有个 `TOOL_USE_ENFORCEMENT_MODELS` 子串匹配表），Aegis 只要注册了工具就注入；
+`build_environment_hints` 的 remote-backend 分支（docker/ssh/modal）不搬——Aegis 没有
+远程终端后端。
+
+### Aegis design and data flow
+
+新增 `src/aegis_agent/context/prompt_sections.py`，五个 `PromptContributor`：
+
+- `TaskCompletionContributor(registry)` / `ToolUseEnforcementContributor(registry)`
+  —— 注册表非空才渲染（无工具时这两段的失效模式不存在，直接丢）；
+- `ModelIdentityContributor(provider)` —— `getattr(provider, "model", None)` 为真才渲染，
+  所以 fake provider 不产出这一段；
+- `EnvironmentContributor(cwd)` —— Host 行（WSL/Windows/macOS/Linux）+ home + cwd
+  （传入的是 `ToolContext.cwd`，即工具真正解析相对路径的目录）+ WSL 时追加文件系统提示；
+- `TimestampContributor()` —— date-only 的 "Conversation started: …"。
+
+`AgentRuntime.with_defaults` 按 Hermes 的段落顺序把它们挂到 `prompt_builder` 上：
+identity → task-completion → tool-use →（技能索引）→（MCP 提示）→ 模型身份 → 环境 → 时间戳。
+每个 contributor 都持有活的依赖（registry / provider），每轮 `build()` 重新渲染，所以提示
+词跟随当前状态变化；但 `run_turn` 和"原始消息不可变"不变式一个字没动——这些只影响派生视图。
+
+### Key files
+
+- `src/aegis_agent/context/prompt_sections.py`（新）—— 五个 contributor + 文本常量 + `_is_wsl`；
+- `src/aegis_agent/context/system_prompt.py` —— 重写 `DEFAULT_IDENTITY`；
+- `src/aegis_agent/runtime.py` —— `with_defaults` 里的 wiring；
+- `src/aegis_agent/context/__init__.py` —— re-export；
+- `tests/test_prompt_sections.py`（新）—— 14 个测试。
+
+### Reliability invariants, edge cases, and failure handling
+
+- 无工具 → 行为两段消失；fake provider → 无模型身份行；无技能 → 无索引段（已有测试覆盖）；
+- 组合顺序有测试断言（identity < finishing < enforcement < host < started）；
+- 排他性测试：组合出的提示词里不得出现 `session_search` / `SOUL` / `Hermes` /
+  `USER.md` / `persistent memory` 等 Aegis 不支持的子系统词；
+- date-only 时间戳保证系统提示词一天内字节稳定（prompt-cache 友好）。
+
+### Tests
+
+`uv run pytest -q tests/test_prompt_sections.py`（14 passed）；
+回归 `test_skills_prompt` / `test_context_invariants`（32 passed）、
+`test_runtime` / `test_cli` / `test_tui`（21 passed）。
+`uv run ruff check`（改动文件全过）、`uv run mypy src`（改动文件无新增错误）。
+
+### Trade-offs, remaining limitations, and TODOs
+
+- tool-use enforcement 不按模型家族门控，是有意简化；若将来接入更多真实 provider，
+  可以把 Hermes 的 `TOOL_USE_ENFORCEMENT_MODELS` 匹配表补上；
+- 没有 context-files / memory / user-profile 段，符合当前里程碑边界；
+- 仓库里 `mcp/client.py`、`cli.py` 有先前遗留的 ruff/mypy 告警，与本次改动无关，未触碰。
+
+### Interview summary
+
+"这一步是把之前搭好的 `SystemPromptBuilder` 缝真正填满内容。我先读了 Hermes 怎么动态
+拼系统提示词——它分 stable/context/volatile 三层，每层条件 append、丢空串、`\n\n` join。
+我照着它的段落顺序，只把 Aegis 真有对应能力的几段做成 `PromptContributor`：行为准则
+（finishing the job + tool-use enforcement，注册表非空才出）、模型身份（provider 有 model
+才出）、运行环境（Host/home/cwd + WSL 提示）、date-only 时间戳。关键是**克制**：长期记忆、
+session_search、SOUL、context files 这些 Aegis 还没有的东西，我特意不写进去，还加了排他性
+测试守住这条线。整个改动只塑形派生的系统消息，原始会话历史和不变式完全不碰。"

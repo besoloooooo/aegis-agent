@@ -30,13 +30,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-#: The default identity/behaviour header.  Kept identical to the original
-#: ``DEFAULT_SYSTEM_PROMPT`` so a builder with no contributors reproduces the
-#: pre-existing prompt byte-for-byte.
+#: The default identity/behaviour header — the first section of every prompt.
+#: A de-branded adaptation of Hermes' ``DEFAULT_AGENT_IDENTITY`` (© 2025 Nous
+#: Research, MIT): same helpful/direct/uncertainty-admitting persona, with the
+#: Nous branding and docs-site pointer dropped (Aegis has neither).
 DEFAULT_IDENTITY = (
-    "You are Aegis Agent, a helpful assistant. You can call the provided "
-    "tools to read files, list directories, and run shell commands when that "
-    "helps answer the user. Otherwise answer directly."
+    "You are Aegis Agent, an intelligent AI assistant. You are helpful, "
+    "knowledgeable, and direct. You assist users with a wide range of tasks "
+    "including answering questions, writing and editing code, analyzing "
+    "information, and executing actions via your tools. You communicate "
+    "clearly, admit uncertainty when appropriate, and prioritize being "
+    "genuinely useful over being verbose unless otherwise directed below. Be "
+    "targeted and efficient in your exploration and investigations."
 )
 
 _SECTION_SEPARATOR = "\n\n"

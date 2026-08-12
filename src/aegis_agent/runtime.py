@@ -27,6 +27,13 @@ from enum import Enum
 
 from aegis_agent.context.builder import ContextBuilder
 from aegis_agent.context.compress import compress_context
+from aegis_agent.context.prompt_sections import (
+    EnvironmentContributor,
+    ModelIdentityContributor,
+    TaskCompletionContributor,
+    TimestampContributor,
+    ToolUseEnforcementContributor,
+)
 from aegis_agent.context.system_prompt import DEFAULT_IDENTITY, SystemPromptBuilder
 from aegis_agent.context.tool_budget import ContentReplacementState, create_state
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
@@ -266,6 +273,12 @@ class AgentRuntime:
 
         identity = system_prompt if system_prompt is not None else DEFAULT_IDENTITY
         prompt_builder = SystemPromptBuilder(identity=identity)
+        # Behaviour tier: task-completion + tool-use enforcement.  Both render
+        # live against the registry, so they include themselves only once tools
+        # exist (they read the *final* registry state at build time, even though
+        # skills/MCP tools are registered further below).
+        prompt_builder.add(TaskCompletionContributor(registry))
+        prompt_builder.add(ToolUseEnforcementContributor(registry))
         skill_router: SkillRouter | None = None
         builtin_count = len(registry.names())
         skills_count = 0
@@ -322,6 +335,12 @@ class AgentRuntime:
                 # should not prevent Aegis from starting.
                 import logging
                 logging.getLogger(__name__).warning("MCP discovery failed", exc_info=True)
+
+        # Model / environment / timestamp tiers (appended last so they render
+        # after the skills index and MCP note, matching Hermes' section order).
+        prompt_builder.add(ModelIdentityContributor(provider))
+        prompt_builder.add(EnvironmentContributor(cwd=context.cwd))
+        prompt_builder.add(TimestampContributor())
 
         builder = ContextBuilder(prompt_builder)
         startup_info = {

@@ -9,6 +9,13 @@ from aegis_agent.context.compress import (
     estimate_tokens,
     message_to_dict,
 )
+from aegis_agent.context.prompt_sections import (
+    EnvironmentContributor,
+    ModelIdentityContributor,
+    TaskCompletionContributor,
+    TimestampContributor,
+    ToolUseEnforcementContributor,
+)
 from aegis_agent.context.system_prompt import (
     DEFAULT_IDENTITY,
     PromptContributor,
@@ -19,8 +26,13 @@ __all__ = [
     "DEFAULT_IDENTITY",
     "DEFAULT_SYSTEM_PROMPT",
     "ContextBuilder",
+    "EnvironmentContributor",
+    "ModelIdentityContributor",
     "PromptContributor",
     "SystemPromptBuilder",
+    "TaskCompletionContributor",
+    "TimestampContributor",
+    "ToolUseEnforcementContributor",
     "compress_context",
     "dict_to_message",
     "estimate_tokens",
