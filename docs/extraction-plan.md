@@ -403,6 +403,7 @@ Aegis 通过**依赖注入 + 单向分层**（§5 依赖方向）根除这些环
 | — | 终端与后台进程工具（terminal / process，ProcessRegistry） | Stage 7（新增） |
 | — | Web 工具（web_search / web_extract，SSRF 门 + ddgs/Tavily/Exa 后端） | Stage 8（新增） |
 | — | 技能管理工具（skill_manage：install/uninstall/update/list + 锁文件溯源） | Stage 9（新增） |
+| — | 动态系统提示词内容填充（去品牌身份段 + finishing-the-job + tool-use enforcement + 模型身份 + 环境提示 + date-only 时间戳，按 Hermes 段落顺序的 PromptContributor） | Stage 13（新增） |
 | 阶段 6 | 层级上下文压缩（移植 `ctx-compress-opt` 三阶段管线：超大工具结果转存+预览 → micro_compact 本地清理 → 按轮 LLM 摘要 → 单轮兜底；含超大结果外置存储） | Stage 10（移植）+ Stage 11（接入 Loop，跨轮 ContentReplacementState、reasoning_content、tiktoken、确定性摘要 provider） |
 | 阶段 5 | SQLite 会话持久化 + 消息级幂等落盘 + checkpoint/tail 快照快速恢复 + 会话租约（SQLite/Redis 双后端、心跳熔断、CLI `--resume`） | Stage 12 |
 
@@ -438,6 +439,16 @@ Aegis 通过**依赖注入 + 单向分层**（§5 依赖方向）根除这些环
 
 - **范围**：重连机制（server 断开后自动恢复）、断路器（连续失败降级）、`tools/list_changed` 动态刷新。
 - **当前**：连接成功时工具固定，server 断开后调用直接报错。
+
+#### 系统提示词补全（Stage 13 已完成基础框架，Hermes 高级段未迁移）
+
+- **已做（Stage 13）**：`SystemPromptBuilder` + `PromptContributor` 缝在 Stage 4 就搭好了；Stage 13 把 Aegis 真有能力对应的段落填进去——去品牌身份段、finishing-the-job、tool-use enforcement（注册表非空才出）、模型身份（provider 有 model 才出）、环境提示（Host/home/cwd + WSL）、date-only 时间戳。刻意排除：`memory`、`session_search`、USER.md、SOUL.md、context files、kanban、computer-use、平台提示、Nous 品牌。组合顺序与不变式有测试守护（`tests/test_prompt_sections.py`）。
+- **未做**（等对应子系统存在后再加）：
+  - **context files / 项目指令段**——读工作目录下的项目说明文件（类 `AGENTS.md`/`CLAUDE.md`）注入提示词，需先有项目指令加载器；
+  - **模型家族门控的 tool-use enforcement**——Hermes 有 `TOOL_USE_ENFORCEMENT_MODELS` 子串匹配表，Aegis 目前一律注入；将来接更多真实 provider 时可补；
+  - **模型家族专属操作指导**（`GOOGLE_MODEL_OPERATIONAL_GUIDANCE`、`OPENAI_MODEL_EXECUTION_GUIDANCE`）——按需引入；
+  - **长期记忆 / session_search / USER profile / SOUL.md / 平台提示 / 远程终端后端环境探针**——均属超范围功能，按 CLAUDE.md §5 不迁移；
+  - **分钟级时间戳 / session-id 子行**——目前为 prompt-cache 稳定只用 date-only，如需可加。
 
 ---
 
