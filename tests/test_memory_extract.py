@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from aegis_agent.memory.extractor import (
     MemoryAction,
     apply_actions,
@@ -199,3 +201,45 @@ class TestFilenameValidation:
         assert not is_valid_memory_filename("MEMORY.md")
         assert not is_valid_memory_filename(".hidden.md")
         assert not is_valid_memory_filename("noext")
+
+
+class TestStalenessCheck:
+    """mtime staleness check (cross-process, best-effort) on memory writes.
+
+    Mirrors Claude Code FileWriteTool: a write whose target changed since this
+    process last read it is refused instead of silently overwriting.  New files
+    (never read) are not checked — matching Claude's meta===null skip.
+    """
+
+    def test_refuses_write_when_changed_since_read(self, tmp_path):
+        from aegis_agent.memory.store import (
+            record_read,
+            render_memory_file,
+            write_memory_file,
+        )
+
+        body = lambda: render_memory_file(name="a", description="x", memory_type="user", body="v")
+        write_memory_file(tmp_path, "a.md", body())
+        f = memory_dir(tmp_path) / "a.md"
+        # Fake "this process last read it long ago" so the current mtime looks newer.
+        record_read(f, 0.0)
+        with pytest.raises(ValueError):
+            write_memory_file(tmp_path, "a.md", body())
+
+    def test_write_ok_when_not_changed(self, tmp_path):
+        from aegis_agent.memory.store import render_memory_file, write_memory_file
+
+        body = lambda: render_memory_file(name="a", description="x", memory_type="user", body="v")
+        # First write records the fresh mtime; a second write by the same process
+        # sees current == last and is allowed.
+        write_memory_file(tmp_path, "a.md", body())
+        write_memory_file(tmp_path, "a.md", body())  # must not raise
+
+    def test_new_file_not_checked(self, tmp_path):
+        from aegis_agent.memory.store import render_memory_file, write_memory_file
+
+        write_memory_file(
+            tmp_path, "new.md",
+            render_memory_file(name="n", description="x", memory_type="user", body="x"),
+        )
+        assert (memory_dir(tmp_path) / "new.md").exists()

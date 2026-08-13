@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aegis_agent.memory.paths import memory_dir
-from aegis_agent.memory.store import _read_text
+from aegis_agent.memory.store import _read_text, record_read
 from aegis_agent.memory.types import MemoryType
 from aegis_agent.skills.frontmatter import parse_frontmatter
 
@@ -100,6 +100,9 @@ def scan_memory_files(home: str | Path | None = None) -> list[MemoryCandidate]:
             if head is None:
                 continue
             frontmatter, _ = parse_frontmatter(head)
+            # Record the observation so a later write can detect external changes
+            # (mtime staleness check in the store).
+            record_read(path, mtime)
         except OSError:
             logger.debug("memory scan: skipping unreadable %s", path, exc_info=True)
             continue

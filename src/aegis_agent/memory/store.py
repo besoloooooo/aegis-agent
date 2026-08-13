@@ -113,6 +113,46 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+# ── mtime staleness check (cross-process, best-effort) ──────────────────────
+#
+# Behavioural reference: Claude Code ``FileWriteTool.ts`` — before writing, it
+# compares the file's current mtime against the time this process last read it
+# (``readFileState``); if the file changed since, it raises
+# ``FILE_UNEXPECTEDLY_MODIFIED_ERROR`` instead of silently overwriting.  Aegis
+# reproduces that optimistic-concurrency check for memory writes: a write whose
+# target was touched by another process since we last read it is refused.  New
+# files (never read → no record) are not checked, matching Claude's
+# ``meta === null`` skip.  This is NOT a lock — it only detects conflicts, it
+# does not serialise writers.
+
+#: Resolved path → mtime this process last observed (read or wrote) the file.
+_read_state: dict[Path, float] = {}
+
+
+def record_read(path: str | Path, mtime: float) -> None:
+    """Record that this process last observed ``path`` at ``mtime``."""
+    try:
+        _read_state[Path(path).resolve()] = mtime
+    except OSError:
+        pass
+
+
+def get_last_read(path: str | Path) -> float | None:
+    """Return the mtime this process last recorded for ``path``, or ``None``."""
+    try:
+        return _read_state.get(Path(path).resolve())
+    except OSError:
+        return None
+
+
+def _record_read_of(path: Path) -> None:
+    """Record this process's current observation of ``path`` (best-effort)."""
+    try:
+        _read_state[path.resolve()] = path.stat().st_mtime
+    except OSError:
+        pass
+
+
 def load_user_profile(path: str | Path) -> str | None:
     """Return the truncated ``USER.md`` text, or ``None`` if absent/empty."""
     content = _read_text(Path(path))
@@ -140,6 +180,7 @@ def parse_memory_file(path: str | Path) -> MemoryEntry | None:
     content = _read_text(p)
     if content is None:
         return None
+    _record_read_of(p)
     frontmatter, body = parse_frontmatter(content)
     name = str(frontmatter.get("name", "")).strip() or p.stem
     description = str(frontmatter.get("description", "")).strip()
@@ -228,7 +269,23 @@ def write_memory_file(
     if target.parent != directory.resolve():
         raise ValueError(f"memory path escapes the memory directory: {filename!r}")
 
+    # mtime staleness check (cross-process, best-effort): refuse to overwrite a
+    # file that changed since this process last read it — another process wrote
+    # it, so the write is skipped rather than silently clobbering the newer
+    # content.  New files (no prior read) are written unconditionally.
+    if target.exists():
+        try:
+            current = target.stat().st_mtime
+        except OSError:
+            current = 0.0
+        last = get_last_read(target)
+        if last is not None and current > last:
+            raise ValueError(
+                f"memory file {filename!r} changed since it was last read; skipping write"
+            )
+
     atomic_write(target, content)
+    _record_read_of(target)
     return target
 
 

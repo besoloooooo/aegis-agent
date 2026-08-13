@@ -2052,3 +2052,48 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
   这段时间给它跑）；若想首轮也注入，可改为「首轮同步等一个很短的超时」，这是未做的权衡；
 - drain 后若再 `before_turn` 会因线程池已 shutdown 抛异常——CLI 只在退出时 drain 一次，无影响；
 - 仍无真正的 provider prompt cache，放系统提示词的注入点在缓存友好性上仍是已记录的设计债。
+
+---
+
+## Milestone 7 补记二 — 跨进程写冲突检测（mtime staleness check，对齐 Claude FileWrite）
+
+### 为什么做
+
+上一版 memory 写盘是「原子但不检测冲突」：两个 Aegis 窗口（两个进程）同时提取时，后写者会
+静默覆盖先写者，索引 `rebuild_index` 会丢条目。查证 Claude 源码后确认，**Claude 的常规提取也
+没有跨进程文件锁**（`extractMemories.ts` 的并发控制全是进程内闭包 `inProgress`/`pendingContext`/
+`inFlightExtractions`），它靠的是 **FileWrite/FileEdit 工具自带的 mtime staleness check**：
+写前对比文件当前 mtime 和本进程上次读取时间，变了就抛 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`。
+（Claude 里唯一真正的跨进程锁是 autoDream 专用的 `consolidationLock.ts`，常规提取不用。）
+
+### 做了什么
+
+在 Aegis 的 memory 写入口 `write_memory_file` 复刻这个乐观并发检查：
+
+- `store.py` 加进程内 `_read_state`（resolved path → 本进程上次观察到的 mtime）+ `record_read` /
+  `get_last_read` / `_record_read_of`；
+- `scan_memory_files` 和 `parse_memory_file` 读文件时 `record_read`（记录「上次读」时间）；
+- `write_memory_file` 写前：若目标存在且当前 mtime > 记录值 → 抛 `ValueError`（`apply_actions`
+  捕获后跳过该 action），否则原子写并刷新记录。
+
+### 与 Claude 的对齐 / 局限（一致）
+
+| 维度 | 行为 |
+|---|---|
+| 更新已有文件（如 MEMORY.md 或 update 已有记忆） | mtime 变了 → 拒绝写（对齐 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`） |
+| 创建新文件（新记忆主题） | **不检查**（无「上次读」记录），与 Claude 的 `meta===null` 跳过一致 |
+| 性质 | 乐观并发 + 冲突检测，**不是锁**——不串行化写者，只检测到就拒绝 |
+| mtime 精度 | 秒级/亚秒级精度局限与 Claude 相同 |
+
+### 测试
+
+新增 `TestStalenessCheck`（3 项）：外部改动后拒绝写、本进程未变则正常写、新文件不检查。
+`uv run pytest tests/test_memory_extract.py tests/test_memory_recall.py tests/test_memory.py -q` → **61 passed**；
+回归（含 write_file/patch）→ **149 passed**；ruff/mypy 干净。
+
+### 结论
+
+对齐 Claude 的「常规提取」跨进程行为：进程内串行（单 worker）+ 写文件 mtime 冲突检测，无锁文件。
+用户诉求「先写存、后写提示」在当前个人级、best-effort 语义下，以「后写者检测到冲突 → 跳过本轮
+提取」近似满足；若将来要严格的「先写存、后写阻塞等待」，再考虑 autoDream 式的 `.consolidate-lock`
+锁文件。
