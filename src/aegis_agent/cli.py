@@ -64,6 +64,21 @@ def _main(
         help="Path to MCP server config (default: ~/.aegis/config.yaml).",
     ),
     no_mcp: bool = typer.Option(False, "--no-mcp", help="Disable MCP server discovery."),
+    no_memory: bool = typer.Option(
+        False,
+        "--no-memory",
+        help="Disable personal long-term memory (USER.md / MEMORY.md injection).",
+    ),
+    memory_recall: bool = typer.Option(
+        False,
+        "--memory-recall",
+        help="Enable relevance recall: surface relevant memories per turn via a side-query model.",
+    ),
+    memory_extract: bool = typer.Option(
+        False,
+        "--memory-extract",
+        help="Enable background memory extraction after each final reply (writes to ~/.aegis/memory).",
+    ),
     context_max_tokens: int | None = typer.Option(
         None,
         "--context-max-tokens",
@@ -152,6 +167,7 @@ def _main(
             )
             raise typer.Exit(code=1)
 
+    runtime: AgentRuntime | None = None
     try:
         runtime = AgentRuntime.with_defaults(
             provider=provider,
@@ -162,6 +178,9 @@ def _main(
             skills_dir=skills_dir,
             enable_mcp=not no_mcp,
             mcp_config_path=mcp_config,
+            enable_memory=not no_memory,
+            enable_memory_recall=memory_recall and not no_memory,
+            enable_memory_extract=memory_extract and not no_memory,
             context_token_budget=context_budget,
             summary_provider=summary_provider,
         )
@@ -179,6 +198,10 @@ def _main(
             snapshot_every_n=snapshot_every_n,
         )
     finally:
+        # Wait for any in-flight background memory work (recall/extract) before
+        # the process exits, mirroring Claude Code's drain-before-exit.
+        if runtime is not None:
+            runtime.shutdown()
         if lease_manager is not None:
             lease_manager.stop()
         # Snapshot final state before closing the store.

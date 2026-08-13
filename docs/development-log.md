@@ -1766,3 +1766,289 @@ identity → task-completion → tool-use →（技能索引）→（MCP 提示�
 才出）、运行环境（Host/home/cwd + WSL 提示）、date-only 时间戳。关键是**克制**：长期记忆、
 session_search、SOUL、context files 这些 Aegis 还没有的东西，我特意不写进去，还加了排他性
 测试守住这条线。整个改动只塑形派生的系统消息，原始会话历史和不变式完全不碰。"
+
+---
+
+## Milestone 6 — 个人级长期记忆（Stage 1：存储格式 + MEMORY.md 索引注入 + 行为提示词）
+
+### Task goal and the original problem
+
+给 Aegis 加**跨会话的个人长期记忆**。本阶段**只做个人级**，且只做读侧三件事：
+（1）Memory 存储格式，（2）`MEMORY.md` 索引注入，（3）Memory 行为提示词。
+**明确不做**：`findRelevantMemories` / Top-K 召回、`extractMemories` 后台自动提取、
+embedding / 向量库、Project / Team Memory、autoDream。参考文档是
+`Claude-Code/docs/08-memory.md`（即 Claude Code 的 `src/memdir/*`）。
+
+### 参考行为与来源（Claude Code，不是 Hermes）
+
+- `src/memdir/paths.ts:getAutoMemPath` —— 记忆目录解析；
+- `src/memdir/memoryTypes.ts` —— 四类记忆（user/feedback/project/reference）与"存什么/不存什么"文案；
+- `src/memdir/memdir.ts:truncateEntrypointContent` —— `MEMORY.md` 索引 200 行 / 25 KB 双上限截断 + 警告；
+- `src/memdir/memdir.ts:loadMemoryPrompt` —— `memory` 系统提示词分节；
+- `src/utils/claudemd.ts`(:979) —— 把 `MEMORY.md` 作为 `AutoMem` 上下文条目注入。
+
+因为源在 Claude Code，本阶段是**行为再实现（ADAPT/original）**，不是代码 port。
+
+### Migration decision
+
+- **paths / types / store / prompt**：ADAPT —— 复刻可观察行为（目录布局、四类型、截断上限、
+  索引/正文分离、行为规则），但只保留个人级，砍掉 settings 覆盖链、git-root 规范化、
+  `~/.ssh` 安全护栏（Aegis 目前没有"不可信项目级 settings"这个来源）、project/team 目录。
+- **runtime / cli / tui 接线**：original。
+
+### Aegis 设计、数据流与关键接口
+
+目录布局（个人级）：
+
+```
+$AEGIS_HOME(默认 ~/.aegis)/
+├── USER.md            # 稳定用户画像（不是 Auto Memory）
+└── memory/
+    ├── MEMORY.md      # Auto Memory 索引（一行一条）
+    └── *.md           # 具体 Memory 正文（frontmatter + 正文）
+```
+
+- `memory/paths.py`：`aegis_home()` / `user_profile_path()` / `memory_dir()` /
+  `memory_index_path()`。`$AEGIS_HOME` 覆盖 home，`$AEGIS_MEMORY_DIR` 直接覆盖记忆目录。
+- `memory/types.py`：`MemoryType` 枚举（四类，`str` 混入便于 frontmatter round-trip），
+  `parse()` 容错（未知/缺失 → `None`）。
+- `memory/store.py`：`truncate_entrypoint_content()`（先行后字节，UTF-8 边界安全，截断附提示）、
+  `load_user_profile()` / `load_memory_index()`（缺失/空 → `None`，永不抛）、
+  `parse_memory_file()` → `MemoryEntry`（复用 skills 的 frontmatter 解析器；本阶段没有任何
+  地方自动读正文，留给后续召回阶段）。
+- `memory/prompt.py`：三个 `PromptContributor` ——
+  `MemoryBehaviorContributor`（静态行为规则）、`UserProfileContributor`（USER.md，独立标题）、
+  `MemoryIndexContributor`（MEMORY.md，明确标注"是索引不是正文"）。每次 build 重新读文件。
+
+注入调用链：
+
+```
+AgentRuntime.with_defaults(enable_memory=True, memory_home=...)
+  → prompt_builder.add(MemoryBehaviorContributor())
+  → prompt_builder.add(UserProfileContributor(USER.md))
+  → prompt_builder.add(MemoryIndexContributor(MEMORY.md))
+  → ContextBuilder(prompt_builder)
+每轮 run_turn → ContextBuilder.build() → 各 contributor.render()（文件现读现截断）
+  → 拼进 system message（派生视图；原始历史不动）
+```
+
+段落顺序：行为准则 → skills → mcp → **memory 三段** → 模型身份 → 环境 → 时间戳。
+`USER.md` 段在 `MEMORY.md` 段之前，且各自带清晰不同的标题，语义不混。
+
+### Reliability invariants / edge cases / failure handling
+
+- 文件缺失/空/不可读 → 对应段 `render()` 返回 `None`，被 builder 丢弃，**不影响启动**；
+- `MEMORY.md` 超 200 行或 25 KB → 安全截断并追加"可能不完整"提示（对齐 Claude）；
+- 只注入**索引**，正文由模型按需用 Read/Grep 自取（本阶段无自动召回、无自动写盘）；
+- 只塑形派生 system message，**原始消息、session/resume/持久化不变式完全不受影响**
+  （有专门测试守这条线）；
+- `USER.md` 与 Auto Memory 分开处理，前者不当普通 Memory。
+
+### Tests、结果
+
+新增 `tests/test_memory.py`（27 项）：路径解析与 `$AEGIS_HOME`/`$AEGIS_MEMORY_DIR` 覆盖、
+四类型解析、frontmatter 解析、行/字节截断、存在/缺失注入、USER.md vs MEMORY.md 语义区分、
+runtime 接线 + `--no-memory`、以及"记忆不影响会话持久化"。更新 `tests/test_prompt_sections.py`：
+排他性测试收窄为 `session_search`/`SOUL`/`Hermes`，新增 `test_memory_section_present`。
+
+- `uv run pytest tests/test_memory.py -q` → **27 passed**；
+- 回归 `test_prompt_sections`/`test_runtime`/`test_cli`/`test_tui`/`test_context_invariants`/
+  `test_sessions`/`test_sessions_sqlite` → **92 passed**；
+- `uv run ruff check`（改动文件全过）；`uv run mypy src` 改动模块（`memory/*`、runtime）**无新增错误**
+  （既有的 cli/mcp/web 等历史告警与本次无关，未触碰）。
+- 全量 `uv run pytest -q`：除两个**与本次无关**的既有失败外全过——
+  `test_web_tools::test_web_extract_blocks_private_url`（真实 Tavily 网络调用返回 400）、
+  以及被本次有意更新的 `test_prompt_sections` 旧排他断言（已改）。
+
+### Trade-offs、限制与 TODO
+
+- 本阶段**只有读侧**：不自动写记忆、不自动召回、不做 embedding；
+- `parse_memory_file`/`MemoryEntry` 已就绪但暂无消费者，为下一阶段召回预留；
+- 未做 Project / Team Memory，但 `MemoryType` 四类已按 Claude 对齐，可直接复用；
+- 未移植 `~/.ssh` 安全护栏——等 Aegis 引入"项目级 settings"这类不可信来源时再补。
+
+### Interview summary
+
+"这步给 Aegis 加个人级长期记忆，但我严格只做读侧三件事：存储格式、`MEMORY.md` 索引注入、
+行为提示词。核心照搬 Claude Code 的两条设计——**索引/正文分离**（常驻上下文的只有目录页，
+硬上限 200 行/25KB，正文让模型按需 Read）和**提示词里把'该存什么/不该存什么/记忆是可能过期的
+历史'讲清楚**。接入点选得很轻：Aegis 早有 `SystemPromptBuilder + PromptContributor` 这个缝
+（skills 就是这么注入索引的），我照抄这个模式加了三个 contributor，`run_turn` 一行没改，
+原始历史和会话不变式完全不碰。`USER.md`（稳定画像）和 `MEMORY.md`（Auto Memory 索引）刻意分成
+两段、语义不混。文件缺失就整段不渲染，绝不阻塞启动。召回、后台提取、项目级这些我都留到下一阶段。"
+
+---
+
+## Milestone 7 — 记忆相关性召回 + 后台自动提取（Stage 2/3，个人级）
+
+### Task goal and the original problem
+
+第一阶段已有「存储格式 + `MEMORY.md` 索引注入 + 行为提示词」。本阶段一次性补齐 Claude Code
+Auto Memory 的两条**动态**通道，仍然只做个人级：
+
+1. **相关性召回（Recall）** —— 用户提问时自动"想起来"最相关的 ≤5 条记忆正文，注入本轮上下文；
+2. **后台自动提取（Extract）** —— 一轮对话结束后后台判断有无值得长期保存的信息，产出
+   create/update 动作，写盘并刷新 `MEMORY.md`。
+
+**明确不做**：embedding / Vector DB、Project / Team Memory、autoDream、复杂 Memory Eval。
+
+### 参考行为与来源（Claude Code）
+
+- `src/memdir/memoryScan.ts:scanMemoryFiles` / `formatMemoryManifest` —— 只读 frontmatter 的
+  轻量扫描 + 紧凑清单，上限 200 文件；
+- `src/memdir/findRelevantMemories.ts` —— side query（JSON schema，≤5 条，拿不准就不选）→
+  校验返回文件名 → 只读选中正文；
+- `src/utils/attachments.ts` —— `getRelevantMemoryAttachments` / `readMemoriesForSurfacing` /
+  `collectSurfacedMemories`（正文单文件+总量上限、`already_surfaced` 去重）；
+- `src/services/extractMemories/extractMemories.ts` + `prompts.ts` —— 游标 + 互斥 + 权限沙箱 +
+  提取提示词；
+- `src/query/stopHooks.ts` / `src/query.ts:301/1599` —— 召回预取/收集、最终回复后触发提取。
+
+### Migration decision
+
+全部 **ADAPT（行为再实现）**，因为源在 Claude Code（TS）而非 Hermes；`sidequery.py`、
+`runtime/cli` 接线为 **original**。三处刻意简化见下。
+
+### Aegis 设计、数据流与关键接口
+
+**Recall 调用链：**
+
+```
+run_turn → MemoryManager.before_turn(session_id, user_query)
+  → scan_memory_files()  只读 frontmatter（≤200、排除 MEMORY.md、坏文件跳过）
+  → format_manifest()    紧凑清单（filename/type/description，不含正文）
+  → run_side_query()     复用 ModelProvider（默认主 provider），JSON 解析容错
+  → _select_filenames()  只保留 Manifest 里真实存在的文件名，截断到 5 条
+  → 只读被选中正文（4KB/文件 + 12KB/总量上限）
+  → RelevantMemoriesContributor.set_block(render_recall_block(...))
+系统提示词每次 rebuild 时把该 block 作为 "## Relevant memories" 注入派生 context
+（原始历史不动）
+```
+
+**Extract 调用链：**
+
+```
+run_turn → 正常 FINAL_ANSWER 后 → MemoryManager.after_turn(session_id, messages, tool_calls)
+  → 若主 Agent 本轮已写 memory 目录（write_file/patch 的 path 命中）→ skip（互斥）
+  → messages_since_cursor(messages, cursor)  只审游标后的新增消息
+  → extract_memories()  side query → {"actions":[{action,filename,type,name,description,content}]}
+  → _coerce_action()    校验 filename 安全 + 个人级 type（拒绝 project）+ content 非空
+  → apply_actions()     write_memory_file（路径安全）→ rebuild_index()（幂等、去重）
+  → 推进游标到最新消息 client_msg_id
+```
+
+### 与 Claude Code 的对应关系 & 简化
+
+| 维度 | Claude Code | Aegis |
+|---|---|---|
+| 召回注入 | 附件消息 `relevant_memories` + 预取/收集 | 有状态 `PromptContributor`（系统提示词每次 rebuild，天然每轮、不进历史） |
+| side query | 独立 `sideQuery` 传输 | 复用现有 `ModelProvider.stream()` + `collect_response`，不造新 Provider |
+| 提取执行 | fork 子 agent + 权限沙箱（Write 只允许落在记忆目录） | 结构化 `MemoryAction → store.apply()`，**不给 Extractor 通用 Write 权限**（§8 更安全） |
+| 触发 | stopHooks 后台 fire-and-forget | 最终回复后同步 best-effort（用户已拿到答案，失败只记日志） |
+| 游标 | 消息 UUID；被压缩则回退审全部可见 | `client_msg_id` 游标；未知/丢失回退最近 12 条 |
+| 去重 | `already_surfaced` + readFileState 双重 | 实现 `already_surfaced`；主动 Read 检测因架构低侵入暂未做（见 TODO） |
+
+**完全对齐**：manifest 只含 metadata、≤5 条、拿不准少选、非法文件名/`../` 拒绝、只读选中正文、
+正文单文件/总量上限、游标只审新增消息、主 Agent 已写则跳过、`MEMORY.md` 只存索引且幂等去重、
+extractor 失败不影响主回答。
+
+### 可靠性不变量 / 边界 / 失败处理
+
+- 召回/提取任意失败（provider 异常、JSON 解析失败、坏文件、文件消失）→ 记 debug 日志，**绝不影响主流程**；
+- 只塑形派生 context / 只写 memory 目录，**原始会话历史与 session/resume/持久化不变式完全不碰**；
+- `write_memory_file` 双层防护：`is_valid_memory_filename` + resolved 路径必须落在 memory 目录内；
+- 游标失效安全回退（最近 12 条），不会永久停摆；有消息无 client_msg_id 时用最后一条有 id 的推进；
+- interrupted / error 轮次不跑提取（partial turn 不进记忆），但 recall block 仍会清掉防泄漏。
+
+### Tests 与结
+
+新增 `tests/test_memory_recall.py`（17 项）+ `tests/test_memory_extract.py`（14 项），覆盖两份
+验收清单全部 12+12 条。
+
+- `uv run pytest tests/test_memory_recall.py tests/test_memory_extract.py -q` → **31 passed**；
+- 全量记忆+回归（memory/prompt_sections/runtime/cli/tui/context_invariants/sessions/sqlite）→ **123 passed**；
+- `uv run ruff check`（memory 包 + 改动文件）→ **All checks passed**；
+- `uv run mypy src` → memory 包与 runtime **无新增错误**（既有 cli/mcp/sessions 历史告警与本次无关）。
+
+### Trade-offs、限制与 TODO
+
+- 提取是**同步** best-effort，非后台线程/fork —— 后续优化项，非行为需求；
+- 未实现主动 Read 检测去重（`note_surfaced` 已留接口，接入 Read 工具后即可用）；
+- Context 压缩后 `already_surfaced` 是否重置未做（Claude 当前行为未明确，未自行扩大范围）；
+- 仅个人级，`project` type 在提取侧被主动拒绝（enum 已就绪，供后续项目级复用）；
+- 未做 embedding / 向量召回（严格按要求）。
+
+### Interview summary
+
+"第二三阶段我给个人级记忆补上了两条动态通道：召回和提取，但都严格照 Claude Code 的调用链走，
+不自己发明架构。召回是 scan→manifest→side query→校验文件名→只读选中正文→注入 '## Relevant
+memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegis 现成的 `PromptContributor` 缝——
+系统提示词每次 rebuild，所以这个有状态的 contributor 天然每轮生效、又不碰历史，比 Claude 的附件
+消息更贴合 Aegis。提取用游标只审新增消息，side query 返回结构化 action，再由 path-safe 的 store
+落盘并幂等重建 `MEMORY.md`；主 Agent 本轮已经自己写过记忆就跳过，避免重复提取。关键安全点是
+**不给 extractor 通用 Write 权限**，而是结构化 action → store 内部校验路径，model 无法指定任意
+绝对路径。原始历史、session/resume 这些不变式一行没动，123 个回归测试全绿。"
+
+---
+
+## Milestone 7 补记 — 召回/提取异步化（对齐 Claude 的 fire-and-forget + 预取/收集）
+
+### 改了什么
+
+上一版召回和提取都是**同步**的（召回挡在首轮模型调用前，提取挡在 `run_turn` 返回前）。本轮改成
+后台异步，对齐 Claude Code 的调用链：
+
+- **召回**：`before_turn` 不再同步跑，改为把召回提交到一个小线程池（`Future`），立即返回；
+  新增 `collect_recall()` 非阻塞收集点，`run_turn` 循环里每次 `build(context)` 前调用——
+  召回完成了就注入，没完成就跳过（对齐 Claude「赶不上就跳过，永不阻塞」）。因为 side query 要
+  1~5 秒而首轮 build 只要几毫秒，所以**首轮通常赶不上**，真正注入发生在「工具执行完、第二次模型
+  请求前」——这正是 Claude 预取/收集的设计。
+- **提取**：`after_turn` 不再同步跑，改为把任务快照入队（fire-and-forget），由**单个 worker 线程**
+  串行消费；新增 `drain()` 在 CLI 退出前等待未完成工作落盘。
+
+### 锁的结论（回答「写入 md 有没有锁」）
+
+- Aegis 单文件写用 `atomic_write`（mkstemp + fsync + `os.replace`）是**原子替换**，能保证不写坏
+  文件，但**不是锁**——并发会「后写覆盖先写」。
+- 索引 `rebuild_index` 是读-改-写，无锁，并发会丢条目。
+- **Claude 也没有文件锁**：它靠 (1) 应用层互斥 `hasMemoryWritesSince`（主 agent 本轮写过就跳过
+  提取，Aegis 的 `_main_agent_wrote_memory` 已对齐）+ (2) stash 串行队列（提取任务一个跑完再跑
+  下一个）+ 节流。
+- Aegis 异步化后补上了「串行」这半：**单 worker 线程 + 队列**（等价于 Claude 的 stash 队列），
+  提取写盘天然串行，不再需要文件锁。文件写层面 Aegis 的 `os.replace` 原子写其实**不弱于甚至强于**
+  Claude 的 Node `fs`。
+
+### 与 Claude 的对齐点 / 差异
+
+| 维度 | Claude | Aegis（异步化后） |
+|---|---|---|
+| 召回启动 | 每轮提问进入循环时预取（`startRelevantMemoryPrefetch`） | `before_turn` 提交线程池，立即返回 |
+| 召回收集 | 工具执行完、下次请求前收集点 | `collect_recall` 在每次 `build` 前非阻塞收集 |
+| 首轮注入 | 通常赶不上，跳过 | 同（对齐） |
+| 提取触发 | stopHooks fire-and-forget | `after_turn` 入队，立即返回 |
+| 提取串行 | stash 队列 | 单 worker 线程 + 队列 |
+| 退出 drain | `drainPendingExtraction`（-p 最多等 60s） | `runtime.shutdown()` → `manager.drain()` |
+
+### 改动文件
+
+- `memory/manager.py`：`_SessionState.pending_recall`（`Future`）、`_ExtractTask`、线程池 + 提取
+  队列/worker、`before_turn`/`collect_recall`/`after_turn`/`drain` 重写；
+- `runtime.py`：循环内加 `collect_recall` 收集点；新增 `shutdown()`；
+- `cli.py`：退出路径 `runtime.shutdown()`（`runtime` 提为 `AgentRuntime | None`）；
+- 测试：3 处加 `drain()` / `collect_recall()` 显式等待（异步语义下不能立即断言）。
+
+### 测试与结果
+
+- `uv run pytest tests/test_memory_recall.py tests/test_memory_extract.py tests/test_memory.py -q` → **58 passed**；
+- 回归（prompt/runtime/streaming/cli/tui/context_invariants/sessions/sqlite）→ **130 passed**；
+- `uv run ruff check`（memory 包 + runtime + cli）→ 仅 cli 既有告警，新代码零告警；
+- `uv run mypy src` → memory 包与 runtime **无新增错误**（既有 14 个历史告警不变）。
+
+### 遗留 / TODO
+
+- `RelevantMemoriesContributor` 的 set/clear/render 全部在主线程，故未加锁（召回线程只通过
+  `Future` 返回结果，不碰 contributor）——若将来 contributor 被后台线程直接写，需补锁；
+- 召回首轮「赶不上」是**有意对齐** Claude，但单轮无工具调用的对话里召回基本不生效（没工具执行
+  这段时间给它跑）；若想首轮也注入，可改为「首轮同步等一个很短的超时」，这是未做的权衡；
+- drain 后若再 `before_turn` 会因线程池已 shutdown 抛异常——CLI 只在退出时 drain 一次，无影响；
+- 仍无真正的 provider prompt cache，放系统提示词的注入点在缓存友好性上仍是已记录的设计债。

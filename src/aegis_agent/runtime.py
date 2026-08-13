@@ -38,6 +38,13 @@ from aegis_agent.context.system_prompt import DEFAULT_IDENTITY, SystemPromptBuil
 from aegis_agent.context.tool_budget import ContentReplacementState, create_state
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
+from aegis_agent.memory.manager import MemoryEvent, MemoryManager
+from aegis_agent.memory.prompt import (
+    MemoryBehaviorContributor,
+    RelevantMemoriesContributor,
+    default_memory_index_contributor,
+    default_user_profile_contributor,
+)
 from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.sessions.repository import SessionRepository
@@ -193,6 +200,7 @@ class AgentRuntime:
         context_token_budget: int | None = None,
         compress_storage_dir: str | None = None,
         summary_provider: ModelProvider | None = None,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -202,6 +210,11 @@ class AgentRuntime:
         self._max_iterations = max_iterations
         self._skill_router = skill_router
         self._startup_info = startup_info or {}
+        # Personal long-term memory (Stage 2/3): recall before the turn, extract
+        # after the final reply.  ``None`` disables both channels (Stage-1
+        # behaviour).  The manager only shapes the derived context and writes to
+        # the memory dir — it never mutates session history.
+        self._memory_manager = memory_manager
         # Context compression (Stage 11).  ``context_token_budget=None`` disables
         # compression entirely; when set, the derived context is compressed
         # before every model call.  ``_budget_states`` holds one
@@ -227,6 +240,12 @@ class AgentRuntime:
         skills_dir: str | None = None,
         enable_mcp: bool = True,
         mcp_config_path: str | None = None,
+        enable_memory: bool = True,
+        memory_home: str | None = None,
+        enable_memory_recall: bool = False,
+        enable_memory_extract: bool = False,
+        memory_side_provider: ModelProvider | None = None,
+        memory_event_sink: Callable[[MemoryEvent], None] | None = None,
         context_token_budget: int | None = None,
         compress_storage_dir: str | None = None,
         summary_provider: ModelProvider | None = None,
@@ -249,6 +268,14 @@ class AgentRuntime:
         from ``mcp_config_path`` (or ``~/.aegis/config.yaml``) and their tools
         are registered into the tool registry.  If the ``mcp`` SDK is not
         installed this is a no-op.
+
+        When ``enable_memory`` is True (the default), personal long-term memory
+        is wired into the system prompt: the memory behaviour rules, the
+        ``USER.md`` profile and the ``MEMORY.md`` index (from ``memory_home`` or
+        ``$AEGIS_HOME``/``~/.aegis``).  Missing files render nothing, so an
+        empty install behaves exactly as before.  Only the *index* is injected —
+        memory bodies are read on demand by the model; there is no automatic
+        recall or extraction in this milestone.
 
         When ``context_token_budget`` is set, the derived context is compressed
         (``context.compress_context``) before every model call — oversized tool
@@ -336,6 +363,36 @@ class AgentRuntime:
                 import logging
                 logging.getLogger(__name__).warning("MCP discovery failed", exc_info=True)
 
+        # ---- Personal long-term memory -----------------------------------
+        # Stage-1 sections (behaviour rules, USER.md profile, MEMORY.md index) +
+        # the Stage-2/3 relevant-memories slot.  Each renders on every build so
+        # file edits show up next turn; missing files render nothing (memory
+        # never blocks startup).  When recall/extract are enabled a
+        # MemoryManager is built to drive the side-query channels.
+        memory_present = False
+        memory_manager: MemoryManager | None = None
+        if enable_memory:
+            prompt_builder.add(MemoryBehaviorContributor())
+            profile_contrib = default_user_profile_contributor(memory_home)
+            index_contrib = default_memory_index_contributor(memory_home)
+            prompt_builder.add(profile_contrib)
+            prompt_builder.add(index_contrib)
+            relevant_contrib = RelevantMemoriesContributor()
+            prompt_builder.add(relevant_contrib)
+            memory_present = bool(profile_contrib.render() or index_contrib.render())
+
+            if enable_memory_recall or enable_memory_extract:
+                # Default the side-query model to the main provider unless an
+                # explicit (usually cheaper) one is supplied.
+                side = memory_side_provider or provider
+                memory_manager = MemoryManager(
+                    relevant_contrib,
+                    recall_provider=side if enable_memory_recall else None,
+                    extract_provider=side if enable_memory_extract else None,
+                    home=memory_home,
+                    on_event=memory_event_sink,
+                )
+
         # Model / environment / timestamp tiers (appended last so they render
         # after the skills index and MCP note, matching Hermes' section order).
         prompt_builder.add(ModelIdentityContributor(provider))
@@ -348,6 +405,9 @@ class AgentRuntime:
             "skills": skills_count,
             "mcp_servers": mcp_server_count,
             "mcp_tools": mcp_tool_count,
+            "memory": 1 if memory_present else 0,
+            "memory_recall": 1 if (memory_manager and enable_memory_recall) else 0,
+            "memory_extract": 1 if (memory_manager and enable_memory_extract) else 0,
         }
         return cls(
             provider=provider,
@@ -361,6 +421,7 @@ class AgentRuntime:
             context_token_budget=context_token_budget,
             compress_storage_dir=compress_storage_dir,
             summary_provider=summary_provider,
+            memory_manager=memory_manager,
         )
 
     @property
@@ -379,6 +440,15 @@ class AgentRuntime:
     @property
     def max_iterations(self) -> int:
         return self._max_iterations
+
+    def shutdown(self) -> None:
+        """Wait for any in-flight background memory work to finish.
+
+        The CLI calls this on exit so queued memory extraction isn't cut off
+        mid-write.  A no-op when no memory manager is wired in.
+        """
+        if self._memory_manager is not None:
+            self._memory_manager.drain()
 
     def run_turn(
         self,
@@ -406,9 +476,16 @@ class AgentRuntime:
 
         self._persist(session_id, Message(role=Role.USER, content=user_message))
 
+        # Recall (pre-turn): best-effort inject relevant memories for this query.
+        # Only shapes the system prompt via the manager's contributor; the
+        # source history is untouched.  Never raises.
+        if self._memory_manager is not None:
+            self._memory_manager.before_turn(session_id, user_message)
+
         budget = IterationBudget(self._max_iterations)
         iterations = 0
         tool_calls_made = 0
+        turn_tool_calls: list[ToolCall] = []
         final_text = ""
         stop_reason = StopReason.FINAL_ANSWER
 
@@ -432,6 +509,13 @@ class AgentRuntime:
                 break
 
             iterations += 1
+            # Recall collect point (non-blocking): if the background recall for
+            # this query has finished, inject it before building context.  On the
+            # first iteration it usually hasn't finished yet (side query takes
+            # longer than build); it lands on a later iteration after a tool
+            # round, mirroring Claude Code's prefetch/collect timing.
+            if self._memory_manager is not None:
+                self._memory_manager.collect_recall(session_id)
             source = self._repository.list_messages(session_id)
             api_messages = self._context.build(source)
             if self._context_token_budget is not None:
@@ -478,6 +562,7 @@ class AgentRuntime:
                 break
 
             tool_calls_made += len(response.tool_calls)
+            turn_tool_calls.extend(response.tool_calls)
             results = self._executor.execute(response.tool_calls)
             for tool_message, result in zip(self._executor.to_messages(results), results):
                 self._persist(session_id, tool_message)
@@ -485,12 +570,25 @@ class AgentRuntime:
                     on_event(TurnEvent.from_tool_result(result))
             # loop continues: the tool results are now in history for the next call
 
+        # Extraction (post-turn): only after a normal final reply — mirrors
+        # Claude Code firing after the tool-free final answer.  Best-effort;
+        # never affects the result the user already has.  Skipped on
+        # interrupt/error so a partial turn is not mined for memory.
+        final_messages = self._repository.list_messages(session_id)
+        if self._memory_manager is not None:
+            self._memory_manager.after_turn(
+                session_id,
+                final_messages,
+                tool_calls=turn_tool_calls,
+                extract=stop_reason is StopReason.FINAL_ANSWER,
+            )
+
         if on_event is not None:
             on_event(TurnEvent.turn_end(stop_reason))
 
         return TurnResult(
             final_text=final_text,
-            messages=self._repository.list_messages(session_id),
+            messages=final_messages,
             iterations=iterations,
             stop_reason=stop_reason,
             tool_calls_made=tool_calls_made,

@@ -211,3 +211,47 @@ computer-use, platform hints, Nous branding + docs URL).
 | `src/aegis_agent/runtime.py` (`with_defaults` wiring) | **original** | — | Registers the five contributors on `prompt_builder` in Hermes' section order (identity → task-completion → tool-use → skills → mcp → model-identity → environment → timestamp). No change to `run_turn` or the source-of-truth invariant. |
 | `src/aegis_agent/context/__init__.py` (updated) | **original** | — | Re-exports the new contributors. |
 | `tests/test_prompt_sections.py` | **original** | — | 14 tests: per-contributor render/drop conditions + composed-prompt ordering and exclusion of unsupported-subsystem terms (`memory`, `session_search`, `SOUL`, `Hermes`). |
+
+## Stage 14 — personal long-term memory (Stage 1: storage format + MEMORY.md index injection + behaviour prompt)
+
+Reproduces the *file-system + prompt-driven* half of Claude Code's Auto Memory
+(design reference: `Claude-Code/docs/08-memory.md`, i.e. `src/memdir/*`).  Only
+the **personal (user-level) scope** and the three read-side pieces are built;
+relevance recall (`findRelevantMemories`), background extraction
+(`extractMemories`), embeddings and project/team memory are explicitly deferred
+to later stages.  Source here is Claude Code (not Hermes), so this is a
+behavioural re-implementation, not a code port.
+
+| Aegis file | Relationship | Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/memory/paths.py` | **ADAPT** | `src/memdir/paths.ts` → `getAutoMemPath` / dir layout | Personal-scope only: `<home>/USER.md` + `<home>/memory/{MEMORY.md,*.md}`. Home = `$AEGIS_HOME` → `~/.aegis`; `$AEGIS_MEMORY_DIR` overrides the memory dir directly. Dropped: settings-driven override chain, git-root canonicalisation, project/team dirs, the SECURITY `~/.ssh` guard (no untrusted project-settings source in Aegis yet). |
+| `src/aegis_agent/memory/types.py` | **ADAPT** | `src/memdir/memoryTypes.ts` → the four kinds | `MemoryType` enum = `user`/`feedback`/`project`/`reference`, verbatim taxonomy so project scope can reuse it. `parse()` is tolerant (unknown/missing → `None`). The full eval-tuned behaviour prose lives in `prompt.py` instead. |
+| `src/aegis_agent/memory/store.py` | **ADAPT** | `src/memdir/memdir.ts` → `truncateEntrypointContent`; `memoryScan.ts` frontmatter read | `truncate_entrypoint_content` = 200-line + 25 KB dual cap with a truncation notice (UTF-8 byte-safe). `load_user_profile`/`load_memory_index` read+truncate (missing/empty → `None`, never raises). `parse_memory_file` reuses the skills frontmatter parser → `MemoryEntry` (exposed for a later recall stage; nothing auto-loads bodies this milestone). |
+| `src/aegis_agent/memory/prompt.py` | **ADAPT** | `src/memdir/memdir.ts` → `loadMemoryPrompt`; `memoryTypes.ts` behaviour text; `utils/claudemd.ts` (:979) index injection | Three `PromptContributor`s: `MemoryBehaviorContributor` (static rules — what memory is, per-kind what-to-store, what-NOT-to-store, stale-history/verify-before-use, current-instruction-wins/ignore semantics), `UserProfileContributor` (USER.md, distinct header), `MemoryIndexContributor` (MEMORY.md, labelled "index, not the bodies"). Re-rendered each build; missing files → `None`. |
+| `src/aegis_agent/memory/__init__.py` | **original** | — | Package doc + re-exports; states the deferred scope explicitly. |
+| `src/aegis_agent/runtime.py` (`with_defaults` wiring) | **original** | — | `enable_memory`/`memory_home` params; adds the three memory contributors after the MCP note and before model/env/timestamp; `startup_info["memory"]` = 1 when USER.md or MEMORY.md loaded. No change to `run_turn` or the source-of-truth invariant. |
+| `src/aegis_agent/cli.py`, `src/aegis_agent/tui.py` (updated) | **original** | — | `--no-memory` flag; startup panel shows `Memory: on/none`. |
+| `tests/test_memory.py` | **original** | — | 27 tests: path resolution/overrides, four-kind parse, frontmatter parse, line/byte truncation, present/absent injection, USER.md vs MEMORY.md distinct semantics, runtime wiring + `--no-memory`, and session-persistence-unaffected. |
+| `tests/test_prompt_sections.py` (updated) | **original** | — | Exclusion test narrowed to `session_search`/`SOUL`/`Hermes` (memory is now a real subsystem); added `test_memory_section_present`. |
+
+## Stage 15 — memory recall + background extraction (Stage 2/3, personal scope)
+
+Reproduces Claude Code Auto Memory's two *dynamic* channels — relevance recall
+(`findRelevantMemories`) and background extraction (`extractMemories`) — still
+personal scope only, no embeddings / project / team / autoDream.  Both reuse
+Aegis's existing `ModelProvider` Protocol as the side-query transport (no new
+provider), and both are strictly best-effort.
+
+| Aegis file | Relationship | Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/memory/scan.py` | **ADAPT** | `src/memdir/memoryScan.ts:scanMemoryFiles` / `formatMemoryManifest` | Metadata-only scan (filename/name/description/type/mtime), reads just the leading ~40 lines (never bodies), excludes `MEMORY.md`, caps at 200 newest-first. A bad/missing file is skipped, never fatal. |
+| `src/aegis_agent/memory/retriever.py` | **ADAPT** | `src/memdir/findRelevantMemories.ts`; `utils/attachments.ts:getRelevantMemoryAttachments`/`collectSurfacedMemories` | Manifest → side query (JSON `{"files":[…]}` ≤5, unsure→skip) → keep only filenames present in the manifest (rejects invention/`../`) → read selected bodies under 4 KB/file + 12 KB/total caps → `render_recall_block` (`## Relevant memories`, per-file `file=`/`type=` tags). |
+| `src/aegis_agent/memory/sidequery.py` | **original** | — | Shared one-shot helper: `provider.stream()` folded via `collect_response`, then tolerant JSON-object extraction (bare / fenced / embedded). Any failure → `None`. |
+| `src/aegis_agent/memory/prompt.py` (`RelevantMemoriesContributor`) | **ADAPT** | `utils/attachments.ts` attachment injection (behaviour) | Stateful contributor; `set_block`/`clear` per turn. Injection is via the system-prompt rebuild (Aegis has no attachment message), so `run_turn`'s loop body is unchanged and source history is untouched. |
+| `src/aegis_agent/memory/extractor.py` | **ADAPT** | `services/extractMemories/extractMemories.ts` + `prompts.ts` | Cursor over `client_msg_id` (unknown cursor → last-12 fallback, never "nothing" or "everything"); side query returns `{"actions":[{action,filename,type,name,description,content}]}`; `_coerce_action` validates filename + personal-only type (rejects `project`/unknown) + non-empty content. `apply_actions` routes every write through the path-safe store and rebuilds the index once. No forked sub-agent (structured action → store, no Write tool granted to the extractor). |
+| `src/aegis_agent/memory/store.py` (write side) | **ADAPT** | `extractMemories` write path + index sync | `render_memory_file` (frontmatter + body), `is_valid_memory_filename` (bare `*.md`, no `..`/sep/`MEMORY.md`/dotfile), `write_memory_file` (atomic + resolved-path-inside-dir check), `rebuild_index` (derive `MEMORY.md` from files: sorted, deduped, idempotent; removes empty index). |
+| `src/aegis_agent/memory/manager.py` | **ADAPT** | `query.ts:301/1599` (recall prefetch/collect), `stopHooks.ts:149` (post-final-reply) | `before_turn` *starts* a background recall (pool thread → `Future`, non-blocking); `collect_recall` is the non-blocking collect point (skip if not done → Claude's "didn't make it in time"); `after_turn` enqueues extraction onto a single serial worker thread (fire-and-forget, mirrors Claude's stash queue — no file lock, serialised writes); `drain` waits for in-flight work. Emits `memory.recall`/`memory.extract` `MemoryEvent`s. |
+| `src/aegis_agent/runtime.py` (wiring) | **original** | — | `__init__` gains `memory_manager`; `run_turn` calls `before_turn` after persisting the user message, a non-blocking `collect_recall` before each `build(context)` inside the loop (so recall lands after a tool round, not on the first), and `after_turn` after a `FINAL_ANSWER`; `shutdown()` drains background work. `with_defaults` builds the manager when `enable_memory_recall`/`enable_memory_extract` are set. `startup_info` gains `memory_recall`/`memory_extract`. |
+| `src/aegis_agent/cli.py` (updated) | **original** | — | `--memory-recall` / `--memory-extract` opt-in flags; `runtime.shutdown()` in the exit path drains in-flight recall/extract. |
+| `tests/test_memory_recall.py` | **original** | — | 17 tests: empty/missing dir no-op, frontmatter scan, bad-file tolerance, 200-cap, 0..5 selection, invalid/`../` rejection, render block, context injection, history-not-modified, already-surfaced dedup, main-agent-write→skip. |
+| `tests/test_memory_extract.py` | **original** | — | 14 tests: cursor new-messages/fallback, noop, create, update-over-duplicate, project-type rejection, unsafe-filename rejection, index rebuild + idempotency, no-outside-root write, extractor-failure isolation, mutex skip, filename validation. |

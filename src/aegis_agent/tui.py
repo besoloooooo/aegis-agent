@@ -110,6 +110,9 @@ def _startup_panel(info: dict[str, int]) -> Panel:
     # Builtin
     parts.append(f"Builtin tools: {info.get('builtin_tools', 0)}")
 
+    # Memory (present = USER.md or MEMORY.md was loaded)
+    parts.append("Memory: on" if info.get("memory") else "Memory: none")
+
     body = " · ".join(parts)
     return Panel(
         Text(body, style="aegis.dim"),

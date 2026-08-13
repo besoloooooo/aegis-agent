@@ -128,9 +128,18 @@ class TestIntegrationOrdering:
 
     def test_excluded_subsystems_absent(self):
         prompt = self._prompt()
-        # Aegis has no memory / session search / soul / branding — none must leak.
-        for term in ("session_search", "SOUL", "Hermes", "USER.md", "persistent memory"):
+        # Aegis has no session search / soul / branding — none must leak.
+        # (Personal memory IS a subsystem now — see test_memory_section_present.)
+        for term in ("session_search", "SOUL", "Hermes"):
             assert term not in prompt
+
+    def test_memory_section_present(self):
+        # Personal long-term memory is enabled by default: its behaviour section
+        # (which references USER.md / MEMORY.md) is part of the composed prompt.
+        prompt = self._prompt()
+        assert "# Memory" in prompt
+        assert "USER.md" in prompt
+        assert "MEMORY.md" in prompt
 
     def test_fake_provider_omits_model_identity_line(self):
         prompt = self._prompt()
