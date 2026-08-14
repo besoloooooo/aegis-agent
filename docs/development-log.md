@@ -2150,3 +2150,107 @@ MCP / terminal / process wait 这类「Python 轮询等待」的工具现在可�
 不再杀进程、不污染历史（半成品工具结果不持久化）。局限：模型流若卡在**不可轮询的阻塞网络读**上，
 第一次 Ctrl+C 只能置位事件、无法立刻打断该次读——用「第二次 Ctrl+C 强制退出」兜底（对齐常见 CLI 的
 双击退出约定）。web 的单个 httpx 请求仍受其自身 30s 超时约束（只在请求之间可取消）。
+
+---
+
+## session_search：SQLite + FTS5 历史会话检索
+
+### 为什么做
+
+Aegis 已具备 SQLite 会话持久化（幂等消息、快照+尾部恢复、会话租约），但**没有检索历史聊天
+的能力**。用户问「我们之前是怎么处理 X 的 / 上次聊到哪里了」时，Agent 只能靠 web 搜索或文件
+检索，查不到自己的对话历史。Hermes 有一套成熟的 FTS5 方案：`sessions.db → messages 表 → FTS5
+索引 → session_search 工具 → 命中窗口 / 前后翻页`。本次把这条链路整体迁移过来。
+
+边界：这只做**真实历史聊天检索**，与 Aegis 的 Auto Memory（Stage 14/15，提炼后的长期记忆）是两套
+能力——`session_search` 查的是原始 messages，Auto Memory 读的是 `~/.aegis/memory/*.md`。明确不做：
+FTS5 用到 memory 文件、改长期记忆 recall、embedding / 向量库 / LLM rerank / 混合检索 / Project Memory。
+
+### Hermes 行为与源码位置
+
+- `hermes_state.py` `SessionDB`：`FTS_SQL`/`FTS_TRIGRAM_SQL`（虚拟表 + 同步触发器，行 id 即
+  rowid，正文 = content || tool_name || tool_calls）；`_ensure_fts_schema`/`_rebuild_fts_indexes`
+  /`_sqlite_supports_fts5`/`_drop_fts_triggers`（幂等初始化 + 无 FTS5 运行时的降级）；`search_messages`
+  （FTS5 MATCH + snippet + BM25 排序 + CJK trigram/LIKE 降级）；`get_messages_around`（±window 锚点）；
+  `get_anchored_view`（窗口 + bookends）；`list_sessions_rich`（预览 + last_active）。
+- `tools/session_search_tool.py`：单 shape 工具，四态推断（DISCOVERY / SCROLL / READ / BROWSE），
+  `SESSION_SEARCH_SCHEMA` + registry 注册 + `check_session_search_requirements`。
+- `tests/tools/test_session_search.py`：四态行为 + schema + FTS 生命周期测试。
+
+### 迁移决策
+
+**整体搬运 + 最小 Aegis 适配**（ADAPT port）。FTS 的 DDL、触发器同步、BM25 检索、CJK 降级、
+锚点窗口 / bookends、工具四态推断全部照搬；只做最薄的 schema 与 API 适配：
+
+- 不新建第二套会话数据库——FTS 直接挂在现有 `SQLiteSessionRepository` 上；
+- `sessions.started_at` → `created_at`，`s.model` 丢弃（Aegis 不记模型），`_decode_content` 丢弃
+  （Aegis content 恒为 str），加 `active=1` 过滤（Aegis 软删除）；
+- 工具侧丢弃 `profile` 参数、跨 profile 读取、`@session:<profile>/<id>` 自动拆分、压缩链
+  `_resolve_to_parent`（恒等）、scroll 的 lineage rebind——Aegis 无 profile、无压缩链（不 fork 会话）。
+
+### Aegis 设计、数据流与关键接口
+
+**写入 → 索引同步**：`append_message` 走 `_execute_write`（BEGIN IMMEDIATE 事务）INSERT messages，
+同一事务里 FTS 触发器 `AFTER INSERT/UPDATE/DELETE ON messages` 把 `rowid=id, content=...` 写进
+`messages_fts`（unicode61/BM25）与 `messages_fts_trigram`（trigram/CJK）。因为同事务 COMMIT，
+**不会出现「messages 有数据、FTS 没数据」**。
+
+**幂等初始化 + backfill**：`_init_fts` 先 `_sqlite_supports_fts5` 探测；不支持则 `_drop_fts_triggers`
+（保核心持久化）。`CREATE VIRTUAL TABLE IF NOT EXISTS` + `CREATE TRIGGER IF NOT EXISTS` 幂等；当
+`triggers_need_repair`（触发器曾被无 FTS5 运行删掉）或 FTS 表是新建的（旧库首次启用）时，
+`_rebuild_fts_indexes` 从 messages 全量回填——旧消息也能被搜到。
+
+**调用链**：`SessionSearchTool.run(args, context)` → `session_search(...)`（四态推断）→ 仓库方法
+`search_messages` / `get_anchored_view` / `get_messages_around` / `list_sessions_rich` / `get_session_dict`
+/ `get_messages_dict`（返回含 id/timestamp 的扁平 dict，供锚点/翻页）。工具依赖注入 `SQLiteSessionRepository`；
+内存仓库（无 `search_messages`）→ 优雅返回 `success=false` JSON，不抛异常。
+
+**当前会话过滤**：`ToolContext` 加 `session_id` 字段，runtime → executor → 工具透传活动会话 id，
+browse/discovery 跳过、scroll 拒绝当前会话（那些消息已在上下文里）。
+
+**关键文件**：`sessions/sqlite_store.py`（FTS 常量 + `_init_fts` + `search_messages`/`get_messages_around`
+/`get_anchored_view`/`list_sessions_rich`/`get_session_dict`/`get_messages_dict`/`_search_row_to_dict`/
+`_sanitize_fts5_query`/`_contains_cjk`/`_count_cjk`）；`tools/schemas.py`（`SESSION_SEARCH`）；`tools/builtin/
+session_search.py`（`SessionSearchTool` + `session_search`）；`tools/builtin/__init__.py`（按仓库能力注册）；
+`tools/registry.py`（`ToolContext.session_id`）、`tools/executor.py`、`runtime.py`（session_id 注入）。
+
+### 可靠性不变式、边界与失败处理
+
+- **写→索引一致**：FTS 触发器与 messages INSERT 同事务，不存在分裂。
+- **幂等**：FTS 表/触发器 `IF NOT EXISTS`；重复 init 不重复建、不重复回填（回填前先 DELETE）。
+- **旧库 backfill**：FTS 表缺失或触发器缺失时从 messages 重建。
+- **无 FTS5 运行时**：探测失败 → 删触发器、`_fts_enabled=False`、`search_messages` 返回 []，核心
+  持久化不受影响。
+- **SQL/FTS 注入安全**：`_sanitize_fts5_query` 清洗未配对引号/特殊字符/裸布尔算子，避免
+  `sqlite3.OperationalError`；CJK 短词走 LIKE 转义 `%`/`_`。
+- **窗口边界**：`messages_before`/`messages_after` 让 Agent 判断是否到会话头/尾；`window` 夹取 [1,20]，
+  `limit` 夹取 [1,10]；`get_anchored_view` 锚点永不因 role 过滤被丢。
+- **不破坏现有能力**：resume / snapshot+tail / 消息幂等 / lease / Auto Memory 全部不动——FTS 是
+  纯新增的读路径 + 触发器，不改 `append_message` 主链路；恢复/快照/幂等测试全绿。
+
+### 测试
+
+新增 `tests/test_session_search.py`（49 项，改编自 Hermes + 新增 FTS 生命周期）：
+
+1. FTS 表/触发器初始化（`messages_fts`、`messages_fts_trigram`、`_fts_enabled`）；2. 新消息写入后
+可检索；3. 旧库 backfill 后可检索（drop FTS 表+触发器 → reopen 重建）；4. 数据库重开索引仍在；
+5. 特殊字符查询不报错；6. 空结果返回 []；7. 无 query → browse 最近会话；8. query 命中正确消息；
+9. 多会话 newest/oldest 排序；10. 命中上下文（bookend_start/window/bookend_end/messages_before/after）；
+11. user/assistant/tool 三角色 + role_filter；12. 空结果；13. scroll 窗口/夹取/翻页/缺锚点报错/当前会话
+拒绝；14. 四态优先级；15. READ 整段 dump + 截断；16. 内存仓库优雅降级。
+
+结果：`uv run pytest tests/test_session_search.py tests/test_sessions_sqlite.py tests/test_sessions.py
+tests/test_session_lease.py tests/test_tools.py -q` → **98 passed**。全量 `uv run pytest -q` → **488 passed,
+2 skipped, 1 failed**（唯一失败为改动前已存在的 `test_web_extract_blocks_private_url`：`.env` 里配了
+`TAVILY_API_KEY` 时走 Tavily 后端而非本地 SSRF 门，与本次改动无关；改动前基线同为该用例失败）。
+`uv run ruff check .`（改动文件）干净；`uv run mypy src` 改动文件无新增错误（余 10 个为改动前已存在的
+其它文件告警）。
+
+### 结论 / 局限
+
+Hermes 原版 FTS5 会话检索能力已稳定迁入 Aegis，且与 Auto Memory 职责分离（本工具查真实历史聊天，
+不碰 `memory/*.md`）。局限：Aegis 无 profile / 压缩链，故丢弃了跨 profile 读取与 lineage 去重（对单
+用户、单库场景无损失）；`sessions` 表不记 model，检索结果 `model` 恒为 "unknown"；CJK 检索沿用
+Hermes 的 trigram + LIKE 降级（无 embedding）。后续若做 `FTS5 + LLM rerank` / embedding / 向量库 /
+混合检索，均不在本阶段范围内。
+

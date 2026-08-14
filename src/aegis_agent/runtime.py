@@ -288,7 +288,8 @@ class AgentRuntime:
             from aegis_agent.models.fake import FakeModelProvider
 
             provider = FakeModelProvider()
-        registry = build_default_registry()
+        repo = repository or InMemorySessionRepository()
+        registry = build_default_registry(session_repository=repo)
         tool_cwd = cwd if cwd else None
         context = (
             ToolContext(cwd=tool_cwd, allow_dangerous_shell=allow_dangerous_shell)
@@ -296,7 +297,6 @@ class AgentRuntime:
             else ToolContext(allow_dangerous_shell=allow_dangerous_shell)
         )
         executor = ToolExecutor(registry, context)
-        repo = repository or InMemorySessionRepository()
 
         identity = system_prompt if system_prompt is not None else DEFAULT_IDENTITY
         prompt_builder = SystemPromptBuilder(identity=identity)
@@ -568,7 +568,9 @@ class AgentRuntime:
             tool_calls_made += len(response.tool_calls)
             turn_tool_calls.extend(response.tool_calls)
             try:
-                results = self._executor.execute(response.tool_calls, is_cancelled=is_cancelled)
+                results = self._executor.execute(
+                    response.tool_calls, is_cancelled=is_cancelled, session_id=session_id
+                )
             except OperationCancelled:
                 # A tool aborted mid-flight (Ctrl+C / cancel): stop the turn
                 # without persisting the partial tool result.

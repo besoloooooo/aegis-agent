@@ -46,14 +46,19 @@ class ToolExecutor:
         self,
         tool_calls: Sequence[ToolCall],
         is_cancelled: Callable[[], bool] | None = None,
+        session_id: str | None = None,
     ) -> list[ToolResult]:
         """Execute a batch of tool calls in order, one result per call."""
-        return [self.execute_one(tc, is_cancelled=is_cancelled) for tc in tool_calls]
+        return [
+            self.execute_one(tc, is_cancelled=is_cancelled, session_id=session_id)
+            for tc in tool_calls
+        ]
 
     def execute_one(
         self,
         tool_call: ToolCall,
         is_cancelled: Callable[[], bool] | None = None,
+        session_id: str | None = None,
     ) -> ToolResult:
         """Execute a single tool call, never raising for tool-level failures.
 
@@ -62,6 +67,10 @@ class ToolExecutor:
         :class:`~aegis_agent.exceptions.OperationCancelled`, which propagates
         out of the executor so the runtime can stop the turn without persisting
         a spurious tool result.
+
+        ``session_id`` (when set) is the active session id, injected into the
+        tool context so tools like ``session_search`` can exclude the current
+        conversation (whose messages are already in context).
         """
         tool = self._registry.get(tool_call.name)
         if tool is None:
@@ -83,10 +92,14 @@ class ToolExecutor:
             )
 
         context = self._context
-        if is_cancelled is not None:
-            context = dataclasses.replace(self._context, is_cancelled=is_cancelled)
-            if is_cancelled():
-                raise OperationCancelled("tool execution cancelled by interrupt")
+        if is_cancelled is not None or session_id is not None:
+            context = dataclasses.replace(
+                self._context,
+                is_cancelled=is_cancelled if is_cancelled is not None else self._context.is_cancelled,
+                session_id=session_id if session_id is not None else self._context.session_id,
+            )
+        if is_cancelled is not None and is_cancelled():
+            raise OperationCancelled("tool execution cancelled by interrupt")
 
         try:
             result = tool.run(arguments, context)

@@ -39,6 +39,7 @@ class ToolContext:
     cwd: str = field(default_factory=os.getcwd)
     allow_dangerous_shell: bool = False
     is_cancelled: Callable[[], bool] | None = None
+    session_id: str | None = None
 
 
 @runtime_checkable
