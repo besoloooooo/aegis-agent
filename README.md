@@ -4,58 +4,51 @@ A lightweight, recoverable, and extensible **Agent Runtime**, built by extractin
 
 > Built for reliable long-running agents with session recovery, context compression, memory, tool use, and extensible runtime components.
 
-## ✨ Features
+## 🏁 Milestones delivered
 
-* **Agent Runtime** — streaming responses, tool calling, multi-turn execution, timeout and interruption handling
-* **Reliable Sessions** — SQLite persistence, idempotent writes, snapshots, and crash recovery
-* **Session Lease** — SQLite / Redis cross-process concurrency control
-* **Context Compression** — oversized tool offload, local compacting, and LLM summaries
-* **Long-term Memory** — automatic memory extraction and relevance-based recall
-* **History Search** — local FTS5 search with BM25 ranking and CJK trigram matching
-* **Tools** — terminal, file editing, search, web search, web extraction, and background processes
-* **Skills** — `SKILL.md` discovery, loading, routing, and dynamic prompt injection
-* **MCP** — stdio and Streamable HTTP MCP clients
-* **OpenAI-compatible Models** — configurable through environment variables
+Sixteen milestones, from a minimal skeleton to the full runtime:
+
+**Core runtime**
+1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
+2. OpenAI-compatible provider & streaming tool calls
+3. Live terminal UI
+
+**Tools**
+4. Skills subsystem — `SKILL.md` discovery / loading / routing
+5. Lightweight MCP client — stdio + Streamable HTTP
+6. File-editing tools — write_file / patch / search_files
+7. Terminal & background-process tools
+8. Web tools — web_search / web_extract with SSRF gate
+9. Skill management — `skill_manage`
+
+**Reliability & sessions**
+10. Context compression pipeline — offload → micro-compact → LLM summary
+11. Compression wired into the agent loop + reasoning_content
+12. SQLite persistence + snapshot fast-resume + cross-process leases
+
+**Prompt / memory / search**
+13. Dynamic system-prompt sections
+14. Personal long-term memory (Auto Memory) — `USER.md` + `MEMORY.md` index
+15. Memory recall + background extraction
+16. Session history search — FTS5 `session_search`
 
 ---
 
-## 🏗 Architecture
+## 🏗 Project layout
 
 ```text
-User
- │
- ▼
-CLI / REPL
- │
- ▼
-Agent Runtime
- ├── System Prompt
- ├── Context Builder
- ├── Context Compression
- ├── Memory
- ├── Session Store
- ├── Model Provider
- │
- └── Tool Runtime
-      ├── Builtin Tools
-      ├── Skills
-      └── MCP
-```
-
-The runtime follows a simple execution loop:
-
-```text
-guard
-  ↓
-build context
-  ↓
-compress context
-  ↓
-call model
-  ↓
-execute tools
-  ↓
-continue loop
+src/aegis_agent/
+├── cli.py          # Typer CLI / REPL entry point
+├── tui.py          # terminal UI (prompt_toolkit + rich)
+├── runtime.py      # AgentRuntime — the agent loop
+├── events.py       # model event stream
+├── models/         # ModelProvider protocol, fake / OpenAI providers, Message / ToolCall
+├── tools/          # tool registry, executor, builtin tools
+├── context/        # context builder + compression
+├── sessions/       # session repository (in-memory / SQLite) + leases
+├── memory/         # Auto Memory (long-term memory)
+├── skills/         # SKILL.md loading / routing
+└── mcp/            # MCP client
 ```
 
 Original conversation messages are preserved. Context compression only modifies the derived view sent to the model.
@@ -64,10 +57,16 @@ Original conversation messages are preserved. Context compression only modifies 
 
 ## 🚀 Quick Start
 
-Aegis uses [uv](https://docs.astral.sh/uv/) for dependency management.
+Prerequisites: [uv](https://docs.astral.sh/uv/) — it installs the Python 3.11 toolchain automatically.
 
 ```bash
+# 1. Install uv (once)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Sync dependencies — uv reads .python-version and prepares Python 3.11 + all deps
 uv sync
+
+# 3. Run
 uv run aegis
 ```
 
