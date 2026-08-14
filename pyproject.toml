@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.0",
+    "mcp>=2.0.0",
     "openai>=2.52.0",
     "prompt-toolkit>=3.0.53",
     "pydantic>=2.13.4",
@@ -20,9 +21,6 @@ dependencies = [
 aegis = "aegis_agent.cli:main"
 
 [project.optional-dependencies]
-mcp = [
-    "mcp>=2.0.0",
-]
 web = [
     "ddgs>=9.0.0",
     "trafilatura>=2.0.0",
