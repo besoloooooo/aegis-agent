@@ -2097,3 +2097,56 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 用户诉求「先写存、后写提示」在当前个人级、best-effort 语义下，以「后写者检测到冲突 → 跳过本轮
 提取」近似满足；若将来要严格的「先写存、后写阻塞等待」，再考虑 autoDream 式的 `.consolidate-lock`
 锁文件。
+---
+
+## 工具执行协作式中断（is_cancelled 轮询）
+
+### 为什么做
+
+交互式 REPL 里 Ctrl+C 只能「杀进程」：CLI 的 `interrupt` 事件只接跨进程 lease 丢失，SIGINT 默认
+抛 `KeyboardInterrupt`（`BaseException`），而 `call_tool`/`executor` 只 `except Exception`，于是
+KeyboardInterrupt 一路穿透、整个进程退出。用户实测：`mcp_paper_search_search_papers`
+（`sources:"all"`）聚合多个上游源，慢到触到 180s 超时，期间无任何进度、无优雅取消，只能 `^C`
+杀掉。问题不止 MCP——`terminal`（最长 600s）、`process wait`（最长 180s）、`web_search/extract`
+（网络）同样无法被 Ctrl+C 打断。
+
+### 做了什么
+
+给工具层加一条与模型流一致的协作式中断路径（对齐 `events.collect_response` 的 `is_cancelled`
+模式），Ctrl+C 优雅取消当前工具、回到 `❯`，而不是杀进程：
+
+- **`tools/registry.py`**：`ToolContext` 加 `is_cancelled: Callable[[], bool] | None` 字段
+  （frozen dataclass 新增可选字段，向后兼容），ambient 取消信号，模型不可设。
+- **`tools/executor.py`**：`execute`/`execute_one` 接受 `is_cancelled`；用 `dataclasses.replace`
+  注入 context；执行前预检、执行中 `except OperationCancelled: raise`（区别于「工具报错→error result」，
+  取消要穿透到 runtime 而非落一个假 error 结果）。
+- **`runtime.py`**：把 `is_cancelled` 从循环内提到循环外，同时传给 `collect_response`（模型流）和
+  `executor.execute`（工具）；工具执行 `except OperationCancelled → INTERRUPTED`，不持久化半成品工具结果。
+- **`mcp/client.py`**：`_run_on_loop` 轮询循环里（每次 `future.result(timeout=0.1)` 之间）检查
+  `is_cancelled`，置位即 `future.cancel()` 并抛 `OperationCancelled`；`call_tool` 透传并 re-raise。
+- **`mcp/tools.py`**：`MCPToolWrapper.run` 把 `context.is_cancelled` 传给 `call_tool`。
+- **`terminal.py`**：前台 `subprocess.run` 改为 `Popen` + `_wait_and_drain`（`communicate(timeout=0.2)`
+  增量排水，避免满管道死锁；每次迭代查 cancel/deadline，cancel 先 kill 再抛 `OperationCancelled`），
+  超时语义不变（`exit_code 124`）。
+- **`process_registry.py` / `process.py`**：`wait()` 加 `is_cancelled`，轮询循环里置位即抛。
+- **`web/backends.py` + `web_search/web_extract.py`**：`web_search`/`web_extract` 及 ddgs 迭代循环、
+  逐 URL 之间轮询 `_check_cancelled`；`except OperationCancelled: raise` 避免被兜底 `except Exception` 吞掉。
+- **`cli.py`**：装 `SIGINT` handler——turn 运行时第一次 Ctrl+C 只 `interrupt.set()`（优雅取消），第二次
+  Ctrl+C 抛 `KeyboardInterrupt`（强制退出兜底）；空闲时保持默认 `KeyboardInterrupt`（退出 REPL）。
+  每次 turn 前 `interrupt.clear()`（Ctrl+C 是瞬态），lease 丢失另用 `lease_lost` 持久标记、不清，
+  避免「上一个取消信号误杀下一条消息」也避免「租约丢失后继续写」。
+
+### 测试
+
+新增 4 项：终端前台取消抛 `OperationCancelled`；工具抛取消 → runtime `INTERRUPTED` 且不落工具结果；
+executor 预取消先抛；executor 把 `is_cancelled` 注入 context。
+`HOME=$(mktemp -d) uv run pytest -q` → **440 passed, 2 skipped**（跳过项为 opt-in integration）。
+`uv run ruff check .` 剩 4 个**改动前已存在**的告警（cli.py `F821 _print_session_list`、`DTZ005/006`、
+`mcp/client.py SIM115`），本次未引入新告警。
+
+### 结论 / 局限
+
+MCP / terminal / process wait 这类「Python 轮询等待」的工具现在可被 Ctrl+C 亚秒级取消并回到提示符，
+不再杀进程、不污染历史（半成品工具结果不持久化）。局限：模型流若卡在**不可轮询的阻塞网络读**上，
+第一次 Ctrl+C 只能置位事件、无法立刻打断该次读——用「第二次 Ctrl+C 强制退出」兜底（对齐常见 CLI 的
+双击退出约定）。web 的单个 httpx 请求仍受其自身 30s 超时约束（只在请求之间可取消）。

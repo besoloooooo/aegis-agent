@@ -113,3 +113,17 @@ def test_detect_dangerous_command_subset():
     assert detect_dangerous_command("ls -la") is None
     assert detect_dangerous_command("echo hello") is None
     assert detect_dangerous_command("") is None
+
+
+def test_terminal_foreground_cancel_raises(tmp_path):
+    """A cooperative cancel aborts the foreground command (raises, no result)."""
+    import pytest
+
+    from aegis_agent.exceptions import OperationCancelled
+
+    tool, _, _ = _make(tmp_path)
+    ctx = ToolContext(cwd=str(tmp_path), is_cancelled=lambda: True)
+    with pytest.raises(OperationCancelled):
+        # The cancel is checked before the child is even waited on, so this
+        # returns immediately instead of sleeping.
+        tool.run({"command": "sleep 5", "timeout": 30}, ctx)

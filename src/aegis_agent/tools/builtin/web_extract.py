@@ -33,7 +33,11 @@ class WebExtractTool:
             return _error("web_extract: 'urls' must be a non-empty list of URL strings.")
 
         urls = urls[:_MAX_URLS]
-        results = backends.web_extract(urls)
+        is_cancelled = context.is_cancelled if context is not None else None
+        if is_cancelled is None:
+            results = backends.web_extract(urls)
+        else:
+            results = backends.web_extract(urls, is_cancelled=is_cancelled)
 
         # Normalise each entry to {url, title, content, error}.
         normalised = []

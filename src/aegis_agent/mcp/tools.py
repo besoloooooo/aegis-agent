@@ -46,11 +46,13 @@ class MCPToolWrapper:
     def run(self, arguments: Mapping[str, Any], context: ToolContext | None = None) -> ToolResult:
         if arguments is None:
             arguments = {}
+        is_cancelled = context.is_cancelled if context is not None else None
         raw = _client.call_tool(
             self._server_name,
             self._tool_name,
             dict(arguments),
             timeout=self._timeout,
+            is_cancelled=is_cancelled,
         )
         try:
             parsed = json.loads(raw)

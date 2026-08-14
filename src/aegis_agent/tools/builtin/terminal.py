@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from aegis_agent.exceptions import OperationCancelled
 from aegis_agent.models.base import ToolResult
 from aegis_agent.tools import schemas
 from aegis_agent.tools.danger import detect_dangerous_command
@@ -74,7 +76,8 @@ class TerminalTool:
 
         if background:
             return self._run_background(command, workdir)
-        return self._run_foreground(command, workdir, arguments, use_pty)
+        is_cancelled = context.is_cancelled if context is not None else None
+        return self._run_foreground(command, workdir, arguments, use_pty, is_cancelled)
 
     # -- foreground ----------------------------------------------------------
 
@@ -84,6 +87,7 @@ class TerminalTool:
         workdir: Path | None,
         arguments: Mapping[str, Any],
         use_pty: bool,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
         # Nudge long-lived server/watch commands toward background mode.
         lowered = command.lower()
@@ -105,16 +109,24 @@ class TerminalTool:
 
         argv = ["cmd", "/c", command] if _is_windows() else ["/bin/sh", "-c", command]
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 argv,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
                 cwd=str(workdir) if workdir else None,
-                check=False,  # exit codes are reported, never raised
             )
+        except OSError as exc:
+            return _error(f"Could not execute command: {exc}")
+
+        try:
+            returncode, output = _wait_and_drain(proc, timeout, is_cancelled)
+        except OperationCancelled:
+            # Cooperative cancel: the child is already killed.  Propagate so
+            # the runtime stops the turn without persisting a partial result.
+            raise
         except subprocess.TimeoutExpired:
             payload = {
                 "output": "",
@@ -122,22 +134,19 @@ class TerminalTool:
                 "error": f"Command timed out after {timeout}s and was killed.",
             }
             return ToolResult(tool_call_id="", name=self.definition.name, content=json.dumps(payload), is_error=True)
-        except OSError as exc:
-            return _error(f"Could not execute command: {exc}")
 
-        output = (completed.stdout or "") + (completed.stderr or "")
         output = _truncate_output(output)
 
-        payload: dict[str, Any] = {"output": output, "exit_code": completed.returncode, "error": None}
-        if completed.returncode != 0:
-            meaning = _exit_code_meaning(completed.returncode)
+        payload: dict[str, Any] = {"output": output, "exit_code": returncode, "error": None}
+        if returncode != 0:
+            meaning = _exit_code_meaning(returncode)
             if meaning:
                 payload["exit_code_meaning"] = meaning
         if hint:
             payload["hint"] = hint
         if note:
             payload["pty_note"] = note
-        is_error = completed.returncode != 0 and not payload.get("exit_code_meaning")
+        is_error = returncode != 0 and not payload.get("exit_code_meaning")
         return ToolResult(tool_call_id="", name=self.definition.name, content=json.dumps(payload, ensure_ascii=False), is_error=is_error)
 
     # -- background ----------------------------------------------------------
@@ -179,6 +188,61 @@ def _exit_code_meaning(code: int) -> str | None:
     if code == 124:
         return "exit code 124 — command timed out."
     return None
+
+
+def _wait_and_drain(
+    proc: subprocess.Popen,
+    timeout: int,
+    is_cancelled: Callable[[], bool] | None,
+) -> tuple[int, str]:
+    """Wait for ``proc``, draining output and honouring cancel/deadline.
+
+    Returns ``(returncode, combined_output)``.  stdout/stderr are drained
+    incrementally via ``communicate(timeout=...)`` so a chatty child cannot
+    wedge on a full pipe buffer.  Raises
+    :class:`~aegis_agent.exceptions.OperationCancelled` when ``is_cancelled``
+    fires and :class:`subprocess.TimeoutExpired` on deadline — in both cases
+    the child is killed first.
+    """
+    deadline = time.monotonic() + timeout
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    while True:
+        if is_cancelled is not None and is_cancelled():
+            _kill_proc(proc)
+            raise OperationCancelled("terminal command cancelled by interrupt")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_proc(proc)
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        try:
+            out, err = proc.communicate(timeout=min(0.2, remaining))
+            if out:
+                stdout_parts.append(out)
+            if err:
+                stderr_parts.append(err)
+            break
+        except subprocess.TimeoutExpired as exc:
+            # Data read so far is only on the exception; retrying communicate
+            # continues from where it left off, so append it here.
+            if exc.output:
+                stdout_parts.append(exc.output)
+            if exc.stderr:
+                stderr_parts.append(exc.stderr)
+            continue
+    return proc.returncode, "".join(stdout_parts) + "".join(stderr_parts)
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and reap it, best-effort (never raises)."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def _is_windows() -> bool:

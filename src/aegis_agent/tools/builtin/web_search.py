@@ -32,7 +32,11 @@ class WebSearchTool:
 
         limit = _as_int(arguments.get("limit", 5), default=5)
 
-        result = backends.web_search(query, limit)
+        is_cancelled = context.is_cancelled if context is not None else None
+        if is_cancelled is None:
+            result = backends.web_search(query, limit)
+        else:
+            result = backends.web_search(query, limit, is_cancelled=is_cancelled)
         if "error" in result:
             return _error(result["error"])
 

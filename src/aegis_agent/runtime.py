@@ -489,6 +489,11 @@ class AgentRuntime:
         final_text = ""
         stop_reason = StopReason.FINAL_ANSWER
 
+        # Cooperative-cancel callback shared by the model stream and tool
+        # execution: both abort (and discard partial work) when the interrupt
+        # event is set, instead of blocking to their own timeouts.
+        is_cancelled = (lambda: interrupt.is_set()) if interrupt is not None else None
+
         def _emit(event: ModelEvent) -> None:
             if on_event is not None:
                 te = TurnEvent.from_model_event(event)
@@ -529,7 +534,6 @@ class AgentRuntime:
                     summary_provider=self._summary_provider,
                 )
 
-            is_cancelled = (lambda: interrupt.is_set()) if interrupt is not None else None
             try:
                 response = collect_response(
                     self._provider.stream(api_messages, tools=self._registry.definitions()),
@@ -563,7 +567,13 @@ class AgentRuntime:
 
             tool_calls_made += len(response.tool_calls)
             turn_tool_calls.extend(response.tool_calls)
-            results = self._executor.execute(response.tool_calls)
+            try:
+                results = self._executor.execute(response.tool_calls, is_cancelled=is_cancelled)
+            except OperationCancelled:
+                # A tool aborted mid-flight (Ctrl+C / cancel): stop the turn
+                # without persisting the partial tool result.
+                stop_reason = StopReason.INTERRUPTED
+                break
             for tool_message, result in zip(self._executor.to_messages(results), results):
                 self._persist(session_id, tool_message)
                 if on_event is not None:

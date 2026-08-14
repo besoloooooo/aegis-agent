@@ -10,6 +10,7 @@ imported by the runtime (one-way dependency cli → runtime).
 from __future__ import annotations
 
 import os
+import signal
 import threading
 from pathlib import Path
 
@@ -28,6 +29,40 @@ _EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
 #: Default token budget for the derived model context (compression target).
 DEFAULT_CONTEXT_MAX_TOKENS = 120_000
+
+#: True while a turn is executing.  A SIGINT during this window sets the
+#: interrupt event (a graceful cancel) instead of raising KeyboardInterrupt,
+#: which would otherwise tear down the whole process mid-turn.
+_turn_active = False
+_interrupt_event: threading.Event | None = None
+
+
+def _sigint_handler(signum, frame):
+    """Route Ctrl+C to the cooperative interrupt while a turn is running.
+
+    When idle (at the prompt) the default behaviour is preserved: raise
+    ``KeyboardInterrupt`` so ``Tui.prompt`` returns and the REPL exits.  While
+    a turn is running, the first Ctrl+C sets the interrupt event (a graceful
+    cancel); a second Ctrl+C raises ``KeyboardInterrupt`` as a force-quit
+    escape hatch if the turn is stuck in a non-pollable wait.
+    """
+    if not _turn_active or _interrupt_event is None:
+        raise KeyboardInterrupt
+    if _interrupt_event.is_set():
+        raise KeyboardInterrupt
+    _interrupt_event.set()
+
+
+def _install_sigint_handler(interrupt: threading.Event) -> None:
+    """Install the Ctrl+C handler; a no-op when not on the main thread."""
+    global _interrupt_event
+    _interrupt_event = interrupt
+    try:
+        signal.signal(signal.SIGINT, _sigint_handler)
+    except (ValueError, OSError):
+        # Not the main thread (embedding host / test): leave the default
+        # handler in place — graceful cancel is simply not wired up here.
+        pass
 
 
 @app.callback(invoke_without_command=True)
@@ -146,20 +181,32 @@ def _main(
         typer.echo(f"[error] session not found: {resume}")
         raise typer.Exit(code=1)
 
+    # ---- cooperative interrupt (Ctrl+C / lease loss) --------------------
+    # ``interrupt`` is the transient cancel signal: the SIGINT handler sets it
+    # while a turn is running (instead of the default KeyboardInterrupt, which
+    # would kill the process) and the REPL clears it before the next turn.
+    # ``lease_lost`` is the *terminal* signal set when another process takes
+    # the session lease — it also sets ``interrupt`` (to stop the in-flight
+    # turn) but is never cleared, so subsequent turns keep stopping instead of
+    # risking dual writers.  The runtime polls ``interrupt`` between model
+    # calls and — via ToolContext.is_cancelled — inside long-running tools.
+    interrupt = threading.Event()
+    lease_lost = threading.Event()
+    _install_sigint_handler(interrupt)
+
     # ---- cross-process session lease ------------------------------------
     # With the in-memory store there is no cross-process shared state, so a
     # lease has nothing to protect — skip it rather than falling back to the
     # default-path SQLite lock namespace.  An operator who explicitly sets
     # AEGIS_SESSION_LEASE_BACKEND still gets a lease (explicit intent wins).
     lease_manager = None
-    lease_lost = threading.Event()
     lease_backend_env_set = bool(os.environ.get("AEGIS_SESSION_LEASE_BACKEND"))
     skip_lease = no_lease or (ephemeral and not lease_backend_env_set)
     if ephemeral and not no_lease and not lease_backend_env_set:
         typer.echo("[note] ephemeral store: session lease skipped "
                    "(nothing is shared across processes).")
     if not skip_lease:
-        lease_manager = _start_lease(repository, session_id, lease_lost)
+        lease_manager = _start_lease(repository, session_id, interrupt, lease_lost)
         if lease_manager is None:
             typer.echo(
                 f"[error] session '{session_id}' is currently owned by another process. "
@@ -194,7 +241,8 @@ def _main(
             runtime,
             session_id,
             tui,
-            interrupt=lease_lost if lease_manager is not None else None,
+            interrupt=interrupt,
+            lease_lost=lease_lost,
             snapshot_every_n=snapshot_every_n,
         )
     finally:
@@ -331,6 +379,9 @@ def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> No
             typer.echo(f"aegis> {a_line}{'…' if len(a_text) > 120 else ''}")
         typer.echo()
     typer.echo("─" * 70)
+
+
+def _print_session_list(repository) -> None:
     """Print a human-readable session table and exit."""
     import datetime
 
@@ -352,7 +403,12 @@ def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> No
         typer.echo(f"{sid:<32} {title:<20} {count:>5}  {created}")
 
 
-def _start_lease(repository, session_id: str, lease_lost: threading.Event):
+def _start_lease(
+    repository,
+    session_id: str,
+    interrupt: threading.Event,
+    lease_lost: threading.Event,
+):
     """Acquire the cross-process session lease; None when it is already held.
 
     The lease backend comes from ``AEGIS_SESSION_LEASE_BACKEND`` (default
@@ -362,9 +418,10 @@ def _start_lease(repository, session_id: str, lease_lost: threading.Event):
     entirely (see ``_main``) — an in-memory session has no cross-process
     shared state to protect.
 
-    ``on_lost`` sets ``lease_lost`` — the event is passed to
-    ``run_turn(interrupt=...)``, so a lost lease stops the agent loop at the
-    next guard instead of risking dual writers.
+    ``on_lost`` sets both ``interrupt`` (to stop the in-flight turn at the
+    next guard) and ``lease_lost`` (a terminal marker the REPL never clears),
+    so a lost lease stops the agent loop and keeps it stopped instead of
+    risking dual writers.
     """
     from aegis_agent.sessions.lease import (
         SessionLeaseManager,
@@ -381,6 +438,7 @@ def _start_lease(repository, session_id: str, lease_lost: threading.Event):
         raise typer.Exit(code=1) from exc
 
     def _on_lost(lost_session: str) -> None:
+        interrupt.set()
         lease_lost.set()
         typer.echo(
             f"\n[warning] session lease for '{lost_session}' was lost — "
@@ -399,9 +457,11 @@ def _repl(
     tui: Tui,
     *,
     interrupt: threading.Event | None = None,
+    lease_lost: threading.Event | None = None,
     snapshot_every_n: int = 20,
 ) -> None:
     """Read user lines, run turns, stream replies until an exit command / EOF."""
+    global _turn_active
     while True:
         line = tui.prompt()
         if line is None:  # EOF / Ctrl-C
@@ -413,9 +473,23 @@ def _repl(
         turn_input = _maybe_route_skill(runtime, line, tui)
         try:
             state = tui.begin_turn()
-            runtime.run_turn(
-                session_id, turn_input, interrupt=interrupt, on_event=tui.on_event_factory(state)
-            )
+            # Clear a transient Ctrl+C from a previous turn so it doesn't
+            # instantly interrupt the next message.  A lost lease is terminal:
+            # its event stays set (and keeps ``interrupt`` set) so we never
+            # resume writing to a session another process now owns.
+            if interrupt is not None and not (
+                lease_lost is not None and lease_lost.is_set()
+            ):
+                interrupt.clear()
+            # Mark the turn active so a SIGINT here cancels cooperatively
+            # (via the interrupt event) rather than raising KeyboardInterrupt.
+            _turn_active = True
+            try:
+                runtime.run_turn(
+                    session_id, turn_input, interrupt=interrupt, on_event=tui.on_event_factory(state)
+                )
+            finally:
+                _turn_active = False
         except AegisError as exc:
             tui.say(f"[error] {exc}")
             continue

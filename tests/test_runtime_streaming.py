@@ -144,3 +144,84 @@ def test_loop_does_not_import_concrete_provider():
         text = fh.read()
     assert "openai_compat" not in text
     assert "OpenAICompatibleProvider" not in text
+
+
+def test_tool_cancel_propagates_and_discards_result():
+    """A tool that raises OperationCancelled stops the turn without persisting a
+    tool result (mirrors the mid-stream cancel discard)."""
+    from aegis_agent.exceptions import OperationCancelled
+    from aegis_agent.models.base import ToolDefinition
+    from aegis_agent.tools.executor import ToolExecutor
+    from aegis_agent.tools.registry import ToolRegistry
+
+    class CancellingTool:
+        definition = ToolDefinition(name="cancel_me", description="raises cancel", parameters={})
+
+        def run(self, arguments, context=None):
+            raise OperationCancelled("tool cancelled by interrupt")
+
+    class Provider:
+        name = "p"
+
+        def stream(self, messages, tools=None):
+            yield ModelEvent.tool(ToolCall(id="c1", name="cancel_me", arguments="{}"))
+            yield ModelEvent.done("tool_calls")
+
+    registry = ToolRegistry()
+    registry.register(CancellingTool())
+    runtime = AgentRuntime(
+        provider=Provider(),
+        registry=registry,
+        executor=ToolExecutor(registry),
+        repository=InMemorySessionRepository(),
+    )
+    result = runtime.run_turn("s1", "go")
+
+    assert result.stop_reason is StopReason.INTERRUPTED
+    # user + assistant(tool-call request) persisted, but no TOOL result message.
+    assert [m.role for m in result.messages] == [Role.USER, Role.ASSISTANT]
+
+
+def test_executor_cancelled_before_run_raises():
+    """A pre-set cancel aborts the executor before the tool handler runs."""
+    import pytest
+
+    from aegis_agent.exceptions import OperationCancelled
+    from aegis_agent.models.base import ToolDefinition
+    from aegis_agent.tools.executor import ToolExecutor
+    from aegis_agent.tools.registry import ToolRegistry
+
+    class NeverTool:
+        definition = ToolDefinition(name="never", description="d", parameters={})
+
+        def run(self, arguments, context=None):
+            raise AssertionError("tool must not run when pre-cancelled")
+
+    registry = ToolRegistry()
+    registry.register(NeverTool())
+    executor = ToolExecutor(registry)
+    with pytest.raises(OperationCancelled):
+        executor.execute_one(ToolCall(id="c1", name="never", arguments="{}"), is_cancelled=lambda: True)
+
+
+def test_executor_threads_is_cancelled_into_context():
+    """The executor injects is_cancelled into the tool context (no pre-cancel)."""
+    from aegis_agent.models.base import ToolDefinition, ToolResult
+    from aegis_agent.tools.executor import ToolExecutor
+    from aegis_agent.tools.registry import ToolContext, ToolRegistry
+
+    seen = {}
+
+    class RecordingTool:
+        definition = ToolDefinition(name="rec", description="d", parameters={})
+
+        def run(self, arguments, context=None):
+            seen["is_cancelled"] = context.is_cancelled if context else None
+            return ToolResult(tool_call_id="", name="rec", content="{}")
+
+    registry = ToolRegistry()
+    registry.register(RecordingTool())
+    executor = ToolExecutor(registry, ToolContext(cwd="."))
+    cancelled = lambda: False
+    executor.execute_one(ToolCall(id="c1", name="rec", arguments="{}"), is_cancelled=cancelled)
+    assert seen["is_cancelled"] is cancelled

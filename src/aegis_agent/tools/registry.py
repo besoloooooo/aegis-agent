@@ -10,7 +10,7 @@ there is no hidden global state and tests can build isolated registries.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -28,10 +28,17 @@ class ToolContext:
     never enable it — only the embedding application / CLI can (mirroring
     Hermes' internal ``force`` flag).  Kept frozen so tools cannot mutate
     shared runtime state.
+
+    ``is_cancelled`` is an optional cooperative-cancel callback: when set,
+    long-running tools (terminal, web, MCP, process wait) poll it and raise
+    :class:`~aegis_agent.exceptions.OperationCancelled` to abort early instead
+    of blocking to their timeout.  It is ambient state injected by the
+    executor/runtime, never a tool argument the model can set.
     """
 
     cwd: str = field(default_factory=os.getcwd)
     allow_dangerous_shell: bool = False
+    is_cancelled: Callable[[], bool] | None = None
 
 
 @runtime_checkable

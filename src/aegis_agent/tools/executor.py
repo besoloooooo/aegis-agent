@@ -19,10 +19,12 @@ exception that would tear down the agent loop.
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
+from aegis_agent.exceptions import OperationCancelled
 from aegis_agent.models.base import Message, Role, ToolCall, ToolResult
 from aegis_agent.models.sanitize import repair_tool_call_arguments
 from aegis_agent.tools.registry import ToolContext, ToolRegistry
@@ -40,12 +42,27 @@ class ToolExecutor:
         self._registry = registry
         self._context = context or ToolContext()
 
-    def execute(self, tool_calls: Sequence[ToolCall]) -> list[ToolResult]:
+    def execute(
+        self,
+        tool_calls: Sequence[ToolCall],
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> list[ToolResult]:
         """Execute a batch of tool calls in order, one result per call."""
-        return [self.execute_one(tc) for tc in tool_calls]
+        return [self.execute_one(tc, is_cancelled=is_cancelled) for tc in tool_calls]
 
-    def execute_one(self, tool_call: ToolCall) -> ToolResult:
-        """Execute a single tool call, never raising for tool-level failures."""
+    def execute_one(
+        self,
+        tool_call: ToolCall,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> ToolResult:
+        """Execute a single tool call, never raising for tool-level failures.
+
+        ``is_cancelled`` (when set) is injected into the tool context and
+        polled by long-running tools.  A cooperative cancel raises
+        :class:`~aegis_agent.exceptions.OperationCancelled`, which propagates
+        out of the executor so the runtime can stop the turn without persisting
+        a spurious tool result.
+        """
         tool = self._registry.get(tool_call.name)
         if tool is None:
             return ToolResult(
@@ -65,8 +82,16 @@ class ToolExecutor:
                 is_error=True,
             )
 
+        context = self._context
+        if is_cancelled is not None:
+            context = dataclasses.replace(self._context, is_cancelled=is_cancelled)
+            if is_cancelled():
+                raise OperationCancelled("tool execution cancelled by interrupt")
+
         try:
-            result = tool.run(arguments, self._context)
+            result = tool.run(arguments, context)
+        except OperationCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001 — convert any tool error into a result
             return ToolResult(
                 tool_call_id=tool_call.id,

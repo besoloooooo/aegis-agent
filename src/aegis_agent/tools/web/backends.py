@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
+from aegis_agent.exceptions import OperationCancelled
 from aegis_agent.tools.web.url_safety import is_safe_url
 
 logger = logging.getLogger(__name__)
@@ -48,25 +50,44 @@ def search_backend_name() -> str:
     return "ddgs"
 
 
-def web_search(query: str, limit: int = 5) -> dict[str, Any]:
+def _check_cancelled(is_cancelled: Callable[[], bool] | None) -> None:
+    """Raise :class:`OperationCancelled` when the cancel flag is set."""
+    if is_cancelled is not None and is_cancelled():
+        raise OperationCancelled("web request cancelled by interrupt")
+
+
+def web_search(
+    query: str,
+    limit: int = 5,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Search the web; return ``{"results": [...]}`` or ``{"error": ...}``.
 
     Each result is ``{title, url, description, position}``.  Prefers a paid
     provider when its API key is set, otherwise DuckDuckGo via ``ddgs``.
+    ``is_cancelled`` (when set) is polled between requests/items and raises
+    :class:`~aegis_agent.exceptions.OperationCancelled` to abort early.
     """
     limit = max(1, min(int(limit), 100))
     try:
+        _check_cancelled(is_cancelled)
         if os.environ.get("TAVILY_API_KEY"):
-            return _search_tavily(query, limit)
+            return _search_tavily(query, limit, is_cancelled)
         if os.environ.get("EXA_API_KEY"):
-            return _search_exa(query, limit)
-        return _search_ddgs(query, limit)
+            return _search_exa(query, limit, is_cancelled)
+        return _search_ddgs(query, limit, is_cancelled)
+    except OperationCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 — surface as an error dict, never raise
         logger.warning("web_search failed: %s", exc)
         return {"error": f"web_search failed: {type(exc).__name__}: {exc}"}
 
 
-def _search_ddgs(query: str, limit: int) -> dict[str, Any]:
+def _search_ddgs(
+    query: str,
+    limit: int,
+    is_cancelled: Callable[[], bool] | None,
+) -> dict[str, Any]:
     try:
         from ddgs import DDGS
     except ImportError:
@@ -77,6 +98,7 @@ def _search_ddgs(query: str, limit: int) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     with DDGS() as ddgs:
         for i, hit in enumerate(ddgs.text(query, max_results=limit)):
+            _check_cancelled(is_cancelled)
             results.append({
                 "title": hit.get("title", ""),
                 "url": hit.get("href", hit.get("url", "")),
@@ -105,7 +127,12 @@ def _tavily_request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     return resp.json()
 
 
-def _search_tavily(query: str, limit: int) -> dict[str, Any]:
+def _search_tavily(
+    query: str,
+    limit: int,
+    is_cancelled: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    _check_cancelled(is_cancelled)
     data = _tavily_request(
         "search",
         {
@@ -127,7 +154,12 @@ def _search_tavily(query: str, limit: int) -> dict[str, Any]:
     return {"results": results, "backend": "tavily"}
 
 
-def _search_exa(query: str, limit: int) -> dict[str, Any]:
+def _search_exa(
+    query: str,
+    limit: int,
+    is_cancelled: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    _check_cancelled(is_cancelled)
     api_key = os.environ["EXA_API_KEY"]
     resp = httpx.post(
         "https://api.exa.ai/search",
@@ -153,13 +185,17 @@ def _search_exa(query: str, limit: int) -> dict[str, Any]:
 # extract
 # ---------------------------------------------------------------------------
 
-def _extract_tavily(urls: list[str]) -> list[dict[str, Any]]:
+def _extract_tavily(
+    urls: list[str],
+    is_cancelled: Callable[[], bool] | None,
+) -> list[dict[str, Any]]:
     """Extract content from URLs via the Tavily ``/extract`` endpoint.
 
     Returns a list of ``{url, title, content, error}`` dicts — one per input URL.
     Per-URL failures are reported inline (never raised).  The Tavily endpoint
     accepts up to 20 URLs per call.
     """
+    _check_cancelled(is_cancelled)
     try:
         data = _tavily_request(
             "extract",
@@ -198,11 +234,15 @@ def _extract_tavily(urls: list[str]) -> list[dict[str, Any]]:
     return results
 
 
-def _extract_direct(url: str) -> dict[str, Any]:
+def _extract_direct(
+    url: str,
+    is_cancelled: Callable[[], bool] | None,
+) -> dict[str, Any]:
     """Fetch a single URL and extract readable content via trafilatura."""
     if not is_safe_url(url):
         return {"url": url, "error": "Blocked: URL targets a private/internal address or unsupported scheme."}
 
+    _check_cancelled(is_cancelled)
     try:
         resp = httpx.get(
             url,
@@ -242,7 +282,10 @@ def _extract_direct(url: str) -> dict[str, Any]:
     return {"url": url, "title": title, "content": content}
 
 
-def web_extract(urls: list[str]) -> list[dict[str, Any]]:
+def web_extract(
+    urls: list[str],
+    is_cancelled: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
     """Fetch one or more URLs and extract readable content.
 
     When ``TAVILY_API_KEY`` is set the call is batched through the Tavily
@@ -251,15 +294,22 @@ def web_extract(urls: list[str]) -> list[dict[str, Any]]:
 
     Returns a list of ``{url, title, content, error}`` dicts — one per input
     URL, with per-URL failures reported inline.  Each URL is SSRF-checked
-    before any network access.
+    before any network access.  ``is_cancelled`` (when set) is polled between
+    URLs and raises :class:`~aegis_agent.exceptions.OperationCancelled` to
+    abort the batch early.
     """
     if not urls:
         return []
 
+    _check_cancelled(is_cancelled)
     if os.environ.get("TAVILY_API_KEY", "").strip():
-        return _extract_tavily(urls)
+        return _extract_tavily(urls, is_cancelled)
 
-    return [_extract_direct(u) for u in urls]
+    results: list[dict[str, Any]] = []
+    for u in urls:
+        _check_cancelled(is_cancelled)
+        results.append(_extract_direct(u, is_cancelled))
+    return results
 
 
 def _strip_html(html: str) -> str:

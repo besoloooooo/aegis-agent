@@ -36,7 +36,10 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from aegis_agent.exceptions import OperationCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -347,8 +350,18 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
 
-    def wait(self, session_id: str, timeout: int | None = None) -> dict:
-        """Block until the process exits, times out, or the clamp is hit."""
+    def wait(
+        self,
+        session_id: str,
+        timeout: int | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> dict:
+        """Block until the process exits, times out, or the clamp is hit.
+
+        ``is_cancelled`` (when set) is polled each tick; if it fires,
+        :class:`~aegis_agent.exceptions.OperationCancelled` is raised so the
+        caller can stop waiting immediately instead of blocking to the clamp.
+        """
         requested = timeout
         timeout_note = None
         if requested and requested > _WAIT_DEFAULT_TIMEOUT:
@@ -363,6 +376,8 @@ class ProcessRegistry:
 
         deadline = time.monotonic() + effective
         while time.monotonic() < deadline:
+            if is_cancelled is not None and is_cancelled():
+                raise OperationCancelled("process wait cancelled by interrupt")
             self._reconcile_local_exit(session)
             if session.exited:
                 result = {

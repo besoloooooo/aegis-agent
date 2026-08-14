@@ -28,7 +28,10 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
+
+from aegis_agent.exceptions import OperationCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +97,17 @@ def _ensure_loop() -> None:
         _thread.start()
 
 
-def _run_on_loop(coro_factory, timeout: float) -> Any:
+def _run_on_loop(
+    coro_factory,
+    timeout: float,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> Any:
     """Schedule ``coro_factory()`` on the background loop, block, return result.
 
-    Raises ``TimeoutError`` when the operation exceeds ``timeout`` seconds.
-    The coroutine is cancelled on timeout.  Every other exception (including
+    Raises ``TimeoutError`` when the operation exceeds ``timeout`` seconds and
+    :class:`~aegis_agent.exceptions.OperationCancelled` when ``is_cancelled``
+    fires (the coroutine is cancelled first, so the caller can abort early
+    instead of blocking to the full timeout).  Every other exception (including
     connection and tool errors) is propagated to the caller.
     """
     _ensure_loop()
@@ -111,6 +120,9 @@ def _run_on_loop(coro_factory, timeout: float) -> Any:
 
     deadline = time.monotonic() + timeout
     while True:
+        if is_cancelled is not None and is_cancelled():
+            future.cancel()
+            raise OperationCancelled("MCP tool call cancelled by interrupt")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             future.cancel()
@@ -328,12 +340,21 @@ async def _run_http_forever(
 # ---------------------------------------------------------------------------
 
 
-def call_tool(server_name: str, tool_name: str, arguments: dict, timeout: float | None = None) -> str:
+def call_tool(
+    server_name: str,
+    tool_name: str,
+    arguments: dict,
+    timeout: float | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> str:
     """Execute one MCP tool call and return the JSON result string.
 
     ``arguments`` is the already-parsed dict of tool arguments.
     Returns a JSON object string with either ``"result"`` or ``"error"``.
-    Never raises — errors are returned as ``{"error": "..."}`` JSON.
+    Never raises for tool/connection errors — those are returned as
+    ``{"error": "..."}`` JSON.  A cooperative cancel (``is_cancelled``) is the
+    exception: it raises :class:`~aegis_agent.exceptions.OperationCancelled`
+    so the caller can stop the turn immediately.
     """
     entry = _servers.get(server_name)
     if entry is None:
@@ -346,7 +367,10 @@ def call_tool(server_name: str, tool_name: str, arguments: dict, timeout: float 
         raw = _run_on_loop(
             lambda: _call_async(session, tool_name, arguments),
             effective_timeout,
+            is_cancelled=is_cancelled,
         )
+    except OperationCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": _sanitize_error(f"MCP call failed: {exc}")}, ensure_ascii=False)
 

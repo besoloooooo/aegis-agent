@@ -48,7 +48,12 @@ class ProcessTool:
             payload = self._registry.read_log(session_id, offset=max(0, offset), limit=max(1, limit))
         elif action == "wait":
             timeout = arguments.get("timeout")
-            payload = self._registry.wait(session_id, timeout=_as_int(timeout, default=0) or None)
+            is_cancelled = context.is_cancelled if context is not None else None
+            payload = self._registry.wait(
+                session_id,
+                timeout=_as_int(timeout, default=0) or None,
+                is_cancelled=is_cancelled,
+            )
         elif action == "kill":
             payload = self._registry.kill_process(session_id)
         elif action == "write":
