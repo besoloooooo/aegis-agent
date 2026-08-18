@@ -21,6 +21,12 @@ from aegis_agent.env import load_dotenv
 from aegis_agent.exceptions import AegisError
 from aegis_agent.models.base import Message, Role
 from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime
+from aegis_agent.slash_commands import (
+    SlashHandler,
+    SlashKind,
+    WireCaptureProvider,
+    format_session_table,
+)
 from aegis_agent.tui import Tui
 
 app = typer.Typer(add_completion=False, help="Aegis Agent — minimal interactive agent runtime.")
@@ -171,6 +177,15 @@ def _main(
         context_budget = context_max_tokens or DEFAULT_CONTEXT_MAX_TOKENS
         summary_provider = _build_summary_provider(provider)
 
+    # Wrap the provider so /chatlog can dump the exact derived message list
+    # sent to the model on the most recent call (post system-prompt assembly,
+    # post compression).  A single shallow list copy per call — cheap.  The
+    # unwrapped provider is passed as the memory side-query backend so
+    # recall/extract calls don't overwrite the conversation wire capture.
+    wire = WireCaptureProvider(provider)
+    inner_provider = provider
+    provider = wire
+
     # ---- session store (persistence + resume) ---------------------------
     repository = _build_repository(db_path, ephemeral)
     if list_sessions:
@@ -180,6 +195,13 @@ def _main(
     if resume and repository.get_session(resume) is None:
         typer.echo(f"[error] session not found: {resume}")
         raise typer.Exit(code=1)
+    if not ephemeral:
+        # Persist the session row up front.  The row is otherwise created
+        # lazily by the first run_turn, so exiting without sending a message
+        # left nothing on disk and the printed "Resume: aegis --resume <id>"
+        # hint failed with "session not found".  Idempotent (INSERT OR
+        # IGNORE), so a resumed session keeps its original title/created_at.
+        repository.create_session(session_id)
 
     # ---- cooperative interrupt (Ctrl+C / lease loss) --------------------
     # ``interrupt`` is the transient cancel signal: the SIGINT handler sets it
@@ -228,6 +250,7 @@ def _main(
             enable_memory=not no_memory,
             enable_memory_recall=memory_recall and not no_memory,
             enable_memory_extract=memory_extract and not no_memory,
+            memory_side_provider=inner_provider,
             context_token_budget=context_budget,
             summary_provider=summary_provider,
         )
@@ -237,9 +260,35 @@ def _main(
             tui.say(f"Resumed session {session_id} "
                     f"({repository.message_count(session_id)} messages).")
             _print_resume_preview(repository, session_id)
+
+        # ---- slash commands ----------------------------------------------
+        # Session rotation (/new, /clear): create the fresh session row, then
+        # migrate the lease with switch_session (acquire-new-then-release-old,
+        # so a failed acquire keeps the old lease).  A successful rotation
+        # clears the terminal lease_lost marker — the new session is ours.
+        def _rotate_session(title: str | None) -> str | None:
+            nonlocal session_id
+            new_id = _new_session_id()
+            repository.create_session(new_id, title=title)
+            if lease_manager is not None and not lease_manager.switch_session(new_id):
+                return None
+            session_id = new_id
+            lease_lost.clear()
+            interrupt.clear()
+            return new_id
+
+        slash = SlashHandler(
+            runtime=runtime,
+            repository=repository,
+            emit=tui.out,
+            session_id=session_id,
+            wire=wire,
+            rotate_session=_rotate_session,
+            clear_screen=tui.clear_screen,
+        )
         _repl(
             runtime,
-            session_id,
+            slash,
             tui,
             interrupt=interrupt,
             lease_lost=lease_lost,
@@ -383,24 +432,10 @@ def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> No
 
 def _print_session_list(repository) -> None:
     """Print a human-readable session table and exit."""
-    import datetime
-
     if not hasattr(repository, "list_sessions"):
         typer.echo("(this session store does not support listing)")
         return
-    sessions = repository.list_sessions()
-    if not sessions:
-        typer.echo("(no sessions recorded)")
-        return
-    typer.echo(f"{'SESSION ID':<32} {'TITLE':<20} {'MSGS':>5}  {'CREATED'}")
-    typer.echo("-" * 80)
-    for s in sessions:
-        sid = s["id"][:32]
-        title = (s.get("title") or "")[:20]
-        count = s.get("message_count", 0)
-        ts = s.get("created_at")
-        created = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
-        typer.echo(f"{sid:<32} {title:<20} {count:>5}  {created}")
+    typer.echo("\n".join(format_session_table(repository.list_sessions())))
 
 
 def _start_lease(
@@ -453,24 +488,48 @@ def _start_lease(
 
 def _repl(
     runtime: AgentRuntime,
-    session_id: str,
+    slash: SlashHandler,
     tui: Tui,
     *,
     interrupt: threading.Event | None = None,
     lease_lost: threading.Event | None = None,
     snapshot_every_n: int = 20,
 ) -> None:
-    """Read user lines, run turns, stream replies until an exit command / EOF."""
+    """Read user lines, run turns, stream replies until an exit command / EOF.
+
+    A line starting with ``/`` is first offered to the slash-command handler
+    (``/save``, ``/chatlog``, ``/new``, …).  Unrecognised ``/tokens`` fall
+    through to skill routing and then to the model unchanged.  ``/retry``
+    re-queues the last user message as a fresh turn; ``/undo`` prefills the
+    next composer with the backed-up text.
+    """
     global _turn_active
+    prefill = ""
     while True:
-        line = tui.prompt()
+        line = tui.prompt(default=prefill)
+        prefill = ""
         if line is None:  # EOF / Ctrl-C
             break
         if not line:
             continue
         if line.lower() in _EXIT_COMMANDS:
             break
-        turn_input = _maybe_route_skill(runtime, line, tui)
+        if line.startswith("/"):
+            result = slash.handle(line)
+            if result is not None:
+                if result.kind is SlashKind.EXIT:
+                    break
+                if result.kind is SlashKind.HANDLED:
+                    prefill = result.prefill
+                    continue
+                turn_input = result.text  # REQUEUE (/retry)
+                if not turn_input:
+                    continue
+            else:
+                turn_input = _maybe_route_skill(runtime, line, tui)
+        else:
+            turn_input = _maybe_route_skill(runtime, line, tui)
+        session_id = slash.session_id
         try:
             state = tui.begin_turn()
             # Clear a transient Ctrl+C from a previous turn so it doesn't

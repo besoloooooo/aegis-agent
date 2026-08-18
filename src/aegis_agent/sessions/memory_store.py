@@ -40,6 +40,31 @@ class InMemorySessionRepository:
         with self._lock:
             return self._sessions.get(session_id)
 
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """Update the session title (``/title``).  False when unknown."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.title = title
+            return True
+
+    def rewind_from_seq(self, session_id: str, seq: int) -> int:
+        """Drop the message at ``seq`` and everything after it (``/undo``).
+
+        The in-memory store is ephemeral (nothing survives the process), so
+        unlike the SQLite store's soft delete this simply truncates the tail;
+        ``seq`` equals the list index, so the remaining prefix keeps its
+        ordering invariant.  Returns the number of removed messages.
+        """
+        with self._lock:
+            messages = self._messages_for(session_id)
+            if seq < 0 or seq >= len(messages):
+                return 0
+            removed = len(messages) - seq
+            del messages[seq:]
+            return removed
+
     def append_message(self, session_id: str, message: Message) -> Message:
         with self._lock:
             messages = self._messages_for(session_id)

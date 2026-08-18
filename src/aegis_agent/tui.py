@@ -125,7 +125,7 @@ def _banner_renderable(label: str, session_id: str, startup_info: dict[str, int]
     logo = Text(_SHIELD_LOGO, style="aegis.blue")
     title = Text.assemble(("Aegis Agent  ", "aegis.blue"), (f"v{__version__}", "aegis.dim"))
     sub = Text(f"{label} · session '{session_id}'", style="aegis.dim")
-    hint = Text("type a message; 'exit' to quit.  (←/→ move cursor, ↑/↓ history)", style="aegis.dim")
+    hint = Text("type a message; /help for commands; 'exit' to quit.  (←/→ move cursor, ↑/↓ history)", style="aegis.dim")
     items: list[Any] = [
         Align.center(logo),
         Align.center(title),
@@ -180,10 +180,11 @@ class Tui:
     def banner(self, label: str, session_id: str, startup_info: dict[str, int] | None = None) -> None:
         self._console.print(_banner_renderable(label=label, session_id=session_id, startup_info=startup_info))
 
-    def prompt(self) -> str | None:
+    def prompt(self, default: str = "") -> str | None:
+        """Read one input line; ``default`` prefills the composer (``/undo``)."""
         if self._is_tty and self._session is not None:
             try:
-                text = self._session.prompt([("class:marker", "❯ ")])
+                text = self._session.prompt([("class:marker", "❯ ")], default=default)
             except (EOFError, KeyboardInterrupt):
                 self._console.print()
                 return None
@@ -200,6 +201,14 @@ class Tui:
 
     def info(self, text: str) -> None:
         self._console.print(text, style="aegis.dim", highlight=False)
+
+    def out(self, text: str) -> None:
+        """Print a multi-line block verbatim (help/history/session tables)."""
+        self._console.print(text, highlight=False)
+
+    def clear_screen(self) -> None:
+        """Clear the terminal (the ``/clear`` command)."""
+        self._console.clear()
 
     # -- per-turn streaming ----------------------------------------------
 

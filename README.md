@@ -6,7 +6,7 @@ A lightweight, recoverable, and extensible **Agent Runtime**, built by extractin
 
 ## 🏁 Milestones delivered
 
-Sixteen milestones, from a minimal skeleton to the full runtime:
+Seventeen milestones, from a minimal skeleton to the full runtime:
 
 **Core runtime**
 1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
@@ -32,6 +32,9 @@ Sixteen milestones, from a minimal skeleton to the full runtime:
 15. Memory recall + background extraction
 16. Session history search — FTS5 `session_search`
 
+**Interactive UX**
+17. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
+
 ---
 
 ## 🏗 Project layout
@@ -40,6 +43,7 @@ Sixteen milestones, from a minimal skeleton to the full runtime:
 src/aegis_agent/
 ├── cli.py          # Typer CLI / REPL entry point
 ├── tui.py          # terminal UI (prompt_toolkit + rich)
+├── slash_commands.py  # interactive /command registry + dispatcher
 ├── runtime.py      # AgentRuntime — the agent loop
 ├── events.py       # model event stream
 ├── models/         # ModelProvider protocol, fake / OpenAI providers, Message / ToolCall
@@ -111,6 +115,29 @@ Run without persistence:
 ```bash
 uv run aegis --ephemeral
 ```
+
+---
+
+## ⌨️ Slash Commands
+
+The interactive REPL understands `/commands` (type `/help` inside the REPL):
+
+```text
+/new [name]     start a new session (alias: /reset)
+/clear          clear screen + new session
+/history        show the conversation (tool messages collapsed)
+/save           dump debug snapshots (local / wire / system prompt)
+                to ./aegis-chat-logs/  (alias: /chatlog)
+/retry          resend the last message
+/undo [N]       back up N user turns (rows are soft-deleted, kept on
+                disk for audit) and prefill the composer for editing
+/title [name]   set or show the session title
+/sessions       list recorded sessions
+/exit           quit (alias: /quit)
+```
+
+A `/token` matching no command falls through to skill routing, then to the
+model unchanged.
 
 ---
 

@@ -2254,3 +2254,126 @@ Hermes 原版 FTS5 会话检索能力已稳定迁入 Aegis，且与 Auto Memory 
 Hermes 的 trigram + LIKE 降级（无 embedding）。后续若做 `FTS5 + LLM rerank` / embedding / 向量库 /
 混合检索，均不在本阶段范围内。
 
+---
+
+## 交互式斜杠命令套件（/save、/new、/undo 等）
+
+### 为什么做
+
+Hermes 运行时在 REPL 里提供一整套 `/命令`：导出会话调试快照（/chatlog）、开新会话（/new、
+/clear）、看历史（/history）、撤回与重试（/undo、/retry）、标题与列表（/title、/sessions）等。
+Aegis 此前只有裸 `exit`/`quit`，这些日常操作都不可用。本阶段把**交互式 CLI 子集**整体移植过来。
+
+一个有意为之的命名差异：Aegis 的 **`/save` 直接实现 Hermes `/chatlog` 的行为**（三件套调试导出），
+`/chatlog` 保留为别名；Hermes 原版 `/save` 的 JSON 快照导出未采用（其「便捷导出」价值被
+`--resume` + 调试导出覆盖）。
+
+边界（CLAUDE.md §5）：只迁 REPL 面对的命令。Hermes 注册表里 gateway/Telegram/Slack 分发、
+/model、/cron、/kanban、浏览器/语音/图片、皮肤、自动更新等产品命令全部不迁。
+
+### Hermes 行为与源码位置
+
+- `hermes_cli/commands.py`：`CommandDef` + `COMMAND_REGISTRY` 中央注册表（所有消费方——CLI help、
+  gateway 分发、自动补全——共用同一份数据）；`resolve_command` 别名解析；`SlashCommandCompleter`。
+- `cli.py` `HermesCLI`：`dump_chatlog`（`NN-local/wire/system` 三件套调试导出，数字前缀扫描递增）、
+  `_install_wire_capture`（monkey-patch `agent._build_api_kwargs` 捕获最近一次发往 provider 的
+  消息列表）、`show_history`（工具消息折叠成汇总行、400 字符预览）、`retry_last`/`undo_last`
+  （回退到倒数第 N 条 user 消息并截断；磁盘侧软删除 + 输入框预填）、`new_session`（轮换
+  session id、停旧租约、清 `_lease_lost`）。
+- `hermes_state.py` `SessionDB`：`rewind_to_message`（软删除截断）、`set_session_title`、
+  `sanitize_title`。
+
+### 迁移决策
+
+**逐命令 ADAPT + 少量 REWRITE**，不做整体搬运：Hermes 的分发器长在 16k 行的 `cli.py` 巨类里，
+直接整文件迁移会把大量越界产品功能带进来。具体决策：
+
+- 注册表模式（CommandDef/别名解析/help 渲染）照搬，内容裁剪为 CLI 子集；
+- `/save`（= Hermes /chatlog）、`/history`、`/retry`、`/undo` 的可观察行为逐条对齐（见下）；
+- wire 捕获由 monkey-patch **改为显式 provider 包装器**（REWRITE）——Aegis 的 `ModelProvider`
+  Protocol 本身就是组合点，不需要补丁；
+- 截断类命令（retry/undo）在 Aegis 必须落到**存储层**（Hermes 截内存里的
+  `conversation_history` 列表，Aegis 的唯一事实源是 repository），因此给两个 store 加了
+  `rewind_from_seq`；
+- 分发器做成 UI 无关的 `SlashHandler`（输出走 `emit` 回调、会话轮换走 `rotate_session` 回调），
+  不依赖 Typer/Rich/TTY，可纯单测；runtime 不 import 它（保持 cli → runtime 单向依赖）。
+
+### Aegis 设计、数据流与关键接口
+
+**分发**：`cli._repl` 对 `/` 开头的行先问 `SlashHandler.handle(line)`——命中注册表则执行并返回
+`SlashResult(kind=HANDLED/REQUEUE/EXIT)`；未命中返回 `None`，落回既有的 skill 路由再进模型
+（`/token` 不匹配任何命令时模型看到的仍是用户原文，行为不变）。`/retry` 返回 REQUEUE 把上一条
+user 消息重新跑一轮；`/undo` 返回 `prefill`，REPL 在下一次 `tui.prompt(default=...)` 预填。
+
+**wire 捕获**：`WireCaptureProvider` 包在主 provider 外（每次 `stream()` 浅拷贝消息列表 + 时间戳，
+与 Hermes 捕获同样刻意不做 deepcopy）。CLI 把**未包装**的 provider 传给 memory side-query，避免
+recall/extract 的旁路调用覆盖会话捕获。`/save` 写 `NN-local.json`（持久化历史）、
+`NN-wire.json`（最近一次实际上线的派生上下文，含 system prompt、含压缩结果）、
+`NN-system.txt`（优先取 wire 里的 system 消息，首轮前则现渲染）。
+
+**会话轮换**：`/new`/`/clear` 经 `_rotate_session` 回调：建新 session 行 →
+`SessionLeaseManager.switch_session`（先获新租约再放旧的，失败则留在原会话）→ 清
+`interrupt`/`lease_lost` 事件（对齐 Hermes `new_session` 的 `_lease_lost = False`）。
+
+**软删除截断**：`SQLiteSessionRepository.rewind_from_seq(session_id, seq)` 在同一事务里把
+`seq >= N` 的 active 行置 `active=0`、重算 `sessions.message_count`、递增 `history_version`。
+`active` 列是 Stage 12 schema 里就预留的；所有读路径（全量重放/快照尾部/message_count/FTS 检索）
+本就过滤 `active=1`，所以截断对读取立即可见，而行物理保留供审计。`history_version` 递增使
+改写前的恢复快照版本校验失败 → 恢复自动降级为截断后历史的全量重放（不破坏
+「快照 == 全量重放」不变式）。内存 store 是易失的，直接物理截断（`seq == list 索引`，不变式保持）。
+
+**关键文件**：`src/aegis_agent/slash_commands.py`（注册表、`WireCaptureProvider`、`SlashHandler`、
+`message_to_dict`、`format_session_table`）；`sessions/sqlite_store.py`（`rewind_from_seq`、
+`set_session_title`）；`sessions/memory_store.py`（同名方法）；`runtime.py`（`provider_name`/
+`system_prompt` 只读属性）；`tui.py`（`prompt(default=)`、`out`、`clear_screen`）；`cli.py`
+（REPL 分发 + `_rotate_session`；provider 包装）。
+
+### 可靠性不变式、边界与失败处理
+
+- **原始消息不被物理删除**：undo/retry 只置 `active=0`；审计行保留，FTS 检索默认排除。
+- **快照失效**：rewind 递增 `history_version`，旧快照恢复自动降级全量重放（有测试覆盖）。
+- **幂等/隔离**：同一范围重复 rewind 第二次删 0 行；其它会话的消息不受影响（有测试覆盖）。
+- **空历史/无 user 消息/非法参数**：各命令输出提示并原地不动，不抛异常。
+- **首轮前 /save**：wire 快照为空数组 + `captured_at=null`，system.txt 现渲染（对齐 Hermes）。
+- **租约获取失败**：`/new` 留在旧会话并报错，不会半轮换。
+- **命令层崩溃隔离**：所有导出路径捕获 OSError 并输出错误，debug 命令绝不弄挂 REPL。
+
+### 测试
+
+新增 `tests/test_slash_commands.py`（36 项）：注册表/别名/未知 token 回落、help 完整性、标题清洗、
+/save 三件套导出内容与数字前缀递增 + 首轮前回退 + 空会话、/chatlog 别名等价、/history 渲染与
+工具消息折叠、/new 轮换（成功/失败/无回调）、/title 设置与展示（含首条消息前建会话）、/retry
+重排队列与截断、/undo N/预填/超界/非法计数、SQLite rewind 不变式（审计行保留、message_count
+重算、history_version 递增使快照失效、幂等、跨会话隔离）、CliRunner 端到端（/save、/chatlog、
+/title、/history、/new、/exit、/retry 重跑、未知命令进模型）。
+
+**顺带修复（预先存在的测试隔离/环境缺陷）**：`test_cli.py`/`test_tui.py` 的 CliRunner 用例会加载真实的
+`~/.aegis/.env`，把 `TAVILY_API_KEY` 泄漏进 pytest 进程，导致字母序在后的
+`test_web_extract_blocks_private_url` 走真实 Tavily 网络路径而失败（上个阶段的日志已记录该失败为
+「基线已存在」）。修复分两层：给两个文件加 `_isolated_home` autouse fixture（HOME 指向 tmp，挡住
+dotenv 泄漏）；并给该 web 测试本身显式 `delenv("TAVILY_API_KEY"/"EXA_API_KEY")`——它测的是本地
+SSRF 门，前置条件本就应该是「未配置付费 key」。
+
+结果：`uv run pytest tests/test_slash_commands.py -q` → **36 passed**；全量 `uv run pytest -q` →
+**525 passed, 2 skipped**（修复后全绿；基线为 524 passed + 1 failed）。
+`uv run ruff check src tests` → 仅剩 2 个存量告警（`cli.py` DTZ005、`mcp/client.py` SIM115，
+均为 master 既有，本次未触碰）；本次新代码零告警。`uv run mypy src` → 10 errors in 6 files，
+与改动前基线数量一致（无新增）。
+
+### 结论 / 局限
+
+Hermes 交互式斜杠命令的 CLI 子集已可用：`/save` 按用户决策实现为 Hermes `/chatlog` 的三件套调试
+导出（`/chatlog` 保留为别名；Hermes 原版 `/save` 的 JSON 快照导出未采用），/history、/new、
+/title、/undo、/retry 等行为逐条对齐，且分发层完全可单测。局限与 TODO：未做 `/` 命令的
+prompt_toolkit 自动补全（Hermes 有 SlashCommandCompleter）；`/undo` 的预填在非 TTY 下退化为无预填；
+`/compress`（手动压缩）、`/branch`（会话分叉）、`/usage`（token 统计）依赖尚未存在的子系统，
+留待后续阶段；Hermes 的 `/undo` 还会通知 memory provider 并做 agent 内部状态手术，Aegis 的
+memory manager 无对应钩子，暂未联动。
+
+### 后续修复：空会话不可 resume
+
+实测发现：启动后未发消息直接退出时，退出提示 `Resume: aegis --resume <id>` 实际会报
+"session not found"——会话行是懒创建的（首条消息的 `run_turn` 才落库），0 条消息时 DB 里根本没有
+该会话。修复：持久存储下启动即 `create_session`（幂等，INSERT OR IGNORE；resume 路径不受影响），
+空会话也能 resume。回归测试 `test_cli_empty_session_is_resumable` 覆盖。
+

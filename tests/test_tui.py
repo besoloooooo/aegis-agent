@@ -13,6 +13,7 @@ Two concerns:
 
 from __future__ import annotations
 
+import pytest
 from typer.testing import CliRunner
 
 from aegis_agent.cli import app
@@ -22,6 +23,18 @@ from aegis_agent.runtime import AgentRuntime, StopReason, TurnEvent, TurnEventKi
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Keep the real ~/.aegis/.env (API keys) out of CliRunner runs.
+
+    The CLI loads the user-level dotenv at startup; without this isolation a
+    developer machine's keys (e.g. TAVILY_API_KEY) leak into ``os.environ``
+    for the whole pytest process and flip later tests (web backends) onto
+    live-network code paths.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 class _ChunkedToolThenAnswer:

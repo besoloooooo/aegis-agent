@@ -14,3 +14,6 @@ wheels/
 
 # Windows NTFS alternate-data-stream artifacts that materialise as files in WSL
 *:Zone.Identifier
+
+# /chatlog debug dumps (generated)
+aegis-chat-logs/

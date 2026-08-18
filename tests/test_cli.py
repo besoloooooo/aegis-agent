@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import pytest
 from typer.testing import CliRunner
 
 from aegis_agent.cli import app
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Keep the real ~/.aegis/.env (and its API keys) out of CLI tests.
+
+    The CLI loads the user-level dotenv at startup; without this isolation a
+    developer machine's keys (e.g. TAVILY_API_KEY) leak into ``os.environ``
+    for the whole pytest process and flip later tests (web backends) onto
+    live-network code paths.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 def test_cli_version():
@@ -62,6 +75,25 @@ def test_cli_resume_unknown_session_fails(tmp_path, monkeypatch):
     result = runner.invoke(app, ["--model-backend", "fake", "--resume", "nope"], input="")
     assert result.exit_code == 1
     assert "session not found" in result.output
+
+
+def test_cli_empty_session_is_resumable(tmp_path, monkeypatch):
+    """Exiting without sending a message still persists the session row, so the
+    printed "Resume: aegis --resume <id>" hint actually works (regression: the
+    row used to be created lazily on the first turn, and --resume failed with
+    "session not found" for empty sessions)."""
+    monkeypatch.setenv("AEGIS_DB_PATH", str(tmp_path / "state.db"))
+    first = runner.invoke(
+        app, ["--model-backend", "fake", "--session", "empty-one"], input="exit\n"
+    )
+    assert first.exit_code == 0
+    assert "Resume: aegis --resume empty-one" in first.output
+
+    resumed = runner.invoke(
+        app, ["--model-backend", "fake", "--resume", "empty-one"], input="exit\n"
+    )
+    assert resumed.exit_code == 0
+    assert "Resumed session empty-one (0 messages)." in resumed.output
 
 
 def test_cli_ephemeral_skips_lease(tmp_path, monkeypatch) -> None:

@@ -556,6 +556,47 @@ class SQLiteSessionRepository:
             return None
         return Session(id=row["id"], title=row["title"], created_at=row["created_at"])
 
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """更新会话标题（``/title`` 命令）。会话不存在返回 False。"""
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def rewind_from_seq(self, session_id: str, seq: int) -> int:
+        """软删除 ``seq`` 及之后的所有 active 消息（``/undo`` / ``/retry``）。
+
+        行以 ``active = 0`` 保留在库里用于审计——恢复、检索、计数全部只取
+        ``active = 1``，所以截断后的历史对所有读取路径不可见，但原始消息
+        从未被物理删除。同事务重算 ``sessions.message_count`` 并递增
+        ``history_version``，使改写前生成的恢复快照自动失效（快照校验按
+        版本号判断，见 ``load_latest_snapshot``）。返回软删除的行数。
+        """
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET active = 0 "
+                "WHERE session_id = ? AND seq >= ? AND active = 1",
+                (session_id, seq),
+            )
+            rewound = cursor.rowcount
+            conn.execute(
+                "UPDATE sessions SET "
+                "message_count = (SELECT COUNT(*) FROM messages "
+                "                 WHERE session_id = ? AND active = 1), "
+                "history_version = history_version + 1 "
+                "WHERE id = ?",
+                (session_id, session_id),
+            )
+            return rewound
+
+        return self._execute_write(_do)
+
     def append_message(self, session_id: str, message: Message) -> Message:
         """幂等追加一条消息。
 

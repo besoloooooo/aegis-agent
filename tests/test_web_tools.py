@@ -108,9 +108,13 @@ def test_web_extract_requires_urls(tmp_path):
     assert WebExtractTool().run({"urls": "https://x.com"}, _ctx(tmp_path)).is_error
 
 
-def test_web_extract_blocks_private_url(tmp_path):
+def test_web_extract_blocks_private_url(tmp_path, monkeypatch):
     # Use the REAL backend so the SSRF gate runs; a private URL is blocked
-    # before any network access.
+    # before any network access.  Paid-backend keys must be absent: with
+    # TAVILY_API_KEY/EXA_API_KEY set the extract goes to the remote API
+    # instead of the local fetch path this test exercises.
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
     result = WebExtractTool().run({"urls": ["http://169.254.169.254/latest/meta-data"]}, _ctx(tmp_path))
     payload = json.loads(result.content)
     assert payload["count"] == 0

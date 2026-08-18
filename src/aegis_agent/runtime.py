@@ -441,6 +441,16 @@ class AgentRuntime:
     def max_iterations(self) -> int:
         return self._max_iterations
 
+    @property
+    def provider_name(self) -> str:
+        """Identifier of the active model provider (for status/exports)."""
+        return self._provider.name
+
+    @property
+    def system_prompt(self) -> str:
+        """The system prompt as it renders right now (for ``/chatlog`` dumps)."""
+        return self._context.system_prompt
+
     def shutdown(self) -> None:
         """Wait for any in-flight background memory work to finish.
 
