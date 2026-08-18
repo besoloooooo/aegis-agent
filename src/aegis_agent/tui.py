@@ -91,8 +91,8 @@ def _build_logo() -> str:
 _SHIELD_LOGO = _build_logo()
 
 
-def _startup_panel(info: dict[str, int]) -> Panel:
-    """Build a single panel showing skills, MCP, and builtin tools counts."""
+def _startup_panel(info: dict[str, int | str]) -> Panel:
+    """Build a single panel showing skills, MCP, builtin tools, and memory scope."""
     parts: list[str] = []
 
     # Skills
@@ -110,8 +110,16 @@ def _startup_panel(info: dict[str, int]) -> Panel:
     # Builtin
     parts.append(f"Builtin tools: {info.get('builtin_tools', 0)}")
 
-    # Memory (present = USER.md or MEMORY.md was loaded)
-    parts.append("Memory: on" if info.get("memory") else "Memory: none")
+    # Memory (present = USER.md or MEMORY.md was loaded; scope = personal/project)
+    if info.get("memory"):
+        scope = info.get("memory_scope", "personal")
+        if scope == "project":
+            label = f"Memory: on (project {info.get('project_id', '')})".rstrip()
+        else:
+            label = "Memory: on (personal)"
+    else:
+        label = "Memory: none"
+    parts.append(label)
 
     body = " · ".join(parts)
     return Panel(
@@ -121,7 +129,7 @@ def _startup_panel(info: dict[str, int]) -> Panel:
     )
 
 
-def _banner_renderable(label: str, session_id: str, startup_info: dict[str, int] | None = None) -> Any:
+def _banner_renderable(label: str, session_id: str, startup_info: dict[str, int | str] | None = None) -> Any:
     logo = Text(_SHIELD_LOGO, style="aegis.blue")
     title = Text.assemble(("Aegis Agent  ", "aegis.blue"), (f"v{__version__}", "aegis.dim"))
     sub = Text(f"{label} · session '{session_id}'", style="aegis.dim")
@@ -177,7 +185,7 @@ class Tui:
 
     # -- lifecycle --------------------------------------------------------
 
-    def banner(self, label: str, session_id: str, startup_info: dict[str, int] | None = None) -> None:
+    def banner(self, label: str, session_id: str, startup_info: dict[str, int | str] | None = None) -> None:
         self._console.print(_banner_renderable(label=label, session_id=session_id, startup_info=startup_info))
 
     def prompt(self, default: str = "") -> str | None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import threading
 from pathlib import Path
 
@@ -119,6 +120,12 @@ def _main(
         False,
         "--memory-extract",
         help="Enable background memory extraction after each final reply (writes to ~/.aegis/memory).",
+    ),
+    project: str | None = typer.Option(
+        None,
+        "--project",
+        help="Use project-scoped memory for the given project root (a bare '--project' uses the "
+        "current directory). Absent → personal memory scope.",
     ),
     context_max_tokens: int | None = typer.Option(
         None,
@@ -251,6 +258,7 @@ def _main(
             enable_memory_recall=memory_recall and not no_memory,
             enable_memory_extract=memory_extract and not no_memory,
             memory_side_provider=inner_provider,
+            memory_project=project,
             context_token_budget=context_budget,
             summary_provider=summary_provider,
         )
@@ -589,8 +597,32 @@ def _maybe_route_skill(runtime: AgentRuntime, line: str, tui: Tui) -> str:
     return router.invocation_message(skill, instruction)
 
 
+def _normalize_project_flag(argv: list[str] | None = None) -> list[str]:
+    """Rewrite a bare ``--project`` (no value) into ``--project <cwd>``.
+
+    Typer/Click cannot express an option with an *optional* value (its
+    ``flag_value`` path is dropped by Typer), so ``--project`` is a normal
+    required-value option.  To keep the ergonomic "``--project`` with no value
+    means the current directory" behaviour, a leading bare ``--project`` is
+    expanded here before the Typer app parses ``argv``.  ``--project PATH`` and
+    an absent ``--project`` are left untouched.  Returns the (possibly
+    unchanged) argument list; ``main`` assigns the result back to ``sys.argv``.
+    """
+    args = list(sys.argv if argv is None else argv)
+    for i, token in enumerate(args):
+        if token != "--project":
+            continue
+        next_is_value = i + 1 < len(args) and not args[i + 1].startswith("-")
+        if next_is_value:
+            continue
+        args.insert(i + 1, os.getcwd())
+        return args
+    return args
+
+
 def main() -> None:
     """Console-script entry point."""
+    sys.argv = _normalize_project_flag()
     app()
 
 

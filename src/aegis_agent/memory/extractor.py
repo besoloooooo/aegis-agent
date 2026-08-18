@@ -75,7 +75,31 @@ _EXTRACT_SYSTEM = (
     "Return only the JSON object."
 )
 
-_ALLOWED_TYPES = {MemoryType.USER, MemoryType.FEEDBACK, MemoryType.REFERENCE}
+_EXTRACT_SYSTEM_PROJECT = (
+    "You maintain the long-term memory for the CURRENT PROJECT across sessions. "
+    "You are given the recent conversation and a manifest of existing project "
+    "memories. Decide whether anything in the NEW conversation is worth storing "
+    "long-term for this project.\n\n"
+    "STORE only durable, project-scoped facts: the project's long-term goals and "
+    "architecture decisions (`project`), rules and approaches the user confirmed "
+    "for this project (`feedback`), or reusable external pointers relevant to "
+    "this project (`reference`). For `feedback` and `project` facts, include a "
+    "**Why:** and a **How to apply:** line. Do NOT store ordinary `user` info — "
+    "the global USER.md profile already owns who the user is.\n\n"
+    "DO NOT store: temporary debugging, one-off errors, git history, or anything "
+    "easily re-derived from the code or repository. Prefer UPDATING an existing "
+    "memory (by its exact filename from the manifest) over creating a "
+    "near-duplicate. If nothing qualifies, return an empty actions list.\n\n"
+    "Return STRICT JSON only:\n"
+    '{"actions": [{"action": "create|update|noop", "filename": "kebab-name.md", '
+    '"type": "project|feedback|reference", "name": "Short title", "description": '
+    '"one-line summary", "content": "the memory body"}]}\n'
+    "Filenames must be bare kebab-case *.md names (no paths, no MEMORY.md). "
+    "Return only the JSON object."
+)
+
+_ALLOWED_TYPES_PERSONAL = {MemoryType.USER, MemoryType.FEEDBACK, MemoryType.REFERENCE}
+_ALLOWED_TYPES_PROJECT = {MemoryType.PROJECT, MemoryType.FEEDBACK, MemoryType.REFERENCE}
 
 
 @dataclass(frozen=True)
@@ -138,8 +162,14 @@ def _render_conversation(messages: Sequence[Message]) -> str:
     return "\n".join(lines)
 
 
-def _coerce_action(raw: object) -> MemoryAction | None:
-    """Validate one raw action dict into a :class:`MemoryAction`, or ``None``."""
+def _coerce_action(raw: object, allowed_types: set[MemoryType]) -> MemoryAction | None:
+    """Validate one raw action dict into a :class:`MemoryAction`, or ``None``.
+
+    ``allowed_types`` scopes which memory kinds may be written: the personal
+    scope accepts ``user``/``feedback``/``reference`` (rejecting ``project``),
+    while the project scope accepts ``project``/``feedback``/``reference``
+    (rejecting ``user`` — the global ``USER.md`` owns that).
+    """
     if not isinstance(raw, dict):
         return None
     action = str(raw.get("action", "")).strip().lower()
@@ -152,8 +182,7 @@ def _coerce_action(raw: object) -> MemoryAction | None:
     if not is_valid_memory_filename(filename):
         return None
     memory_type = MemoryType.parse(raw.get("type"))
-    if memory_type not in _ALLOWED_TYPES:
-        # Personal scope: reject project (and unknown) types this milestone.
+    if memory_type not in allowed_types:
         return None
     name = str(raw.get("name", "")).strip()
     description = str(raw.get("description", "")).strip()
@@ -170,17 +199,28 @@ def _coerce_action(raw: object) -> MemoryAction | None:
     )
 
 
+def _scope_config(project: bool) -> tuple[str, set[MemoryType]]:
+    """Return ``(system_prompt, allowed_types)`` for the given scope."""
+    if project:
+        return _EXTRACT_SYSTEM_PROJECT, _ALLOWED_TYPES_PROJECT
+    return _EXTRACT_SYSTEM, _ALLOWED_TYPES_PERSONAL
+
+
 def extract_memories(
     provider: ModelProvider,
     messages: Sequence[Message],
     cursor: str | None,
     home: str | None = None,
+    *,
+    project: bool = False,
 ) -> ExtractionResult:
     """Propose memory actions from the messages after ``cursor``; never raises.
 
-    Runs the side query and validates every returned action; does NOT write
-    anything (that is :func:`apply_actions`).  Returns an
-    :class:`ExtractionResult` with the (possibly empty) validated action list.
+    ``project=True`` selects the project-scoped prompt + allowed-type set (and is
+    expected to be combined with a project ``home``).  Runs the side query and
+    validates every returned action; does NOT write anything (that is
+    :func:`apply_actions`).  Returns an :class:`ExtractionResult` with the
+    (possibly empty) validated action list.
     """
     review = messages_since_cursor(messages, cursor)
     substantive = [m for m in review if m.role in (Role.USER, Role.ASSISTANT, Role.TOOL)]
@@ -191,12 +231,13 @@ def extract_memories(
     if not transcript.strip():
         return ExtractionResult(reviewed_messages=len(substantive))
 
+    system_prompt, allowed_types = _scope_config(project)
     manifest = format_manifest(scan_memory_files(home)) or "(no existing memories)"
     user_prompt = (
         f"Recent conversation:\n{transcript}\n\n"
         f"Existing memories:\n{manifest}"
     )
-    parsed = run_side_query(provider, _EXTRACT_SYSTEM, user_prompt)
+    parsed = run_side_query(provider, system_prompt, user_prompt)
     if parsed is None:
         return ExtractionResult(
             reviewed_messages=len(substantive), failure_reason="side_query_failed"
@@ -206,7 +247,7 @@ def extract_memories(
     actions: list[MemoryAction] = []
     if isinstance(raw_actions, list):
         for raw in raw_actions:
-            act = _coerce_action(raw)
+            act = _coerce_action(raw, allowed_types)
             if act is not None and act.action != "noop":
                 actions.append(act)
     return ExtractionResult(actions=actions, reviewed_messages=len(substantive))

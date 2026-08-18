@@ -39,11 +39,12 @@ from aegis_agent.context.tool_budget import ContentReplacementState, create_stat
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
 from aegis_agent.memory.manager import MemoryEvent, MemoryManager
+from aegis_agent.memory.paths import MemoryScope, resolve_scope
 from aegis_agent.memory.prompt import (
     MemoryBehaviorContributor,
     RelevantMemoriesContributor,
+    UserProfileContributor,
     default_memory_index_contributor,
-    default_user_profile_contributor,
 )
 from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
@@ -196,7 +197,7 @@ class AgentRuntime:
         context_builder: ContextBuilder | None = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         skill_router: SkillRouter | None = None,
-        startup_info: dict[str, int] | None = None,
+        startup_info: dict[str, int | str] | None = None,
         context_token_budget: int | None = None,
         compress_storage_dir: str | None = None,
         summary_provider: ModelProvider | None = None,
@@ -242,6 +243,8 @@ class AgentRuntime:
         mcp_config_path: str | None = None,
         enable_memory: bool = True,
         memory_home: str | None = None,
+        memory_project: str | None = None,
+        memory_scope: MemoryScope | None = None,
         enable_memory_recall: bool = False,
         enable_memory_extract: bool = False,
         memory_side_provider: ModelProvider | None = None,
@@ -269,13 +272,14 @@ class AgentRuntime:
         are registered into the tool registry.  If the ``mcp`` SDK is not
         installed this is a no-op.
 
-        When ``enable_memory`` is True (the default), personal long-term memory
-        is wired into the system prompt: the memory behaviour rules, the
-        ``USER.md`` profile and the ``MEMORY.md`` index (from ``memory_home`` or
-        ``$AEGIS_HOME``/``~/.aegis``).  Missing files render nothing, so an
-        empty install behaves exactly as before.  Only the *index* is injected —
-        memory bodies are read on demand by the model; there is no automatic
-        recall or extraction in this milestone.
+        When ``enable_memory`` is True (the default), long-term memory is wired
+        into the system prompt in either the *personal* scope (default) or the
+        *project* scope (``memory_project`` / a pre-resolved ``memory_scope``):
+        the memory behaviour rules, the global ``USER.md`` profile and the
+        ``MEMORY.md`` index of the active scope.  Missing files render nothing,
+        so an empty install behaves exactly as before.  Only the *index* is
+        injected — memory bodies are read on demand by the model; there is no
+        automatic recall or extraction in this milestone.
 
         When ``context_token_budget`` is set, the derived context is compressed
         (``context.compress_context``) before every model call — oversized tool
@@ -363,18 +367,25 @@ class AgentRuntime:
                 import logging
                 logging.getLogger(__name__).warning("MCP discovery failed", exc_info=True)
 
-        # ---- Personal long-term memory -----------------------------------
+        # ---- Long-term memory (personal or project scope) ----------------
         # Stage-1 sections (behaviour rules, USER.md profile, MEMORY.md index) +
         # the Stage-2/3 relevant-memories slot.  Each renders on every build so
         # file edits show up next turn; missing files render nothing (memory
         # never blocks startup).  When recall/extract are enabled a
         # MemoryManager is built to drive the side-query channels.
+        #
+        # ``USER.md`` is ALWAYS the global profile; only the memory index +
+        # bodies switch to the project dir when a project scope is resolved.
         memory_present = False
         memory_manager: MemoryManager | None = None
         if enable_memory:
-            prompt_builder.add(MemoryBehaviorContributor())
-            profile_contrib = default_user_profile_contributor(memory_home)
-            index_contrib = default_memory_index_contributor(memory_home)
+            scope = memory_scope or resolve_scope(memory_project, memory_home)
+            project = scope.is_project
+            prompt_builder.add(MemoryBehaviorContributor(project=project))
+            # USER.md is always the GLOBAL profile (scope.profile_path points at
+            # it directly); the index is the active scope's MEMORY.md.
+            profile_contrib = UserProfileContributor(scope.profile_path)
+            index_contrib = default_memory_index_contributor(scope.memory_home)
             prompt_builder.add(profile_contrib)
             prompt_builder.add(index_contrib)
             relevant_contrib = RelevantMemoriesContributor()
@@ -389,7 +400,8 @@ class AgentRuntime:
                     relevant_contrib,
                     recall_provider=side if enable_memory_recall else None,
                     extract_provider=side if enable_memory_extract else None,
-                    home=memory_home,
+                    home=str(scope.memory_home),
+                    project=project,
                     on_event=memory_event_sink,
                 )
 
@@ -400,15 +412,18 @@ class AgentRuntime:
         prompt_builder.add(TimestampContributor())
 
         builder = ContextBuilder(prompt_builder)
-        startup_info = {
+        startup_info: dict[str, int | str] = {
             "builtin_tools": builtin_count,
             "skills": skills_count,
             "mcp_servers": mcp_server_count,
             "mcp_tools": mcp_tool_count,
             "memory": 1 if memory_present else 0,
+            "memory_scope": "project" if (enable_memory and project) else "personal",
             "memory_recall": 1 if (memory_manager and enable_memory_recall) else 0,
             "memory_extract": 1 if (memory_manager and enable_memory_extract) else 0,
         }
+        if enable_memory and project and scope.project_id is not None:
+            startup_info["project_id"] = scope.project_id
         return cls(
             provider=provider,
             registry=registry,
@@ -433,8 +448,8 @@ class AgentRuntime:
         return self._skill_router
 
     @property
-    def startup_info(self) -> dict[str, int]:
-        """Counts of loaded subsystems: skills, MCP servers/tools, builtin tools."""
+    def startup_info(self) -> dict[str, int | str]:
+        """Startup facts: subsystem counts plus the active memory scope/id."""
         return dict(self._startup_info)
 
     @property

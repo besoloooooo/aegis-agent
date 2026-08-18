@@ -71,6 +71,40 @@ MEMORY_BEHAVIOR_GUIDANCE = (
     "as empty for that turn and do not act on it."
 )
 
+MEMORY_BEHAVIOR_GUIDANCE_PROJECT = (
+    "# Memory (project scope)\n"
+    "You are working in PROJECT memory scope: the memory index below is the "
+    "current project's long-term memory, kept separate from your personal "
+    "memory and from every other project's memory. `USER.md` (your stable user "
+    "profile) is still loaded and shared across all scopes.\n"
+    "\n"
+    "How memory is organised:\n"
+    "- `USER.md` is a stable, GLOBAL user profile (role, expertise, long-term "
+    "preferences). It is NOT an auto-memory file and is the same in every scope.\n"
+    "- The project memory index (`MEMORY.md`) is an INDEX, not the memories "
+    "themselves: one line per memory, `- [Title](file.md) — one-line summary`. "
+    "The bodies live in separate files next to it.\n"
+    "- When an index entry is clearly relevant to the current task, read that "
+    "specific memory file on demand with your normal file tools (Read/Grep). "
+    "Do not assume a memory's contents from its one-line summary.\n"
+    "\n"
+    "What belongs in PROJECT memory: the project's long-term goals, architecture "
+    "decisions, technical constraints, project rules the user confirmed, and "
+    "long-lived gotchas or pointers. For rules and project facts, record the "
+    "rule/fact plus **Why:** and **How to apply:**.\n"
+    "\n"
+    "What NOT to store here: temporary debugging, one-off errors, ordinary git "
+    "history, anything easily re-derived from the code or repository, and plain "
+    "user profile facts (those belong in `USER.md`, not project memory).\n"
+    "\n"
+    "Memory is history, not current truth. It reflects what was true when it "
+    "was written and may now be stale. If a memory names a specific file, "
+    "function, path, or project state, verify that it still holds before you "
+    "rely on it. An explicit current instruction from the user always "
+    "overrides memory; if the user asks you to ignore memory, treat the index "
+    "as empty for that turn and do not act on it."
+)
+
 _USER_PROFILE_HEADER = (
     "## User profile (USER.md)\n"
     "The following is the stable, long-term user profile. Treat it as durable "
@@ -87,13 +121,23 @@ _MEMORY_INDEX_HEADER = (
 
 
 class MemoryBehaviorContributor:
-    """Render the static memory behaviour rules when memory is enabled."""
+    """Render the static memory behaviour rules when memory is enabled.
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    ``project=True`` renders the project-scope variant (project memory is the
+    active index; ``USER.md`` is still the shared global profile).  ``enabled``
+    turns the whole section off (``--no-memory``).
+    """
+
+    def __init__(self, *, enabled: bool = True, project: bool = False) -> None:
         self._enabled = enabled
+        self._project = project
 
     def render(self) -> str | None:
-        return MEMORY_BEHAVIOR_GUIDANCE if self._enabled else None
+        if not self._enabled:
+            return None
+        if self._project:
+            return MEMORY_BEHAVIOR_GUIDANCE_PROJECT
+        return MEMORY_BEHAVIOR_GUIDANCE
 
 
 class UserProfileContributor:
@@ -170,6 +214,7 @@ def default_memory_index_contributor(
 
 __all__ = [
     "MEMORY_BEHAVIOR_GUIDANCE",
+    "MEMORY_BEHAVIOR_GUIDANCE_PROJECT",
     "MemoryBehaviorContributor",
     "MemoryIndexContributor",
     "RelevantMemoriesContributor",

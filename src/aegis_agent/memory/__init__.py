@@ -1,7 +1,9 @@
-"""Personal long-term memory.
+"""Long-term memory (personal + project scopes).
 
 A file-system + prompt-driven cross-session memory, modelled on Claude Code's
-Auto Memory (see ``Claude-Code/docs/08-memory.md``), personal scope only.
+Auto Memory (see ``Claude-Code/docs/08-memory.md``), in two scopes:
+*personal* (``~/.aegis/memory``) and *project* (``~/.aegis/projects/<id>/memory``),
+both sharing the single global ``USER.md`` profile.
 
 Stage 1 (storage + injection + behaviour):
 
@@ -24,8 +26,8 @@ Stage 2/3 (recall + extraction):
 6. **Orchestration** — :class:`aegis_agent.memory.manager.MemoryManager` wires
    recall (pre-turn) and extraction (post-turn) around a runtime turn.
 
-Deliberately **out of scope**: embeddings / vector DB, project & team memory,
-autoDream, and a full memory-eval platform.
+Deliberately **out of scope**: embeddings / vector DB, personal+project merged
+recall, team memory, autoDream, and a full memory-eval platform.
 """
 
 from __future__ import annotations
@@ -41,13 +43,20 @@ from aegis_agent.memory.manager import MemoryEvent, MemoryManager
 from aegis_agent.memory.paths import (
     AEGIS_HOME_ENV_VAR,
     AEGIS_MEMORY_DIR_ENV_VAR,
+    MemoryScope,
+    MemoryScopeKind,
     aegis_home,
     memory_dir,
     memory_index_path,
+    project_home,
+    project_id,
+    projects_dir,
+    resolve_scope,
     user_profile_path,
 )
 from aegis_agent.memory.prompt import (
     MEMORY_BEHAVIOR_GUIDANCE,
+    MEMORY_BEHAVIOR_GUIDANCE_PROJECT,
     MemoryBehaviorContributor,
     MemoryIndexContributor,
     RelevantMemoriesContributor,
@@ -89,6 +98,7 @@ __all__ = [
     "MAX_ENTRYPOINT_LINES",
     "MAX_SCAN_FILES",
     "MEMORY_BEHAVIOR_GUIDANCE",
+    "MEMORY_BEHAVIOR_GUIDANCE_PROJECT",
     "ExtractionResult",
     "MemoryAction",
     "MemoryBehaviorContributor",
@@ -97,6 +107,8 @@ __all__ = [
     "MemoryEvent",
     "MemoryIndexContributor",
     "MemoryManager",
+    "MemoryScope",
+    "MemoryScopeKind",
     "MemoryType",
     "RecallResult",
     "RecalledMemory",
@@ -115,10 +127,14 @@ __all__ = [
     "memory_index_path",
     "messages_since_cursor",
     "parse_memory_file",
+    "project_home",
+    "project_id",
+    "projects_dir",
     "rebuild_index",
     "recall_memories",
     "render_memory_file",
     "render_recall_block",
+    "resolve_scope",
     "scan_memory_files",
     "truncate_entrypoint_content",
     "user_profile_path",

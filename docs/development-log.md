@@ -2377,3 +2377,108 @@ memory manager 无对应钩子，暂未联动。
 该会话。修复：持久存储下启动即 `create_session`（幂等，INSERT OR IGNORE；resume 路径不受影响），
 空会话也能 resume。回归测试 `test_cli_empty_session_is_resumable` 覆盖。
 
+---
+
+## Milestone 9 — 项目级长期记忆（Project Memory scope）
+
+### Task goal and the original problem
+
+在已完成的**个人级** Memory 之上，增加第二个 **project（项目）作用域**。目标是让与某个项目
+强相关的长期事实（长期目标、架构决策、技术约束、用户确认过的项目规则、长期有效的坑/参考）
+与个人 Memory 分离、且不同项目之间完全隔离。`USER.md` 保持为**全局**用户画像，两种模式都读。
+
+**硬约束**：不重写现有的 scan / retriever / extractor / store / manager / sidequery，只做
+"按当前 scope 取不同的 `MEMORY.md` + `memory/`"，然后继续复用 Recall / Extract /
+`already_surfaced` / cursor / 异步预取 / 串行提取队列 / 路径安全 / 原子写。
+
+### 参考行为与来源（Claude Code，不是 Hermes）
+
+- `src/memdir/paths.ts:findCanonicalGitRoot` + `getAutoMemPath` —— 项目记忆目录
+  `~/.claude/projects/<净化后的 git 根路径>/memory/`，同仓库所有 worktree 共享一个目录；
+- `docs/08-memory.md` —— "每个项目一个记忆目录"、四类型、`MEMORY.md` 索引/正文分离；
+- `src/services/extractMemories/prompts.ts` —— 提取 agent 的按目录/按作用域文案变体。
+
+### Migration decision
+
+- **paths**（`project_id`/`project_home`/`MemoryScope`）：ADAPT —— 复刻 git-root 规范化 + 项目
+  目录布局，但用纯文件系统（不调用 `git` 子进程），`<basename>-<sha256[:8]>` 稳定 slug。
+- **extractor / prompt / manager / runtime / cli / tui**：ADAPT/original —— 加 project 变体，
+  但不复制第二套 pipeline（现有函数已统一接受 `home` 参数）。
+
+### Aegis 设计、数据流与关键接口
+
+```
+USER.md                  全局共享（两个 scope 都读）
+
+scope = personal →  personal memory only   (<home>/memory)
+scope = project  →  current project memory only
+                   (<home>/projects/<project-id>/memory)
+```
+
+关键点：现有 pipeline 的每个环节（`scan_memory_files(home)` / `recall_memories(..., home)` /
+`extract_memories(..., home)` / `write_memory_file` / `rebuild_index`）**早就把 `home` 当参数
+透传**并派生 `<home>/memory`。所以 project scope 的实现本质是"把同一个 pipeline 的 `home`
+指向 `project_home`"，唯一的真正分支是：
+
+1. `USER.md` 永远解析到全局 home（`MemoryScope.profile_path` 直接指向全局 `USER.md` 路径，
+   项目目录下**不创建** USER.md）；
+2. 提取器按 scope 用不同提示词 + 允许类型集。
+
+- `memory/paths.py`：新增 `project_id()`（git-root 感知：向上找最近 `.git` 目录或 worktree
+  gitfile，回退 resolved path；`<basename>-<sha256[:8]>`，确定性无时间/随机）、
+  `project_home()`（`<global-home>/projects/<id>`）、`projects_dir()`、`MemoryScope`
+  （`kind`/`memory_home`/`profile_path`/`project_id`）与 `resolve_scope()`。
+- `memory/extractor.py`：新增 `_EXTRACT_SYSTEM_PROJECT` + `_ALLOWED_TYPES_PROJECT`
+  （`project`/`feedback`/`reference`，**拒绝 `user`**）；`extract_memories(project=...)` 与
+  `_coerce_action(raw, allowed_types)` 用 scope 选择提示词/类型集。默认 personal，老调用不变。
+- `memory/prompt.py`：新增 `MEMORY_BEHAVIOR_GUIDANCE_PROJECT`，`MemoryBehaviorContributor(project=)`。
+- `memory/manager.py`：`MemoryManager(project=...)` → `_run_extraction` 传 `extract_memories(project=...)`；
+  召回不需要改（给定正确 `home` 即 scope 无关）；`_main_agent_wrote_memory` 互斥已用
+  `memory_dir(self._home)`，项目目录自动命中。
+- `runtime.py`：`with_defaults(memory_project=..., memory_scope=...)` 解析 `MemoryScope`；
+  profile contributor 指向全局 `USER.md` 路径，index contributor 指向 scope memory home；
+  `startup_info` 增加 `memory_scope` / `project_id`。
+- `cli.py`：新增 `--project [PATH]`；裸 `--project` 在 `main()` 里被 `_normalize_project_flag`
+  重写为 `--project <cwd>`（Typer 0.27 无法表达 optional-value option）；缺省 → personal。
+- `tui.py`：启动面板显示 `Memory: on (personal)` / `Memory: on (project <id>)`。
+
+### Reliability invariants / edge cases / failure handling
+
+- **作用域隔离严格**：project 模式下不读/不召回/不写 personal `MEMORY.md` 与 `memory/*.md`，
+  反之亦然（有测试专门守住 `prefer-search.md` vs `architecture.md` / `dataset-rules.md` 三条线）；
+- `project_id` 稳定：同一仓库（含子目录 / worktree）→ 同一 id；不同路径 → 不同 id；
+- `project` 模式提取器拒绝 `user` 类型（`USER.md` 已负责画像），拒绝不安全文件名（复用现有校验）；
+- 缺省仍 personal；两种模式都读同一个全局 `USER.md`；
+- 现有 personal / session / resume / `session_search` 不变（回归测试通过）。
+
+### Tests、结果
+
+新增 `tests/test_memory_project.py`（15 项）：默认 personal、双 scope 共享全局 USER.md、
+project 不读 personal 索引/召回、project 召回只搜本目录、project 提取只写本目录、拒绝 `user`
+类型、跨项目隔离、稳定 project-id（子目录/git-root）、personal 无回归。
+
+- `uv run pytest -q tests/test_memory_project.py` → **15 passed**；
+- 回归 `test_memory*` / `test_runtime*` / `test_cli` / `test_session_search` 等全量 → 通过（见完成报告）；
+- `uv run ruff check`（改动文件）通过（仅剩既有 `cli.py:DTZ005` 历史告警，非本次引入）；
+- `uv run mypy src` 改动模块（`memory/*`、runtime）**无新增错误**（剩余 10 处均为既有历史告警）。
+
+### Trade-offs、限制与 TODO
+
+- 本阶段**只做 Project Memory**，不做 Personal + Project 混合召回、Team Memory、embedding / 向量库；
+- `project_id` 用纯文件系统 + 哈希，未移植 Claude 的 settings 覆盖链与 `~/.ssh` 安全护栏
+  （Aegis 仍无"不可信项目级 settings"来源）；
+- `--project` 的可选值通过 `main()` 里对 `sys.argv` 的轻量归一化实现（Typer 0.27 限制），
+  集中在入口一处，无侵入 Typer 内部。
+
+### Interview summary
+
+"这一步在现成个人级 Memory 之上加了项目作用域，但**一行 pipeline 都没重写**。我观察到 scan /
+retriever / extractor / store / manager 全都已经接受 `home` 参数并派生 `<home>/memory`，所以
+project scope 就是把这个 `home` 指到 `<~/.aegis>/projects/<git-root-hash>` 而已。真正要写的新代码
+只有两块：一是 `project_id` 的 git-root 规范化（复刻 Claude 的 `findCanonicalGitRoot`，纯文件系统
++ 短哈希，保证同仓库子目录/worktree 落到同一个 id）；二是提取器按 scope 换提示词和允许类型集
+（project 模式允许 project/feedback/reference、拒绝 user，因为 `USER.md` 全局画像已经管用户是谁）。
+`USER.md` 刻意保持全局、项目目录下不创建它。CLI 加 `--project [PATH]`（裸 `--project` 走 cwd），
+TUI 显示当前 scope。隔离性用三条独立记忆（personal `prefer-search`、project A `architecture`、
+project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
+

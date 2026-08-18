@@ -300,3 +300,25 @@ Typer/Rich/a TTY, and the runtime never imports it.
 | `tests/test_slash_commands.py` | **original** | — | 36 tests: registry/alias resolution, help completeness, title sanitisation, save/chatlog payloads + prefix increment + pre-first-turn fallback, history rendering + tool collapse, session rotation (success/failure/unavailable), retry requeue, undo N/prefill/edge counts, SQLite rewind invariants (soft-delete audit rows, `message_count` recompute, `history_version` bump → snapshot invalidation, idempotency, cross-session isolation), CliRunner end-to-end. |
 | `tests/test_cli.py`, `tests/test_tui.py` (`_isolated_home` autouse fixture) | **original** | — | Test-isolation fix (pre-existing leak): CliRunner runs load `~/.aegis/.env`, leaking real API keys (TAVILY_API_KEY) into the pytest process and flipping `test_web_extract_blocks_private_url` onto the live-Tavily path. HOME is now redirected to tmp. |
 | `tests/test_web_tools.py` (`test_web_extract_blocks_private_url` delenv) | **original** | — | Test-hygiene fix (pre-existing flakiness): the SSRF-gate test exercises the local fetch path, so it now explicitly clears `TAVILY_API_KEY`/`EXA_API_KEY` — with a paid key present the extract goes to the remote API and the assertion never sees the local block. |
+
+## Stage 19 — project-scoped long-term memory (personal + project scopes)
+
+Adds a second **project** memory scope alongside the existing personal scope,
+without duplicating the recall/extract/store pipeline.  The whole pipeline
+already threads a `home` argument and derives `<home>/memory` from it, so
+project scope is "point the same pipeline at a per-project home"; the only real
+branches are (1) `USER.md` stays a single *global* profile read in both
+scopes and (2) the extractor gets a project-appropriate prompt + allowed-type
+set.  Source is Claude Code (not Hermes).
+
+| Aegis file | Relationship | Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/memory/paths.py` (`project_id`, `project_home`, `projects_dir`, `MemoryScope`, `MemoryScopeKind`, `resolve_scope`) | **ADAPT** | `src/memdir/paths.ts` → `findCanonicalGitRoot` / `~/.claude/projects/<sanitized-git-root>/memory` | `project_id` keys on the nearest `.git` ancestor (dir *or* worktree gitfile), falling back to the resolved path; `<basename>-<sha256[:8]>` slug is stable and collision-resistant. `project_home` = `<global-home>/projects/<id>` — handed to the ordinary pipeline as its `home`. `MemoryScope` carries `kind`/`memory_home`/`profile_path`/`project_id`; `profile_path` is always the global `USER.md` (a project never gets its own). |
+| `src/aegis_agent/memory/prompt.py` (`MEMORY_BEHAVIOR_GUIDANCE_PROJECT`, `MemoryBehaviorContributor(project=)`) | **ADAPT** | `src/memdir/memoryTypes.ts` behaviour text | Project-scope behaviour section: project memory is the active index, `USER.md` is still global, project facts belong here, plain `user` facts belong in `USER.md`. |
+| `src/aegis_agent/memory/extractor.py` (`_EXTRACT_SYSTEM_PROJECT`, `_ALLOWED_TYPES_PROJECT`, `_scope_config`, `project=` param) | **ADAPT** | `services/extractMemories/prompts.ts` (per-scope variants) | Project extraction allows `project`/`feedback`/`reference` and rejects `user` (`USER.md` owns the profile). `_coerce_action` now takes the allowed-type set instead of a hardcoded personal set. Default is personal, so existing callers are unchanged. |
+| `src/aegis_agent/memory/manager.py` (`project=` param) | **original** | — | Carries the scope into `_run_extraction` → `extract_memories(project=…)`. Recall is scope-agnostic given the right `home`; the `_main_agent_wrote_memory` mutex already resolves `memory_dir(self._home)` so it targets the project dir automatically. |
+| `src/aegis_agent/memory/__init__.py` | **original** | — | Re-exports the new scope symbols; package doc updated to describe both scopes. |
+| `src/aegis_agent/runtime.py` (`with_defaults` `memory_project`/`memory_scope`, `startup_info`) | **original** | — | Resolves a `MemoryScope`; the profile contributor points at the global `USER.md` path and the index contributor at the scope memory home. `startup_info` gains `memory_scope` and `project_id`. |
+| `src/aegis_agent/cli.py` (`--project`, `_normalize_project_flag`) | **original** | — | `--project [PATH]`: a bare `--project` is rewritten to `--project <cwd>` in `main()` before the Typer app parses argv (Typer 0.27 cannot express an optional-value option). Absent → personal scope. |
+| `src/aegis_agent/tui.py` (startup panel) | **original** | — | Shows `Memory: on (personal)` / `Memory: on (project <id>)`. |
+| `tests/test_memory_project.py` | **original** | — | 15 tests: default-personal, both-scopes-share-USER.md, project-excludes-personal index/recall, project recall only searches its dir, project extract only writes its dir, `user`-type rejection, cross-project isolation, stable project-id (subdir/git-root), no personal regression. |

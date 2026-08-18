@@ -109,6 +109,10 @@ class MemoryManager:
         ``None`` to disable that channel.
     home:
         The memory home; ``None`` uses the default (``$AEGIS_HOME``/``~/.aegis``).
+    project:
+        When True, extraction uses the project-scoped prompt and allowed memory
+        kinds (``project``/``feedback``/``reference``).  ``home`` should then be a
+        project home so writes land in the project's memory dir.
     on_event:
         Optional telemetry sink invoked with :class:`MemoryEvent` objects.
     """
@@ -120,12 +124,14 @@ class MemoryManager:
         recall_provider: ModelProvider | None = None,
         extract_provider: ModelProvider | None = None,
         home: str | None = None,
+        project: bool = False,
         on_event: Callable[[MemoryEvent], None] | None = None,
     ) -> None:
         self._contributor = contributor
         self._recall_provider = recall_provider
         self._extract_provider = extract_provider
         self._home = home
+        self._project = project
         self._on_event = on_event
         self._sessions: dict[str, _SessionState] = {}
         self._sessions_lock = threading.Lock()
@@ -321,6 +327,7 @@ class MemoryManager:
             task.messages,
             state.cursor,
             self._home,
+            project=self._project,
         )
         applied: list[str] = []
         if result.actions:
