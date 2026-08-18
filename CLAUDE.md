@@ -273,6 +273,8 @@ report unresolved risks and TODOs;
 
 update the development report described in Section 10;
 
+update README.md (the milestone list and any affected feature sections — not just docs/source-map.md and docs/development-log.md);
+
 verify that Hermes was not modified.
 
 Use the smallest relevant test first, then run:
@@ -338,6 +340,8 @@ a concise interview-ready explanation of what was done, why it was needed, and h
 
 The report should explain meaningful technical decisions and behavior. It does not need to be a line-by-line code changelog.
 
+The milestone must also be reflected in README.md (the "Milestones delivered" list, the project layout, and any user-facing feature / command sections), not only in docs/source-map.md and docs/development-log.md.
+
 11. Completion report format
 
 Every completed milestone must end with:
@@ -353,6 +357,8 @@ Tests executed
 Test results
 
 Development report
+
+README update
 
 Remaining risks
 
