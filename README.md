@@ -6,7 +6,7 @@ A lightweight, recoverable, and extensible **Agent Runtime**, built by extractin
 
 ## 🏁 Milestones delivered
 
-Seventeen milestones, from a minimal skeleton to the full runtime:
+Eighteen milestones, from a minimal skeleton to the full runtime:
 
 **Core runtime**
 1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
@@ -31,9 +31,10 @@ Seventeen milestones, from a minimal skeleton to the full runtime:
 14. Personal long-term memory (Auto Memory) — `USER.md` + `MEMORY.md` index
 15. Memory recall + background extraction
 16. Session history search — FTS5 `session_search`
+17. Project-scoped long-term memory — `--project [PATH]`
 
 **Interactive UX**
-17. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
+18. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
 
 ---
 
@@ -50,7 +51,7 @@ src/aegis_agent/
 ├── tools/          # tool registry, executor, builtin tools
 ├── context/        # context builder + compression
 ├── sessions/       # session repository (in-memory / SQLite) + leases
-├── memory/         # Auto Memory (long-term memory)
+├── memory/         # Auto Memory (long-term memory, personal + project scopes)
 ├── skills/         # SKILL.md loading / routing
 └── mcp/            # MCP client
 ```
@@ -184,10 +185,15 @@ Aegis separates **long-term memory** from **raw session history**.
 ```text
 ~/.aegis/
 ├── state.db
-├── USER.md
-└── memory/
-    ├── MEMORY.md
-    └── *.md
+├── USER.md                     # global user profile (both scopes)
+├── memory/                     # personal scope
+│   ├── MEMORY.md
+│   └── *.md
+└── projects/
+    └── <project-id>/           # project scope (isolated per project)
+        └── memory/
+            ├── MEMORY.md
+            └── *.md
 ```
 
 Long-term memory supports:
@@ -195,13 +201,19 @@ Long-term memory supports:
 * memory index injection
 * relevance-based recall
 * post-turn memory extraction
-* personal memory scope
+* **personal scope** (default) and **project scope** — `USER.md` is global, memory is scoped
 
 Enable memory features with:
 
 ```bash
 uv run aegis --memory-recall
 uv run aegis --memory-extract
+```
+
+Use project-scoped memory with `--project` (a bare `--project` uses the current directory):
+
+```bash
+uv run aegis --project /path/to/repo --memory-recall
 ```
 
 ---
@@ -298,6 +310,9 @@ uv run aegis --no-memory
 
 uv run aegis --memory-recall
 uv run aegis --memory-extract
+
+uv run aegis --project /path/to/repo --memory-recall
+uv run aegis --project --memory-extract
 
 uv run aegis --version
 ```
