@@ -137,6 +137,62 @@ class TestSharedProfile:
         assert project.startup_info.get("memory_scope") == "project"
         assert project.startup_info.get("project_id")
 
+    def test_project_root_is_named_in_prompt_and_tool_cwd(self, tmp_path, repository):
+        """The model must know WHERE the project is: the prompt names the root
+        and tools resolve relative paths against it (not the startup dir)."""
+        proj = tmp_path / "the-project"
+        proj.mkdir()
+        runtime = AgentRuntime.with_defaults(
+            repository=repository,
+            memory_project=str(proj),
+            enable_mcp=False,
+        )
+        prompt = _prompt_of(runtime)
+        assert f"Project root: {proj.resolve()}" in prompt
+        assert f"Current working directory: {proj.resolve()}" in prompt
+
+    def test_prompt_names_the_memory_directory(self, tmp_path, repository):
+        """The model must know WHERE memory lives — the project memory dir is a
+        hashed path under the aegis home, impossible to guess.  Without this the
+        model looks for memory bodies inside the project root (or cannot
+        delete/edit them when asked)."""
+        proj = tmp_path / "the-project"
+        proj.mkdir()
+        runtime = AgentRuntime.with_defaults(
+            repository=repository,
+            memory_project=str(proj),
+            enable_mcp=False,
+        )
+        prompt = _prompt_of(runtime)
+        mem_dir = memory_dir(project_home(proj))
+        assert f"Project memory directory: {mem_dir}" in prompt
+        # The memory dir is OUTSIDE the project root — state it explicitly.
+        assert str(proj.resolve()) not in str(mem_dir)
+
+    def test_personal_prompt_names_personal_memory_directory(self, tmp_path, repository):
+        home = tmp_path / "home"
+        home.mkdir()
+        runtime = AgentRuntime.with_defaults(
+            repository=repository,
+            memory_home=str(home),
+            enable_mcp=False,
+        )
+        prompt = _prompt_of(runtime)
+        assert f"personal memory directory is: {home / 'memory'}" in prompt
+
+    def test_explicit_cwd_wins_over_project_root(self, tmp_path, repository):
+        proj = tmp_path / "the-project"
+        other = tmp_path / "other"
+        proj.mkdir()
+        other.mkdir()
+        runtime = AgentRuntime.with_defaults(
+            repository=repository,
+            memory_project=str(proj),
+            cwd=str(other),
+            enable_mcp=False,
+        )
+        assert f"Current working directory: {other.resolve()}" in _prompt_of(runtime)
+
 
 # ── strict scope isolation ───────────────────────────────────────────────────
 

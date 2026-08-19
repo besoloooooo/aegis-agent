@@ -39,7 +39,7 @@ from aegis_agent.context.tool_budget import ContentReplacementState, create_stat
 from aegis_agent.events import ModelEvent, ModelEventKind, collect_response
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
 from aegis_agent.memory.manager import MemoryEvent, MemoryManager
-from aegis_agent.memory.paths import MemoryScope, resolve_scope
+from aegis_agent.memory.paths import MemoryScope, memory_dir, resolve_scope
 from aegis_agent.memory.prompt import (
     MemoryBehaviorContributor,
     RelevantMemoriesContributor,
@@ -294,7 +294,13 @@ class AgentRuntime:
             provider = FakeModelProvider()
         repo = repository or InMemorySessionRepository()
         registry = build_default_registry(session_repository=repo)
-        tool_cwd = cwd if cwd else None
+        # Resolve the memory scope up front (cheap, pure path work) so project
+        # mode can ALSO steer where the tools work: ``--project`` means
+        # "operate inside this project", so the tool cwd defaults to the
+        # project root unless an explicit ``cwd`` overrides it.
+        early_scope = resolve_scope(memory_project, memory_home) if enable_memory else None
+        project_root = early_scope.project_root if early_scope is not None else None
+        tool_cwd = cwd if cwd else (str(project_root) if project_root is not None else None)
         context = (
             ToolContext(cwd=tool_cwd, allow_dangerous_shell=allow_dangerous_shell)
             if tool_cwd
@@ -379,9 +385,15 @@ class AgentRuntime:
         memory_present = False
         memory_manager: MemoryManager | None = None
         if enable_memory:
-            scope = memory_scope or resolve_scope(memory_project, memory_home)
+            scope = memory_scope or early_scope or MemoryScope.personal(memory_home)
             project = scope.is_project
-            prompt_builder.add(MemoryBehaviorContributor(project=project))
+            prompt_builder.add(
+                MemoryBehaviorContributor(
+                    project=project,
+                    project_root=scope.project_root,
+                    memory_dir_path=memory_dir(scope.memory_home),
+                )
+            )
             # USER.md is always the GLOBAL profile (scope.profile_path points at
             # it directly); the index is the active scope's MEMORY.md.
             profile_contrib = UserProfileContributor(scope.profile_path)

@@ -91,10 +91,14 @@ Without model configuration, Aegis can run with its deterministic fake provider.
 
 ## 💾 Session Recovery
 
-Messages are persisted to:
+Messages are persisted to a SQLite store. The store is **scoped**: the personal
+scope uses `~/.aegis/state.db`, while a project scope stores its sessions beside
+its memory in `~/.aegis/projects/<project-id>/state.db` (mirroring Claude Code,
+so a session always belongs to the scope that created it).
 
 ```text
-~/.aegis/state.db
+~/.aegis/state.db                          # personal scope
+~/.aegis/projects/<project-id>/state.db    # project scope
 ```
 
 Aegis uses:
@@ -105,10 +109,12 @@ Aegis uses:
 * SQLite / Redis session leases
 * snapshot + tail replay for recovery
 
-Resume a previous session:
+Resume a previous session — pass the same `--project` it was started with, since
+a project session lives in its project's store and is not visible to personal scope:
 
 ```bash
 uv run aegis --resume my-session
+uv run aegis --project /path/to/repo --resume my-session
 ```
 
 Run without persistence:
@@ -184,13 +190,14 @@ Aegis separates **long-term memory** from **raw session history**.
 
 ```text
 ~/.aegis/
-├── state.db
+├── state.db                    # personal session store
 ├── USER.md                     # global user profile (both scopes)
 ├── memory/                     # personal scope
 │   ├── MEMORY.md
 │   └── *.md
 └── projects/
     └── <project-id>/           # project scope (isolated per project)
+        ├── state.db            # project session store
         └── memory/
             ├── MEMORY.md
             └── *.md
@@ -199,22 +206,49 @@ Aegis separates **long-term memory** from **raw session history**.
 Long-term memory supports:
 
 * memory index injection
-* relevance-based recall
-* post-turn memory extraction
+* relevance-based recall — **on by default**
+* post-turn memory extraction — **on by default**
 * **personal scope** (default) and **project scope** — `USER.md` is global, memory is scoped
 
-Enable memory features with:
+Disable either dynamic channel with:
 
 ```bash
-uv run aegis --memory-recall
-uv run aegis --memory-extract
+uv run aegis --no-memory-recall
+uv run aegis --no-memory-extract
 ```
 
 Use project-scoped memory with `--project` (a bare `--project` uses the current directory):
 
 ```bash
-uv run aegis --project /path/to/repo --memory-recall
+uv run aegis --project /path/to/repo
 ```
+
+---
+
+## 🧩 Configuration
+
+Persistent settings live in `~/.aegis/config.yaml` (the same file as `mcp_servers`;
+see `config.example.yaml` for the full key reference).  Only the keys you want to
+override are needed.  Precedence: **CLI flag > config file > built-in default**.
+
+```yaml
+# ~/.aegis/config.yaml
+memory:
+  recall: true
+  extract: true
+context:
+  max_tokens: 120000
+iterations:
+  max: 10
+session:
+  snapshot_every_n: 20
+mcp_servers: { ... }
+```
+
+Configurable from the file: memory (`enabled` / `recall` / `extract` / `project`),
+context (`compress` / `max_tokens`), iterations (`max`), session (`db_path` /
+`snapshot_every_n` / `lease`), skills (`enabled` / `dir`), mcp (`enabled`), shell
+(`allow_dangerous`), model (`backend`).
 
 ---
 
@@ -308,11 +342,12 @@ uv run aegis --no-lease
 uv run aegis --no-compress
 uv run aegis --no-memory
 
-uv run aegis --memory-recall
-uv run aegis --memory-extract
+# recall/extract are on by default; turn them off with:
+uv run aegis --no-memory-recall
+uv run aegis --no-memory-extract
 
-uv run aegis --project /path/to/repo --memory-recall
-uv run aegis --project --memory-extract
+uv run aegis --project /path/to/repo
+uv run aegis --project
 
 uv run aegis --version
 ```

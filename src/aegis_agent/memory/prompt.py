@@ -124,20 +124,61 @@ class MemoryBehaviorContributor:
     """Render the static memory behaviour rules when memory is enabled.
 
     ``project=True`` renders the project-scope variant (project memory is the
-    active index; ``USER.md`` is still the shared global profile).  ``enabled``
+    active index; ``USER.md`` is still the shared global profile).  When a
+    ``project_root`` is given it is appended as an explicit line so the model
+    knows which directory "the project" refers to.  ``memory_dir_path`` (the
+    directory actually scanned/written by the pipeline) is likewise surfaced —
+    without it the model cannot guess ``~/.aegis/projects/<id>/memory`` and
+    ends up looking for memory bodies inside the project root.  ``enabled``
     turns the whole section off (``--no-memory``).
     """
 
-    def __init__(self, *, enabled: bool = True, project: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        project: bool = False,
+        project_root: str | Path | None = None,
+        memory_dir_path: str | Path | None = None,
+    ) -> None:
         self._enabled = enabled
         self._project = project
+        self._project_root = Path(project_root) if project_root is not None else None
+        self._memory_dir = Path(memory_dir_path) if memory_dir_path is not None else None
 
     def render(self) -> str | None:
         if not self._enabled:
             return None
         if self._project:
-            return MEMORY_BEHAVIOR_GUIDANCE_PROJECT
-        return MEMORY_BEHAVIOR_GUIDANCE
+            text = MEMORY_BEHAVIOR_GUIDANCE_PROJECT
+            if self._project_root is not None or self._memory_dir is not None:
+                lines = ["\n\nProject scope facts:"]
+                if self._project_root is not None:
+                    lines.append(
+                        f"- Project root: {self._project_root} — file tools "
+                        "resolve relative paths against this directory by "
+                        "default; treat it as the project the memory scope "
+                        "belongs to."
+                    )
+                if self._memory_dir is not None:
+                    lines.append(
+                        f"- Project memory directory: {self._memory_dir} — the "
+                        "MEMORY.md index and the memory bodies (*.md) live "
+                        "HERE, outside the project root. Relative links in the "
+                        "memory index resolve against this directory, not the "
+                        "project root; read, create, or edit memory files only "
+                        "at this location."
+                    )
+                text += "\n".join(lines)
+            return text
+        text = MEMORY_BEHAVIOR_GUIDANCE
+        if self._memory_dir is not None:
+            text += (
+                f"\n\nYour personal memory directory is: {self._memory_dir} — "
+                "the MEMORY.md index and the memory bodies (*.md) live in that "
+                "directory; read or update memory files there."
+            )
+        return text
 
 
 class UserProfileContributor:

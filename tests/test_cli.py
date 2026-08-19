@@ -135,3 +135,134 @@ def test_cli_lease_blocks_second_owner(tmp_path, monkeypatch):
         app, ["--model-backend", "fake", "--session", "held-session"], input="exit\n"
     )
     assert result.exit_code == 0
+
+
+# ── project-scoped session storage ──────────────────────────────────────────
+
+
+def test_scoped_db_path():
+    """An explicit db path wins; otherwise project scope derives a per-project
+    store and personal scope keeps the shared default."""
+    from aegis_agent.cli import _scoped_db_path
+    from aegis_agent.memory.paths import project_home
+
+    assert _scoped_db_path("/x/explicit.db", "/proj") == "/x/explicit.db"
+    assert _scoped_db_path("/x/explicit.db", None) == "/x/explicit.db"
+    assert _scoped_db_path(None, None) is None
+    assert _scoped_db_path(None, "/proj") == str(project_home("/proj") / "state.db")
+
+
+def test_cli_project_session_stored_in_project_home(tmp_path, monkeypatch):
+    """In project scope the session store defaults to <project home>/state.db,
+    not the shared personal store."""
+    from aegis_agent.memory.paths import project_home
+
+    monkeypatch.delenv("AEGIS_DB_PATH", raising=False)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    scoped_db = project_home(proj) / "state.db"
+
+    result = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--session", "p1"],
+        input="hello aegis\nexit\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert scoped_db.is_file()
+    # The resume hint carries the project flag so the session can be found again.
+    assert f"Resume: aegis --project {proj} --resume p1" in result.output
+
+
+def test_cli_project_session_resumes_within_project(tmp_path, monkeypatch):
+    monkeypatch.delenv("AEGIS_DB_PATH", raising=False)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    first = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--session", "p2"],
+        input="hello aegis\nexit\n",
+    )
+    assert first.exit_code == 0, first.output
+
+    resumed = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--resume", "p2"],
+        input="again\nexit\n",
+    )
+    assert resumed.exit_code == 0, resumed.output
+    assert "Resumed session p2 (2 messages)." in resumed.output
+
+
+def test_cli_project_session_not_visible_to_personal(tmp_path, monkeypatch):
+    """A project session must not be resumable from personal scope; the error
+    points the user back to the project scope."""
+    import aegis_agent.sessions.sqlite_store as store_mod
+
+    monkeypatch.delenv("AEGIS_DB_PATH", raising=False)
+    personal_db = tmp_path / "personal-state.db"
+    monkeypatch.setattr(store_mod, "DEFAULT_DB_PATH", personal_db)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    first = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--session", "p3"],
+        input="hello aegis\nexit\n",
+    )
+    assert first.exit_code == 0, first.output
+
+    # Personal scope (no --project) cannot see the project session.
+    lost = runner.invoke(
+        app, ["--model-backend", "fake", "--no-mcp", "--resume", "p3"], input="exit\n"
+    )
+    assert lost.exit_code == 1
+    assert "session not found" in lost.output
+    assert "lives in a project scope" in lost.output
+
+
+def test_cli_personal_session_not_visible_to_project(tmp_path, monkeypatch):
+    """The reverse direction: a personal session is not resumable from a
+    project scope; the hint says to drop --project."""
+    import aegis_agent.sessions.sqlite_store as store_mod
+
+    monkeypatch.delenv("AEGIS_DB_PATH", raising=False)
+    personal_db = tmp_path / "personal-state.db"
+    monkeypatch.setattr(store_mod, "DEFAULT_DB_PATH", personal_db)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    first = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--session", "pers1"],
+        input="hello aegis\nexit\n",
+    )
+    assert first.exit_code == 0, first.output
+
+    lost = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--resume", "pers1"],
+        input="exit\n",
+    )
+    assert lost.exit_code == 1
+    assert "session not found" in lost.output
+    assert "lives in personal scope" in lost.output
+
+
+def test_cli_explicit_db_overrides_project_scope(tmp_path, monkeypatch):
+    """An explicit --db / AEGIS_DB_PATH still wins over the scoped default."""
+    from aegis_agent.memory.paths import project_home
+
+    explicit_db = tmp_path / "explicit.db"
+    monkeypatch.setenv("AEGIS_DB_PATH", str(explicit_db))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    result = runner.invoke(
+        app,
+        ["--model-backend", "fake", "--no-mcp", "--project", str(proj), "--session", "p4"],
+        input="hello aegis\nexit\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert explicit_db.is_file()
+    assert not (project_home(proj) / "state.db").exists()

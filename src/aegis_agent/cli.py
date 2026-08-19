@@ -81,45 +81,49 @@ def _main(
         "-s",
         help="Session id for this run (default: auto-generated timestamp+hex).",
     ),
-    max_iterations: int = typer.Option(
-        DEFAULT_MAX_ITERATIONS, "--max-iterations", "-n", help="Max model/tool iterations per turn."
+    max_iterations: int | None = typer.Option(
+        None, "--max-iterations", "-n", help="Max model/tool iterations per turn."
     ),
-    model_flag: str = typer.Option(
-        "auto",
+    model_flag: str | None = typer.Option(
+        None,
         "--model-backend",
         help="Which model backend to use: 'auto' (real if AEGIS_* is set, else fake), 'fake', or 'openai'.",
     ),
-    allow_dangerous_shell: bool = typer.Option(
-        False,
-        "--allow-dangerous-shell",
+    allow_dangerous_shell: bool | None = typer.Option(
+        None,
+        "--allow-dangerous-shell/--no-allow-dangerous-shell",
         help="Operator-only: allow terminal to execute commands matching the dangerous list. Use with care.",
     ),
-    skills_dir: str = typer.Option(
+    skills_dir: str | None = typer.Option(
         None,
         "--skills-dir",
         help="Directory to load skills from (default: $AEGIS_SKILLS_DIR or ~/.aegis/skills).",
     ),
-    no_skills: bool = typer.Option(False, "--no-skills", help="Disable skill loading and routing."),
-    mcp_config: str = typer.Option(
+    no_skills: bool | None = typer.Option(
+        None, "--no-skills/--skills", help="Disable skill loading and routing."
+    ),
+    mcp_config: str | None = typer.Option(
         None,
         "--mcp-config",
-        help="Path to MCP server config (default: ~/.aegis/config.yaml).",
+        help="Path to the config file (default: ~/.aegis/config.yaml). Holds both MCP servers and app settings.",
     ),
-    no_mcp: bool = typer.Option(False, "--no-mcp", help="Disable MCP server discovery."),
-    no_memory: bool = typer.Option(
-        False,
-        "--no-memory",
+    no_mcp: bool | None = typer.Option(
+        None, "--no-mcp/--mcp", help="Disable MCP server discovery."
+    ),
+    no_memory: bool | None = typer.Option(
+        None,
+        "--no-memory/--memory",
         help="Disable personal long-term memory (USER.md / MEMORY.md injection).",
     ),
-    memory_recall: bool = typer.Option(
-        False,
-        "--memory-recall",
-        help="Enable relevance recall: surface relevant memories per turn via a side-query model.",
+    memory_recall: bool | None = typer.Option(
+        None,
+        "--memory-recall/--no-memory-recall",
+        help="Surface relevant memories per turn via a side-query model (default: on).",
     ),
-    memory_extract: bool = typer.Option(
-        False,
-        "--memory-extract",
-        help="Enable background memory extraction after each final reply (writes to ~/.aegis/memory).",
+    memory_extract: bool | None = typer.Option(
+        None,
+        "--memory-extract/--no-memory-extract",
+        help="Background-extract memories after each final reply (default: on).",
     ),
     project: str | None = typer.Option(
         None,
@@ -134,14 +138,15 @@ def _main(
         help=f"Token budget for the model context; the derived context is compressed before each model call "
         f"(default: {DEFAULT_CONTEXT_MAX_TOKENS}).",
     ),
-    no_compress: bool = typer.Option(
-        False, "--no-compress", help="Disable context compression entirely."
+    no_compress: bool | None = typer.Option(
+        None, "--no-compress/--compress", help="Disable context compression entirely."
     ),
     db_path: str | None = typer.Option(
         None,
         "--db",
         envvar="AEGIS_DB_PATH",
-        help="SQLite session store path (default: ~/.aegis/state.db).",
+        help="SQLite session store path (default: ~/.aegis/state.db; in project scope: "
+        "<project home>/state.db).",
     ),
     ephemeral: bool = typer.Option(
         False, "--ephemeral", help="Use the in-memory session store (nothing is persisted)."
@@ -149,14 +154,14 @@ def _main(
     resume: str | None = typer.Option(
         None, "--resume", "-r", help="Resume an existing session id from the session store."
     ),
-    no_lease: bool = typer.Option(
-        False,
-        "--no-lease",
+    no_lease: bool | None = typer.Option(
+        None,
+        "--no-lease/--lease",
         help="Disable the cross-process session lease (not recommended: two processes "
         "running the same session duplicate model requests and interleave history).",
     ),
-    snapshot_every_n: int = typer.Option(
-        20, "--snapshot-every-n", help="Write a fast-resume snapshot every N messages (0=off)."
+    snapshot_every_n: int | None = typer.Option(
+        None, "--snapshot-every-n", help="Write a fast-resume snapshot every N messages (0=off)."
     ),
     list_sessions: bool = typer.Option(
         False, "--list", "-l", help="List all recorded sessions and exit."
@@ -173,14 +178,43 @@ def _main(
     # (mirrors Hermes' ~/.hermes/.env pattern for secrets like TAVILY_API_KEY).
     load_dotenv()
     load_dotenv(Path.home() / ".aegis" / ".env")
+
+    # ---- config file: ~/.aegis/config.yaml (same file as mcp_servers) --
+    # Precedence: explicit CLI flag > config file > built-in default.
+    from aegis_agent.config import (
+        load_app_config,
+        resolve_enabled,
+        resolve_flag,
+        resolve_value,
+    )
+
+    cfg = load_app_config(mcp_config)
+    model_backend = resolve_value(model_flag, cfg, "model", "backend", "auto")
+    allow_dangerous = resolve_flag(
+        allow_dangerous_shell, cfg, "shell", "allow_dangerous", default=False
+    )
+    enable_skills = resolve_enabled(no_skills, cfg, "skills", "enabled", default=True)
+    skills_dir_resolved = resolve_value(skills_dir, cfg, "skills", "dir", None)
+    enable_mcp = resolve_enabled(no_mcp, cfg, "mcp", "enabled", default=True)
+    enable_memory = resolve_enabled(no_memory, cfg, "memory", "enabled", default=True)
+    # Recall / extract default ON; recall/extract are also suppressed when the
+    # whole memory subsystem is disabled.
+    enable_recall = resolve_flag(memory_recall, cfg, "memory", "recall", default=True) and enable_memory
+    enable_extract = resolve_flag(memory_extract, cfg, "memory", "extract", default=True) and enable_memory
+    project_resolved = resolve_value(project, cfg, "memory", "project", None)
+    enable_compress = resolve_enabled(no_compress, cfg, "context", "compress", default=True)
+    max_iter_resolved = resolve_value(max_iterations, cfg, "iterations", "max", DEFAULT_MAX_ITERATIONS)
+    snapshot_n = resolve_value(snapshot_every_n, cfg, "session", "snapshot_every_n", 20)
+    db_path_resolved = resolve_value(db_path, cfg, "session", "db_path", None)
+
     try:
-        provider, label = _select_provider(model_flag)
+        provider, label = _select_provider(model_backend)
     except AegisError as exc:
         typer.echo(f"[error] {exc}")
         raise typer.Exit(code=1) from exc
     context_budget: int | None = None
     summary_provider = None
-    if not no_compress:
+    if enable_compress:
         context_budget = context_max_tokens or DEFAULT_CONTEXT_MAX_TOKENS
         summary_provider = _build_summary_provider(provider)
 
@@ -194,13 +228,23 @@ def _main(
     provider = wire
 
     # ---- session store (persistence + resume) ---------------------------
-    repository = _build_repository(db_path, ephemeral)
+    # Mirrors Claude Code: a session belongs to the scope it was started in.  In
+    # project scope the default store lives next to the project memory
+    # (<project home>/state.db) instead of the shared personal store, so
+    # --resume / --list / session_search naturally bind to that project and a
+    # project session can never leak into (or be resumed from) personal scope.
+    # An explicit --db / AEGIS_DB_PATH / session.db_path always wins.
+    db_path_resolved = _scoped_db_path(db_path_resolved, project_resolved)
+    repository = _build_repository(db_path_resolved, ephemeral)
     if list_sessions:
         _print_session_list(repository)
         raise typer.Exit()
     session_id = resume or session_id or _new_session_id()
     if resume and repository.get_session(resume) is None:
         typer.echo(f"[error] session not found: {resume}")
+        hint = _session_scope_hint(resume, project_resolved)
+        if hint:
+            typer.echo(hint)
         raise typer.Exit(code=1)
     if not ephemeral:
         # Persist the session row up front.  The row is otherwise created
@@ -228,10 +272,11 @@ def _main(
     # lease has nothing to protect — skip it rather than falling back to the
     # default-path SQLite lock namespace.  An operator who explicitly sets
     # AEGIS_SESSION_LEASE_BACKEND still gets a lease (explicit intent wins).
+    enable_lease = resolve_enabled(no_lease, cfg, "session", "lease", default=True)
     lease_manager = None
     lease_backend_env_set = bool(os.environ.get("AEGIS_SESSION_LEASE_BACKEND"))
-    skip_lease = no_lease or (ephemeral and not lease_backend_env_set)
-    if ephemeral and not no_lease and not lease_backend_env_set:
+    skip_lease = not enable_lease or (ephemeral and not lease_backend_env_set)
+    if ephemeral and enable_lease and not lease_backend_env_set:
         typer.echo("[note] ephemeral store: session lease skipped "
                    "(nothing is shared across processes).")
     if not skip_lease:
@@ -248,17 +293,17 @@ def _main(
         runtime = AgentRuntime.with_defaults(
             provider=provider,
             repository=repository,
-            max_iterations=max_iterations,
-            allow_dangerous_shell=allow_dangerous_shell,
-            enable_skills=not no_skills,
-            skills_dir=skills_dir,
-            enable_mcp=not no_mcp,
+            max_iterations=max_iter_resolved,
+            allow_dangerous_shell=allow_dangerous,
+            enable_skills=enable_skills,
+            skills_dir=skills_dir_resolved,
+            enable_mcp=enable_mcp,
             mcp_config_path=mcp_config,
-            enable_memory=not no_memory,
-            enable_memory_recall=memory_recall and not no_memory,
-            enable_memory_extract=memory_extract and not no_memory,
+            enable_memory=enable_memory,
+            enable_memory_recall=enable_recall,
+            enable_memory_extract=enable_extract,
             memory_side_provider=inner_provider,
-            memory_project=project,
+            memory_project=project_resolved,
             context_token_budget=context_budget,
             summary_provider=summary_provider,
         )
@@ -300,7 +345,7 @@ def _main(
             tui,
             interrupt=interrupt,
             lease_lost=lease_lost,
-            snapshot_every_n=snapshot_every_n,
+            snapshot_every_n=snapshot_n,
         )
     finally:
         # Wait for any in-flight background memory work (recall/extract) before
@@ -321,9 +366,12 @@ def _main(
         if callable(close):
             close()
         if show_resume:
+            # The session lives in the scope it was started in, so the resume
+            # command must carry the same --project to find it again.
+            project_flag = f" --project {project_resolved}" if project_resolved else ""
             typer.echo(
                 f"\nSession {session_id} — {msg_count} messages.\n"
-                f"Resume: aegis --resume {session_id}"
+                f"Resume: aegis{project_flag} --resume {session_id}"
             )
 
 
@@ -392,6 +440,79 @@ def _build_repository(db_path: str | None, ephemeral: bool):
     from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
 
     return SQLiteSessionRepository(db_path)
+
+
+def _scoped_db_path(db_path: str | None, project: str | None) -> str | None:
+    """Derive the session store path, scoping it to the project when active.
+
+    An explicit ``db_path`` (``--db`` / ``AEGIS_DB_PATH`` / ``session.db_path``)
+    always wins.  Otherwise, in project scope the store defaults to
+    ``<project home>/state.db`` (mirroring Claude Code's per-project session
+    storage) so a project's sessions live beside its memory; with no project it
+    stays ``None`` → the shared personal store default.
+    """
+    if db_path is not None:
+        return db_path
+    if project is None:
+        return None
+    from aegis_agent.memory.paths import project_home
+
+    return str(project_home(project) / "state.db")
+
+
+def _session_scope_hint(session_id: str, project: str | None) -> str | None:
+    """Best-effort hint when a resumed session is absent from the active scope.
+
+    Sessions live in the store of the scope that created them, so a project
+    session is invisible to personal scope and vice-versa.  This looks for the
+    session in the *other* scope's store(s) (read-only) and, if found, tells the
+    user which scope to resume it from.  Returns ``None`` when it cannot be
+    located (the plain "session not found" error stands alone).
+    """
+    from aegis_agent.sessions.sqlite_store import DEFAULT_DB_PATH
+
+    def _contains(db_path: Path) -> bool:
+        import sqlite3
+
+        if not db_path.is_file():
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+
+    if project is not None:
+        # Active scope is a project; the session may live in the personal store.
+        if _contains(DEFAULT_DB_PATH):
+            return (
+                f"[hint] session '{session_id}' lives in personal scope — "
+                "resume it without --project."
+            )
+        return None
+
+    # Active scope is personal; the session may live in some project store.
+    from aegis_agent.memory.paths import projects_dir
+
+    base = projects_dir()
+    if not base.is_dir():
+        return None
+    for proj_dir in sorted(base.iterdir()):
+        candidate = proj_dir / "state.db"
+        if _contains(candidate):
+            return (
+                f"[hint] session '{session_id}' lives in a project scope — "
+                f"resume it with --project (project id '{proj_dir.name}')."
+            )
+    return None
 
 
 def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> None:

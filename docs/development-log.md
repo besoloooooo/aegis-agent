@@ -2482,3 +2482,54 @@ project scope 就是把这个 `home` 指到 `<~/.aegis>/projects/<git-root-hash>
 TUI 显示当前 scope。隔离性用三条独立记忆（personal `prefer-search`、project A `architecture`、
 project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 
+### 后续修复一：project 模式下模型不知道项目根在哪
+
+实测 `--project /mnt/e/xxx` 后问"项目根目录下有什么文件"，模型把**启动目录**当成了项目根。
+根因：scope 只切换了记忆存储位置，系统提示词里没有任何项目根信息，工具 cwd 也是启动目录。
+修复（对齐"在哪个项目里工作"的语义）：
+
+- `MemoryScope` 新增 `project_root`（`--project` 指向的原始目录，区别于存储用的 `memory_home`）；
+- project 模式下**工具 cwd 默认为项目根**（`with_defaults` 提前解析 scope；显式 `cwd=` 仍优先），
+  于是 Environment 分节的 `Current working directory:` 与文件/终端工具的相对路径都落在项目内；
+- `MemoryBehaviorContributor(project_root=...)` 在项目分节末尾显式追加一行
+  "The current project root is: <路径>"。
+
+### 后续修复二：project 会话的 resume 绑定（对齐 Claude Code 的按项目存放）
+
+随后发现：project 会话关闭后 `aegis --resume <id>`（不带 `--project`）会**退回 personal 作用域**
+恢复——sessions 表没有 scope 元数据，scope 是纯启动期参数。危害不只是注入错索引：恢复的对话
+全是项目上下文，personal 提取器却往 personal memory 写（只有提示词软约束兜底）。
+
+没有选"给 sessions 表加 project 列 + 自动恢复"，而是参考 Claude Code 的做法——**会话本身就按
+项目存放，绑定天然成立**：
+
+- project 作用域的会话库默认在 `<project home>/state.db`（即
+  `~/.aegis/projects/<id>/state.db`），personal 仍在 `~/.aegis/state.db`；
+- `--resume` / `--list` / `session_search` / 租约都自然跟随当前 scope 的库：project 会话在
+  personal 下查不到（反之亦然），跨项目同样天然隔离；
+- 显式 `--db` / `AEGIS_DB_PATH` / `session.db_path` 始终优先（运维意图不被覆盖）；
+- resume 找不到会话时做只读旁路探测：若在"另一个 scope 的库"里找到，打印提示
+  （"lives in personal scope — 去掉 --project" / "lives in a project scope — 带上对应 --project"）；
+- 退出时的 `Resume: …` 提示也带上 `--project <路径>`，避免用户照着敲却丢 scope。
+
+实现只在 CLI 层（`_scoped_db_path` / `_session_scope_hint` + resume/退出提示），存储层零改动
+（`SQLiteSessionRepository` 本来就 `mkdir(parents=True)` 且接受任意路径）。新增 6 个 CLI 测试
+覆盖：project 库落位、同 scope resume 成功、双向跨 scope 不可见 + 提示、显式 `--db` 覆盖。
+
+### 后续修复三：提示词必须告诉模型记忆目录在哪
+
+实测发现模型拿到索引条目 `[...](aegis-agent-project-overview.md)` 后，把相对链接解析到**项目根**
+去读（报 File not found）；用户让它删掉这条项目记忆时，它又在项目目录里 find/search——因为
+提示词从未说明记忆目录的位置，而 `~/.aegis/projects/<hash>/memory` 这种路径模型不可能猜到。
+（之前只加了"项目根在哪"，反而暗示记忆文件在项目根下，加重了误导。）
+
+修复：`MemoryBehaviorContributor` 增加 `memory_dir_path`（= pipeline 实际扫描/写入的
+`memory_dir(scope.memory_home)`），两种 scope 都在行为分节末尾显式写出记忆目录绝对路径：
+
+- **project**："Project memory directory: <绝对路径> — 索引与正文在这里、在项目根**之外**；
+  索引里的相对链接按该目录解析，不是项目根；只在此处读/建/改记忆文件"；
+- **personal**："Your personal memory directory is: <绝对路径> — 在该目录读写记忆"。
+
+新增 2 个测试（project 记忆目录出现且确在项目根之外、personal 同样给出目录）；既有
+"project 根 + 工具 cwd" 测试措辞随分节文案更新。
+

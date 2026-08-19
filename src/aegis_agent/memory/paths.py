@@ -169,14 +169,16 @@ class MemoryScope:
 
     ``memory_home`` is the ``home`` fed to the read/write pipeline (personal home
     or a project home).  ``profile_path`` is ALWAYS the global ``USER.md`` — a
-    project never gets its own profile.  ``project_id`` is set only for the
-    project scope (for display / telemetry).
+    project never gets its own profile.  ``project_id`` and ``project_root`` are
+    set only for the project scope (the root is the directory the user pointed
+    ``--project`` at — used for the system prompt / tool cwd, not for storage).
     """
 
     kind: MemoryScopeKind
     memory_home: Path
     profile_path: Path
     project_id: str | None = None
+    project_root: Path | None = None
 
     @property
     def is_project(self) -> bool:
@@ -203,6 +205,7 @@ class MemoryScope:
             memory_home=project_home(project_path, home),
             profile_path=user_profile_path(home),  # global — never project-local
             project_id=project_id(project_path),
+            project_root=Path(project_path).expanduser().resolve(),
         )
 
 
