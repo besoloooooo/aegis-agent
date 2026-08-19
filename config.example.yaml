@@ -1,0 +1,59 @@
+# Aegis Agent configuration example.
+#
+# Copy this file to ~/.aegis/config.yaml.  Only the keys you want to override
+# need to be present — everything else keeps its built-in default.
+#
+# Precedence (highest wins):
+#   explicit CLI flag  >  value in this file  >  built-in default
+#
+# NOTE: this same file also holds the `mcp_servers:` block (see docs).
+
+# ---- memory -------------------------------------------------------------
+memory:
+  enabled: true          # whole memory subsystem; --no-memory / --memory turns it
+  recall: true           # per-turn relevance recall (default ON); --memory-recall/--no-memory-recall
+  extract: true          # background extraction after each final reply (default ON)
+                         # --memory-extract/--no-memory-extract
+  project: null          # project-scoped memory root; null = personal scope (--project)
+
+# ---- context -------------------------------------------------------------
+context:
+  compress: true         # context compression; --no-compress / --compress turns it
+  max_tokens: 120000     # derived-context token budget; --context-max-tokens
+
+# ---- loop ----------------------------------------------------------------
+iterations:
+  max: 10                # max model/tool iterations per turn; --max-iterations / -n
+
+# ---- session / persistence -----------------------------------------------
+session:
+  db_path: null          # SQLite path; --db / AEGIS_DB_PATH (null = ~/.aegis/state.db)
+  snapshot_every_n: 20   # fast-resume snapshot cadence; --snapshot-every-n (0=off)
+  lease: true            # cross-process session lease; --no-lease / --lease turns it
+
+# ---- skills ---------------------------------------------------------------
+skills:
+  enabled: true          # skill loading/routing; --no-skills / --skills turns it
+  dir: null              # skills dir; --skills-dir / AEGIS_SKILLS_DIR
+
+# ---- MCP ------------------------------------------------------------------
+mcp:
+  enabled: true          # MCP discovery; --no-mcp / --mcp turns it
+
+# ---- shell / model --------------------------------------------------------
+shell:
+  allow_dangerous: false # operator-only dangerous-command guard; --allow-dangerous-shell
+
+model:
+  backend: auto          # 'auto' | 'fake' | 'openai'; --model-backend
+
+# ---- MCP servers (consumed by the MCP loader, same file) -----------------
+mcp_servers: {}
+#   example:
+#   my_server:
+#     command: uvx
+#     args: ["-y", "some-mcp-server"]
+#     env:
+#       API_KEY: "${MY_API_KEY}"
+#     enabled: true
+#     timeout: 30
