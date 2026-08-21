@@ -110,6 +110,11 @@ def _startup_panel(info: dict[str, int | str]) -> Panel:
     # Builtin
     parts.append(f"Builtin tools: {info.get('builtin_tools', 0)}")
 
+    # Subagents (the Agent tool)
+    subagents = info.get("subagents", 0)
+    if subagents:
+        parts.append(f"Subagents: {subagents}")
+
     # Memory (present = USER.md or MEMORY.md was loaded; scope = personal/project)
     if info.get("memory"):
         scope = info.get("memory_scope", "personal")

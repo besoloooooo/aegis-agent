@@ -60,6 +60,36 @@ from aegis_agent.tools.registry import ToolContext, ToolRegistry
 
 DEFAULT_MAX_ITERATIONS = 10
 
+#: The identity of the primary, user-facing agent.  Every runtime built by the
+#: CLI carries this name; a future subagent would construct a runtime with a
+#: distinct name so the two are distinguishable in logs / events without any
+#: change to the engine itself.
+MAIN_AGENT_NAME = "main"
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Per-agent identity and tuning knobs for an :class:`AgentRuntime`.
+
+    This is the small, self-contained value object that a caller fills in to
+    say *which* agent this runtime is and how it should be bounded.  It holds
+    only the scalar, agent-level configuration; the heavier collaborators
+    (model provider, tool registry/executor, session repository, context
+    builder) are still injected into :class:`AgentRuntime` directly — they are
+    dependencies, not configuration, and are frequently *shared* between a
+    parent and its future subagents.
+
+    Separating identity/tuning from injected dependencies is exactly what lets
+    the same engine be re-instantiated for different agents: a future subagent
+    spawner builds a fresh ``AgentConfig`` (a different ``agent_name``, perhaps
+    a tighter ``max_iterations``) and reuses the parent's provider, registry
+    and repository.  ``frozen=True`` keeps a config immutable once created so it
+    can be shared without defensive copies.
+    """
+
+    agent_name: str = MAIN_AGENT_NAME
+    max_iterations: int = DEFAULT_MAX_ITERATIONS
+
 
 class IterationBudget:
     """Thread-safe iteration counter for an agent turn.
@@ -202,13 +232,23 @@ class AgentRuntime:
         compress_storage_dir: str | None = None,
         summary_provider: ModelProvider | None = None,
         memory_manager: MemoryManager | None = None,
+        config: AgentConfig | None = None,
+        subagent_manager: object | None = None,
+        team_manager: object | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._executor = executor
         self._repository = repository
         self._context = context_builder or ContextBuilder()
-        self._max_iterations = max_iterations
+        # ``config`` is the agent-level identity/tuning object.  For backward
+        # compatibility the pre-existing ``max_iterations`` keyword still works:
+        # when no explicit config is supplied we synthesise one carrying that
+        # value under the default (main-agent) identity, so every existing
+        # caller keeps its exact behaviour.  When a config IS supplied it is the
+        # single source of truth and ``max_iterations`` is ignored.
+        self._config = config or AgentConfig(max_iterations=max_iterations)
+        self._max_iterations = self._config.max_iterations
         self._skill_router = skill_router
         self._startup_info = startup_info or {}
         # Personal long-term memory (Stage 2/3): recall before the turn, extract
@@ -216,6 +256,16 @@ class AgentRuntime:
         # behaviour).  The manager only shapes the derived context and writes to
         # the memory dir — it never mutates session history.
         self._memory_manager = memory_manager
+        # Subagent task manager (``None`` when subagents are disabled).  Typed as
+        # ``object`` at the constructor to keep the runtime free of an agents
+        # import at module load; it is always a ``SubagentManager`` when set.
+        # The runtime only *drains* its notification queue between turns — it
+        # never spawns subagents itself (that is the Agent tool's job).
+        self._subagent_manager = subagent_manager
+        # Team manager (persistent teammates + messaging).  Also ``object`` to
+        # avoid a module-level agents import; a ``TeamManager`` when set.  The
+        # runtime only drains the lead's inbox between turns.
+        self._team_manager = team_manager
         # Context compression (Stage 11).  ``context_token_budget=None`` disables
         # compression entirely; when set, the derived context is compressed
         # before every model call.  ``_budget_states`` holds one
@@ -233,6 +283,7 @@ class AgentRuntime:
         provider: ModelProvider | None = None,
         repository: SessionRepository | None = None,
         *,
+        agent_name: str = MAIN_AGENT_NAME,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         system_prompt: str | None = None,
         cwd: str | None = None,
@@ -241,6 +292,7 @@ class AgentRuntime:
         skills_dir: str | None = None,
         enable_mcp: bool = True,
         mcp_config_path: str | None = None,
+        enable_subagents: bool = True,
         enable_memory: bool = True,
         memory_home: str | None = None,
         memory_project: str | None = None,
@@ -373,6 +425,58 @@ class AgentRuntime:
                 import logging
                 logging.getLogger(__name__).warning("MCP discovery failed", exc_info=True)
 
+        # ---- Subagents (the Agent tool) ----------------------------------
+        # Registered LAST among tools so a spawned subagent's tool pool (filtered
+        # from this same registry at spawn time) can include the builtins,
+        # skills tools and MCP wrappers registered above.  The SubagentManager
+        # owns task lifecycle (running→completed/failed/killed), background
+        # threads, the concurrency/depth limits, and the completion-notification
+        # queue the runtime drains between turns.  The runner reuses the main
+        # model provider; the parent cwd / dangerous-shell switch flow into each
+        # subagent's tool context.  ``enable_subagents=False`` restores the
+        # exact pre-subagent behaviour (the tool is simply absent).
+        subagent_count = 0
+        subagent_manager = None
+        team_manager = None
+        if enable_subagents:
+            from aegis_agent.agents.agent_tool import AgentTool
+            from aegis_agent.agents.definitions import builtin_agents
+            from aegis_agent.agents.manager import SubagentManager
+            from aegis_agent.agents.runner import SubagentRunner
+
+            agents = builtin_agents()
+            runner = SubagentRunner(
+                provider,
+                registry,
+                cwd=context.cwd,
+                allow_dangerous_shell=allow_dangerous_shell,
+            )
+            subagent_manager = SubagentManager(runner, agents)
+            registry.register(
+                AgentTool(
+                    subagent_manager,
+                    allow_fork=True,
+                    history_provider=repo.list_messages,
+                )
+            )
+            subagent_count = len(agents)
+
+            # ---- Team (persistent teammates + inter-agent messaging) -------
+            # The lead is the Main Agent.  It gets ``team_create`` (bound to no
+            # team initially — it creates one on first use) and a lead-bound
+            # ``send_message``.  Teammates get their own ``send_message`` via
+            # the runner when spawned by the TeamManager.  The TeamManager and
+            # the transport are shared with the runtime so the CLI can drain
+            # the lead's inbox between turns.
+            from aegis_agent.agents.messaging import InProcessTransport
+            from aegis_agent.agents.team import LEAD_NAME, TeamManager
+            from aegis_agent.agents.team_tools import SendMessageTool, TeamCreateTool
+
+            transport = InProcessTransport()
+            team_manager = TeamManager(runner, transport, agents)
+            registry.register(TeamCreateTool(team_manager))
+            registry.register(SendMessageTool(team_manager, team_id=None, sender=LEAD_NAME))
+
         # ---- Long-term memory (personal or project scope) ----------------
         # Stage-1 sections (behaviour rules, USER.md profile, MEMORY.md index) +
         # the Stage-2/3 relevant-memories slot.  Each renders on every build so
@@ -429,6 +533,7 @@ class AgentRuntime:
             "skills": skills_count,
             "mcp_servers": mcp_server_count,
             "mcp_tools": mcp_tool_count,
+            "subagents": subagent_count,
             "memory": 1 if memory_present else 0,
             "memory_scope": "project" if (enable_memory and project) else "personal",
             "memory_recall": 1 if (memory_manager and enable_memory_recall) else 0,
@@ -442,13 +547,15 @@ class AgentRuntime:
             executor=executor,
             repository=repo,
             context_builder=builder,
-            max_iterations=max_iterations,
+            config=AgentConfig(agent_name=agent_name, max_iterations=max_iterations),
             skill_router=skill_router,
             startup_info=startup_info,
             context_token_budget=context_token_budget,
             compress_storage_dir=compress_storage_dir,
             summary_provider=summary_provider,
             memory_manager=memory_manager,
+            subagent_manager=subagent_manager,
+            team_manager=team_manager,
         )
 
     @property
@@ -460,9 +567,52 @@ class AgentRuntime:
         return self._skill_router
 
     @property
+    def subagent_manager(self):
+        """The subagent task manager, or ``None`` when subagents are disabled."""
+        return self._subagent_manager
+
+    @property
+    def team_manager(self):
+        """The team manager, or ``None`` when subagents/teams are disabled."""
+        return self._team_manager
+
+    def drain_team_messages(self) -> list:
+        """Pop messages waiting for the lead (Main Agent) from teammates.
+
+        The CLI calls this between user turns and injects each message as the
+        next input so the lead hears from its teammates **without polling**.
+        Returns an empty list when teams are disabled or nothing is waiting.
+        """
+        if self._team_manager is None:
+            return []
+        return self._team_manager.drain_lead_messages()
+
+    def drain_subagent_notifications(self) -> list:
+        """Pop pending background-subagent completion notifications.
+
+        The CLI calls this between user turns and feeds each notification back
+        in as the next input, so the model learns that a background subagent
+        finished **without any polling**.  Returns an empty list when subagents
+        are disabled or nothing has completed.
+        """
+        if self._subagent_manager is None:
+            return []
+        return self._subagent_manager.drain_notifications()
+
+    @property
     def startup_info(self) -> dict[str, int | str]:
         """Startup facts: subsystem counts plus the active memory scope/id."""
         return dict(self._startup_info)
+
+    @property
+    def config(self) -> AgentConfig:
+        """The agent-level identity/tuning this runtime was built with."""
+        return self._config
+
+    @property
+    def agent_name(self) -> str:
+        """Identity of this agent (``"main"`` for the primary CLI agent)."""
+        return self._config.agent_name
 
     @property
     def max_iterations(self) -> int:
@@ -493,6 +643,7 @@ class AgentRuntime:
         user_message: str,
         *,
         interrupt: threading.Event | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
         on_event: Callable[[TurnEvent], None] | None = None,
     ) -> TurnResult:
         """Run one user turn: persist input, loop model↔tools, return the result.
@@ -502,6 +653,14 @@ class AgentRuntime:
         history, calls the model, persists the assistant message, and either
         finishes (no tool calls) or executes the requested tools, persists
         their results, and loops.
+
+        ``interrupt`` is the CLI's cooperative-cancel :class:`threading.Event`
+        (Ctrl+C / lease loss).  ``is_cancelled`` is an alternative cancel
+        source used when a *parent* runtime drives this one as a subagent: the
+        parent hands down its own ``context.is_cancelled`` callback so a
+        Ctrl+C mid-subagent stops the child too.  Either (or both, or neither)
+        may be supplied; a turn is cancelled when the event is set OR the
+        callback returns True.
 
         When ``on_event`` is given it receives one :class:`TurnEvent` per
         streamed model event (text deltas, tool-call requests) plus a
@@ -527,9 +686,19 @@ class AgentRuntime:
         stop_reason = StopReason.FINAL_ANSWER
 
         # Cooperative-cancel callback shared by the model stream and tool
-        # execution: both abort (and discard partial work) when the interrupt
-        # event is set, instead of blocking to their own timeouts.
-        is_cancelled = (lambda: interrupt.is_set()) if interrupt is not None else None
+        # execution: both abort (and discard partial work) when cancellation is
+        # signalled, instead of blocking to their own timeouts.  Cancellation
+        # comes from either the CLI's interrupt event or a parent-supplied
+        # ``is_cancelled`` callback (subagent path); ``_cancelled`` OR-combines
+        # whichever are present.
+        _parent_cancelled = is_cancelled
+
+        def _cancelled() -> bool:
+            if interrupt is not None and interrupt.is_set():
+                return True
+            return _parent_cancelled is not None and _parent_cancelled()
+
+        cancel_check = _cancelled if (interrupt is not None or _parent_cancelled is not None) else None
 
         def _emit(event: ModelEvent) -> None:
             if on_event is not None:
@@ -538,8 +707,8 @@ class AgentRuntime:
                     on_event(te)
 
         while True:
-            # Guard 1: cooperative interrupt.
-            if interrupt is not None and interrupt.is_set():
+            # Guard 1: cooperative interrupt (event and/or parent callback).
+            if cancel_check is not None and cancel_check():
                 stop_reason = StopReason.INTERRUPTED
                 break
 
@@ -574,7 +743,7 @@ class AgentRuntime:
             try:
                 response = collect_response(
                     self._provider.stream(api_messages, tools=self._registry.definitions()),
-                    is_cancelled=is_cancelled,
+                    is_cancelled=cancel_check,
                     on_event=_emit,
                 )
             except OperationCancelled:
@@ -606,7 +775,7 @@ class AgentRuntime:
             turn_tool_calls.extend(response.tool_calls)
             try:
                 results = self._executor.execute(
-                    response.tool_calls, is_cancelled=is_cancelled, session_id=session_id
+                    response.tool_calls, is_cancelled=cancel_check, session_id=session_id
                 )
             except OperationCancelled:
                 # A tool aborted mid-flight (Ctrl+C / cancel): stop the turn
@@ -664,6 +833,8 @@ class AgentRuntime:
 
 __all__ = [
     "DEFAULT_MAX_ITERATIONS",
+    "MAIN_AGENT_NAME",
+    "AgentConfig",
     "AgentRuntime",
     "IterationBudget",
     "StopReason",

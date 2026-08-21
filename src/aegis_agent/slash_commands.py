@@ -88,6 +88,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("title", "Set or show the current session title", "Session",
                args_hint="[name]"),
     CommandDef("sessions", "List recorded sessions", "Session"),
+    CommandDef("agents", "List subagent tasks (running/finished) and their status", "Session"),
     # Meta
     CommandDef("help", "Show this command list", "Meta"),
     CommandDef("exit", "Quit the REPL", "Meta", aliases=("quit",)),
@@ -459,6 +460,24 @@ class SlashHandler:
             self._emit("(this session store does not support listing)")
             return SlashResult(SlashKind.HANDLED)
         self._emit("\n".join(format_session_table(list_sessions())))
+        return SlashResult(SlashKind.HANDLED)
+
+    def _cmd_agents(self, arg: str) -> SlashResult:
+        """List subagent tasks and their lifecycle status (``/agents``)."""
+        manager = getattr(self._runtime, "subagent_manager", None)
+        if manager is None:
+            self._emit("(subagents are disabled)")
+            return SlashResult(SlashKind.HANDLED)
+        tasks = manager.tasks()
+        if not tasks:
+            self._emit("(no subagent tasks yet)")
+            return SlashResult(SlashKind.HANDLED)
+        lines = [f"{'TASK':<12} {'TYPE':<16} {'STATUS':<11} {'BG':<3} DESCRIPTION", "-" * 72]
+        for t in tasks:
+            bg = "bg" if t.background else ""
+            status = t.status.value
+            lines.append(f"{t.task_id:<12} {t.agent_type:<16} {status:<11} {bg:<3} {t.description}")
+        self._emit("\n".join(lines))
         return SlashResult(SlashKind.HANDLED)
 
     # -- Debug commands ----------------------------------------------------

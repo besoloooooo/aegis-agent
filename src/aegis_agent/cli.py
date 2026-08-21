@@ -634,30 +634,39 @@ def _repl(
     """
     global _turn_active
     prefill = ""
+    # A background-subagent completion queued for injection as the next turn's
+    # input.  Set after a turn that left notifications pending; consumed at the
+    # top of the loop so the model is told *without* the user typing and
+    # *without* any polling.
+    pending_inject: str | None = None
     while True:
-        line = tui.prompt(default=prefill)
-        prefill = ""
-        if line is None:  # EOF / Ctrl-C
-            break
-        if not line:
-            continue
-        if line.lower() in _EXIT_COMMANDS:
-            break
-        if line.startswith("/"):
-            result = slash.handle(line)
-            if result is not None:
-                if result.kind is SlashKind.EXIT:
-                    break
-                if result.kind is SlashKind.HANDLED:
-                    prefill = result.prefill
-                    continue
-                turn_input = result.text  # REQUEUE (/retry)
-                if not turn_input:
-                    continue
+        if pending_inject is not None:
+            turn_input = pending_inject
+            pending_inject = None
+        else:
+            line = tui.prompt(default=prefill)
+            prefill = ""
+            if line is None:  # EOF / Ctrl-C
+                break
+            if not line:
+                continue
+            if line.lower() in _EXIT_COMMANDS:
+                break
+            if line.startswith("/"):
+                result = slash.handle(line)
+                if result is not None:
+                    if result.kind is SlashKind.EXIT:
+                        break
+                    if result.kind is SlashKind.HANDLED:
+                        prefill = result.prefill
+                        continue
+                    turn_input = result.text  # REQUEUE (/retry)
+                    if not turn_input:
+                        continue
+                else:
+                    turn_input = _maybe_route_skill(runtime, line, tui)
             else:
                 turn_input = _maybe_route_skill(runtime, line, tui)
-        else:
-            turn_input = _maybe_route_skill(runtime, line, tui)
         session_id = slash.session_id
         try:
             state = tui.begin_turn()
@@ -682,7 +691,42 @@ def _repl(
             tui.say(f"[error] {exc}")
             continue
         _maybe_snapshot(runtime, session_id, snapshot_every_n)
+        # Deliver any background-subagent completions and teammate messages as
+        # the next turn's input (push model — no polling).
+        pending_inject = _collect_agent_notifications(runtime, tui)
     tui.bye()
+
+
+def _collect_agent_notifications(runtime: AgentRuntime, tui: Tui) -> str | None:
+    """Drain finished background subagents AND teammate messages for the lead.
+
+    Returns ``None`` when nothing is waiting (the REPL just waits for the
+    user), otherwise a message fed back as the next turn so the model reacts.
+    Background-subagent completions and inter-agent (team) messages share this
+    single between-turns injection seam.  A short status line is surfaced to
+    the user so the injected turn isn't a surprise.
+    """
+    parts: list[str] = []
+
+    notifications = runtime.drain_subagent_notifications()
+    for n in notifications:
+        tui.say(f"[subagent] {n.agent_type} {n.status.value}: {n.description}")
+    if len(notifications) == 1:
+        parts.append(notifications[0].render())
+    elif notifications:
+        parts.append(
+            "Several background subagents finished:\n\n"
+            + "\n\n".join(n.render() for n in notifications)
+        )
+
+    team_messages = runtime.drain_team_messages()
+    for m in team_messages:
+        tui.say(f"[team] {m.sender} → you: {' '.join(m.content.split())[:60]}")
+        parts.append(m.render_for_recipient())
+
+    if not parts:
+        return None
+    return "\n\n".join(parts)
 
 
 def _maybe_snapshot(runtime: AgentRuntime, session_id: str, every_n: int) -> None:
