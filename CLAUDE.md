@@ -6,21 +6,21 @@ There are two repositories in the current VS Code workspace:
 
 Target repository:
 
-/home/administrator/projects/aegis-agent
+/home/nacha/aegis-agent
 
 Reference repository:
 
-/home/administrator/projects/hermes-agent
+/home/nacha/hermes-agent
 
 The Hermes repository is read-only reference source code.
 
 Never modify, rename, delete, format, move, commit, or generate files under:
 
-/home/administrator/projects/hermes-agent
+/home/nacha/hermes-agent
 
 All new source code, tests, scripts, configuration, and documentation must be created under:
 
-/home/administrator/projects/aegis-agent
+/home/nacha/aegis-agent
 
 Before editing any file, verify that its absolute path belongs to the target repository.
 

@@ -72,7 +72,7 @@ Hermes' UX.
   auxiliary client) are scheduled for later stages and tracked in
   `docs/extraction-plan.md` §3 and §7.
 - No Hermes file was modified.  All Aegis code lives under
-  `/home/administrator/projects/aegis-agent`.
+  `/home/nacha/aegis-agent`.
 
 ## Stage 4 — skills subsystem & dynamic prompt injection
 
@@ -122,7 +122,7 @@ manages the background processes it spawns.
 | Aegis file | Relationship | Hermes source → symbol | Notes |
 |---|---|---|---|
 | `src/aegis_agent/tools/process_registry.py` | **ADAPT** | `tools/process_registry.py` → `ProcessRegistry`, `ProcessSession`, `spawn_local`, `_reader_loop`, `_reconcile_local_exit`, `poll`/`read_log`/`wait`/`kill_process`/`write_stdin`/`submit_stdin`/`close_stdin`/`list_sessions`, `_prune_if_needed` | Local-only port of the in-memory background-process registry: `_running`/`_finished` dicts + lock, per-session rolling 200KB `output_buffer` + daemon reader thread, `subprocess.Popen` + `os.setsid` process group, TTL + LRU pruning, orphaned-pipe reconcile fix, psutil / `taskkill /T /F` tree-kill, ANSI strip. Dropped: sandbox backends (`spawn_via_env`), ptyprocess PTY, watch-pattern rate limiting + global circuit breaker, gateway notification routing, crash-recovery checkpoint file, per-profile HOME isolation, provider-secret env scrubbing. Shell wrapper simplified to `/bin/sh -c` / `cmd /c`. Attribution header retained. |
-| `src/aegis_agent/tools/builtin/terminal.py` | **REWRITE** | `tools/terminal_tool.py` → `terminal_tool` | `{command, timeout, workdir, background, pty}` → foreground `{output, exit_code, error}` (timeout → exit_code 124, head/tail truncation, grep/diff exit-code-meaning note, server-command → background hint) or background `{session_id, pid, ...}`. Dangerous-command guardrail retained (operator-only `allow_dangerous_shell`). Dropped: sandbox backends, approval/`force`, watch patterns, notify_on_complete framing. |
+| `src/aegis_agent/tools/builtin/terminal.py` | **REWRITE** | `tools/terminal_tool.py` → `terminal_tool` | `{command, timeout, workdir, background, pty}` → foreground `{output, exit_code, error}` (timeout → exit_code 124 with partial stdout/stderr preserved, head/tail truncation, grep/diff exit-code-meaning note, server-command → background hint) or background `{session_id, pid, ...}`. Dangerous-command guardrail retained (operator-only `allow_dangerous_shell`). Dropped: sandbox backends, approval/`force`, watch patterns, notify_on_complete framing. |
 | `src/aegis_agent/tools/builtin/process.py` | **REWRITE** | `tools/terminal_tool.py` process actions (delegating to `process_registry`) | Thin wrapper mapping `action ∈ {list, poll, log, wait, kill, write, submit, close}` onto the shared `ProcessRegistry`; unknown id → `{status: "not_found"}`. |
 | `src/aegis_agent/tools/builtin/run_shell.py` | **removed** | — | Superseded by `terminal`. Its schema/registration and `RunShellTool` references removed; `tools/schemas.RUN_SHELL` deleted. |
 | `src/aegis_agent/models/fake.py`, `tui.py`, `cli.py`, `tools/danger.py`, `tools/registry.py` (docstrings/help) | **original** | — | Updated `run_shell` → `terminal` references (demo shorthand, result renderer, CLI help, guardrail docstrings). |

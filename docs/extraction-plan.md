@@ -1,6 +1,6 @@
 # Aegis Agent — Hermes 核心链路抽取计划 (Extraction Plan)
 
-> 阶段 0 只读架构分析的产物。本文档基于 `/home/administrator/projects/hermes-agent` 的**真实源码**，
+> 阶段 0 只读架构分析的产物。本文档基于 `/home/nacha/hermes-agent` 的**真实源码**，
 > 所有文件路径、函数名、行号均来自实际代码（行号可能随上游变化，但符号名稳定）。
 >
 > Hermes 当前版本：`hermes-agent 0.15.1`，许可证 **MIT**（© 2025 Nous Research）。
