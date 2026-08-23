@@ -127,9 +127,11 @@ class TerminalTool:
             # Cooperative cancel: the child is already killed.  Propagate so
             # the runtime stops the turn without persisting a partial result.
             raise
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            partial_output = _as_text(exc.output) if exc.output else ""
+            partial_stderr = _as_text(exc.stderr) if exc.stderr else ""
             payload = {
-                "output": "",
+                "output": partial_output + partial_stderr,
                 "exit_code": 124,
                 "error": f"Command timed out after {timeout}s and was killed.",
             }
@@ -214,23 +216,35 @@ def _wait_and_drain(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _kill_proc(proc)
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            raise subprocess.TimeoutExpired(
+                proc.args,
+                timeout,
+                output="".join(stdout_parts),
+                stderr="".join(stderr_parts),
+            )
         try:
             out, err = proc.communicate(timeout=min(0.2, remaining))
             if out:
-                stdout_parts.append(out)
+                stdout_parts[:] = [_as_text(out)]
             if err:
-                stderr_parts.append(err)
+                stderr_parts[:] = [_as_text(err)]
             break
         except subprocess.TimeoutExpired as exc:
-            # Data read so far is only on the exception; retrying communicate
-            # continues from where it left off, so append it here.
+            # Python exposes cumulative partial output on each timeout and may
+            # expose it as bytes even with ``text=True``.  Replace, don't append.
             if exc.output:
-                stdout_parts.append(exc.output)
+                stdout_parts[:] = [_as_text(exc.output)]
             if exc.stderr:
-                stderr_parts.append(exc.stderr)
+                stderr_parts[:] = [_as_text(exc.stderr)]
             continue
     return proc.returncode, "".join(stdout_parts) + "".join(stderr_parts)
+
+
+def _as_text(value: str | bytes) -> str:
+    """Normalize fragments exposed by ``TimeoutExpired`` before joining."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _kill_proc(proc: subprocess.Popen) -> None:

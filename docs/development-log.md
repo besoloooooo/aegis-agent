@@ -2533,3 +2533,70 @@ project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 新增 2 个测试（project 记忆目录出现且确在项目根之外、personal 同样给出目录）；既有
 "project 根 + 工具 cwd" 测试措辞随分节文案更新。
 
+---
+
+## 后续修复：MCP 下载超时诊断 + terminal partial-output timeout 修复
+
+### Task goal and original problem
+
+用户在真实 REPL 中用 `paper_search` MCP 找论文时，搜索工具可用，但
+`mcp_paper_search_download_arxiv({paper_id:"2001.03093", save_path:"/mnt/c/Users/nacha/Desktop"})`
+等待 180 秒后返回 `MCP operation timed out after 180s`。随后模型改用 `terminal` 调
+`wget` / `curl` 下载同一 PDF，又失败为 `Tool execution failed: TypeError: sequence item 0: expected str instance, bytes found`；最后用 Python `urllib.request` 才成功。
+
+本次目标不是迁移新的论文 MCP，也不修改用户的 `~/.aegis/config.yaml`，而是定位 Aegis 自身在这个链路中暴露的缺陷：MCP 超时是否属于客户端错误、以及 terminal fallback 为什么会把可恢复的 shell 结果变成 Python 类型异常。
+
+### Relevant behavior and source locations
+
+- `src/aegis_agent/mcp/config.py`：MCP server 配置合并默认值，`timeout` 是每个工具调用的 deadline；用户配置中 `paper_search.timeout=180`。
+- `src/aegis_agent/mcp/client.py`：`call_tool` 通过 `_run_on_loop(..., effective_timeout)` 等待 `session.call_tool`；超时会取消 future，并把 `TimeoutError("MCP operation timed out after 180s")` 包成 `{"error":"MCP call failed: ..."}`。搜索工具已经成功说明 stdio discovery / wrapper 注册是正常的；下载慢到 180 秒是单次 MCP 工具/上游网络问题，不是 Aegis MCP 发现失效。
+- `src/aegis_agent/tools/builtin/terminal.py`：前台命令用 `Popen(text=True)` + 循环 `communicate(timeout=0.2)` 排水。Python 的 `TimeoutExpired.output` / `stderr` 可能仍是 **bytes**，且每次 timeout 暴露的是**累计 partial output**，不是新增 delta；旧代码直接 append 后 `"".join(...)`，因此既会 bytes/string 类型崩溃，也会重复拼接 partial output。
+
+### Migration decision
+
+- MCP：**无代码迁移 / 诊断结论**。当前 Aegis 行为符合已实现的最小 MCP 合同（配置 deadline → error result，不 crash）。真正的后续能力是 reconnect / retry / progress / per-tool timeout policy，属于 README roadmap 里已有的 MCP reconnect/circuit breaker 后续项，不在本次修复范围内。
+- terminal：**REWRITE path 的可靠性修复**。`terminal.py` 本来就是 Aegis 自写的最小行为等价工具；本次只修补 stdout/stderr 排水与 timeout payload，不扩大 shell 功能。
+
+### Aegis design, data flow, key functions
+
+修复点集中在 `terminal.py`：
+
+1. `_wait_and_drain` 捕获 `subprocess.TimeoutExpired` 后，用 `_as_text(value: str | bytes)` 将 partial stdout/stderr 归一为 UTF-8 replacement-decoded `str`；
+2. 因 `TimeoutExpired.output` 是累计值，使用 `stdout_parts[:] = [...]` / `stderr_parts[:] = [...]` 替换当前缓存，而不是 append；
+3. 到达总 deadline 时，kill 子进程并抛带 `output`/`stderr` 的 `TimeoutExpired`，让 `_run_foreground` 能继续返回标准 terminal JSON：`{"output": <partial>, "exit_code": 124, "error": "Command timed out ..."}`。
+
+未改变：危险命令 guardrail、`allow_dangerous_shell` operator-only 语义、后台进程、输出截断、grep/diff exit-code 解释、cooperative cancel。
+
+### Reliability invariants, edge cases, failure handling
+
+- terminal 工具 handler 不应因 Python subprocess 的 partial-output 类型差异而抛异常；工具级失败必须回到 `ToolResult(is_error=True)`。
+- 超时仍 kill + reap 子进程，仍用 `exit_code=124` 表达。
+- partial stdout 与 partial stderr 都保留；二进制/非 UTF-8 片段用 `errors="replace"`，不污染 JSON 编码。
+- MCP 工具超时继续是模型可见的 JSON error result；不会污染 Python 异常栈，也不会持久化半成品 MCP 内部状态。
+
+### Tests and measured results
+
+新增 `tests/test_terminal.py` 两个回归用例：
+
+- command 写 stdout 后 sleep 到 timeout：返回 `exit_code=124` 且 `output == "partial"`；
+- command 写 stderr 后 sleep 到 timeout：同样保留 `partial`。
+
+验证结果：
+
+- `uv run pytest tests/test_terminal.py -q` → **15 passed**；
+- `uv run pytest -q` → **562 passed, 2 skipped**；
+- `uv run ruff check src/aegis_agent/tools/builtin/terminal.py tests/test_terminal.py` → **All checks passed**；
+- `uv run ruff check .` → **2 个既有告警**（`src/aegis_agent/cli.py:431` `DTZ005`、`src/aegis_agent/mcp/client.py:457` `SIM115`），与本次改动无关，未做广泛清理。
+
+尝试直接连接外部 `paper-search-mcp` 做端到端 MCP 复现时，被当前 Claude Code 权限策略拒绝（外部 package execution 需要显式授权），因此没有擅自运行或修改该外部 MCP。
+
+### Trade-offs, remaining limitations, TODOs
+
+- 这次只修 Aegis 自身确定的 terminal bug；`paper-search-mcp` 下载 180 秒超时的根因可能在上游包、arXiv/网络、WSL 到 Windows 路径写入、或该工具的下载实现中。
+- Aegis MCP 仍没有 per-tool 进度、下载重试、自动 fallback、server reconnect/circuit breaker；README roadmap 已有 MCP reconnect/circuit breaker，建议作为下一阶段。
+- 若要继续查 `paper-search-mcp`，需要用户授权执行该外部包，或用户在 Aegis 里把该工具 timeout 提高后提供日志。
+
+### Interview-ready explanation
+
+"这次我把用户实测的失败拆成两层：MCP 搜索能跑说明连接和 schema wrapper 没坏，`download_arxiv` 是单个外部 MCP 工具超过了配置的 180 秒 deadline，Aegis 正确把它转成 error result；真正的 Aegis bug 是 fallback shell 工具。Python 的 `communicate(timeout=...)` 在 text mode 下仍可能把 partial output 放在 `TimeoutExpired.output` 里作为 bytes，而且这个 partial 是累计值。旧代码把它当 str delta append，最后 join 就炸。修复后我们先把 partial 统一 decode 成 str，再替换累计缓存，超时时把已捕获输出放回标准 `{output, exit_code:124, error}` payload。测试覆盖 stdout/stderr 两条 partial-output timeout 路径，全量测试 562 passed。"
+

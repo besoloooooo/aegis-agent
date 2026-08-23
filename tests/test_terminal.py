@@ -42,6 +42,24 @@ def test_terminal_timeout(tmp_path):
     assert "timed out" in payload["error"].lower()
 
 
+def test_terminal_handles_partial_output_on_timeout(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": "printf partial; sleep 5", "timeout": 1}, ctx)
+    assert result.is_error
+    payload = json.loads(result.content)
+    assert payload["exit_code"] == 124
+    assert payload["output"] == "partial"
+
+
+def test_terminal_handles_partial_stderr_on_timeout(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": "printf partial >&2; sleep 5", "timeout": 1}, ctx)
+    assert result.is_error
+    payload = json.loads(result.content)
+    assert payload["exit_code"] == 124
+    assert payload["output"] == "partial"
+
+
 def test_terminal_requires_command(tmp_path):
     tool, _, ctx = _make(tmp_path)
     assert tool.run({}, ctx).is_error

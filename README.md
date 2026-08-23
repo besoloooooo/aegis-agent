@@ -301,6 +301,8 @@ skill_manage
 
 Additional tools can be exposed through MCP.
 
+`terminal` foreground timeouts return `exit_code: 124` and preserve any stdout/stderr captured before the process is killed, so agents can recover with alternate commands instead of losing partial diagnostics.
+
 ---
 
 ## 🧩 Skills & MCP
@@ -325,7 +327,7 @@ stdio
 Streamable HTTP
 ```
 
-with schema normalization and runtime tool wrappers.
+with schema normalization and runtime tool wrappers. Individual MCP tool calls still obey the server's configured `timeout`; a slow upstream operation is returned to the model as an MCP error result rather than crashing the agent loop.
 
 ---
 
