@@ -440,6 +440,24 @@ Aegis 通过**依赖注入 + 单向分层**（§5 依赖方向）根除这些环
 - **范围**：重连机制（server 断开后自动恢复）、断路器（连续失败降级）、`tools/list_changed` 动态刷新。
 - **当前**：连接成功时工具固定，server 断开后调用直接报错。
 
+#### Multi-agent 增强（Stage 20 已完成基础能力）
+
+Stage 20 已完成 `Agent`、`team_create`、`send_message` 和 `/agents` 的基础能力，
+以下是仍未完成的增强项：
+
+- **自定义 agent definitions**：目前只有内置 `explore`、`general-purpose` 和 implicit
+  fork；未实现从 `.aegis/agents/*.md` 加载项目级 agent 定义、工具白名单、提示词和迭代预算。
+- **Team 持久化**：当前 team、teammate mailbox 和 teammate transcript 主要在进程内存中；
+  进程退出后无法恢复 team roster、未处理消息或 teammate 上下文。
+- **跨进程 / 远程通信**：当前使用 `InProcessTransport`，未实现 durable cross-process mailbox、
+  Redis/SQLite transport 或 remote A2A transport。
+- **Team 可观测性**：`/agents` 目前只列 subagent task 的 id/type/status/background/description；
+  未实现完整的 team roster、teammate 状态、mailbox 和 transcript 摘要查看命令（可考虑新增 `/teams`）。
+- **Agent 调度策略**：当前没有按任务自动选择 provider、模型或 cheap worker 的路由策略，也没有
+  面向不同 teammate 的资源配额与优先级调度。
+- **可靠性增强**：已有并发上限、嵌套深度限制、取消、通知队列和 team boundary 测试；仍可补充
+  进程崩溃恢复、重复模型请求/重复工具结果的端到端故障注入，以及跨进程 team 竞态测试。
+
 #### 系统提示词补全（Stage 13 已完成基础框架，Hermes 高级段未迁移）
 
 - **已做（Stage 13）**：`SystemPromptBuilder` + `PromptContributor` 缝在 Stage 4 就搭好了；Stage 13 把 Aegis 真有能力对应的段落填进去——去品牌身份段、finishing-the-job、tool-use enforcement（注册表非空才出）、模型身份（provider 有 model 才出）、环境提示（Host/home/cwd + WSL）、date-only 时间戳。刻意排除：`memory`、`session_search`、USER.md、SOUL.md、context files、kanban、computer-use、平台提示、Nous 品牌。组合顺序与不变式有测试守护（`tests/test_prompt_sections.py`）。

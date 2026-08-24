@@ -13,35 +13,35 @@
 
 Aegis Agent 是一个**轻量、可恢复、可扩展的 Agent Runtime**，通过从
 [Hermes](https://github.com/NousResearch/hermes-agent)（© 2025 Nous Research，MIT）
-的核心运行时行为中**抽取、简化、模块化**而来。
+和 Claude Code reference implementations 中**抽取、简化、适配、重写**有用的运行时行为而来。
 
 定位（见 `CLAUDE.md` §2）：
 
 - 仓库：`aegis-agent`，Python 包：`aegis_agent`，CLI 命令：`aegis`
-- 只保留 Hermes 的**核心链路**：交互式 CLI、Agent Runtime、Agent Loop、模型 provider 抽象、
-  OpenAI-compatible provider、fake provider、工具注册/执行/内置工具、上下文构建、会话存储。
+- 只保留 Hermes 与 Claude Code 中适合 Aegis 当前里程碑的**核心链路**：交互式 CLI、Agent Runtime、Agent Loop、模型 provider 抽象、
+  OpenAI-compatible provider、fake provider、工具注册/执行/内置工具、上下文构建、会话存储、记忆和 multi-agent orchestration。
 - **明确排除**（`CLAUDE.md` §5）：Telegram/Discord、桌面宠物、Web UI、语音、浏览器自动化、
-  定时任务、Hermes 全部工具与 provider、安装脚本与品牌 UI 等。
+  定时任务、Hermes/Claude Code 全部工具与 provider、安装脚本、品牌 UI、远程 A2A 产品能力等。
 
 ### 当前进度
 
-三个里程碑已完成：
+本文档记录到 Stage 20。Aegis 当前已从单 Agent Runtime 扩展到可恢复会话、上下文压缩、记忆、搜索、slash commands 和 multi-agent orchestration：
 
-| 阶段 | 主题 | 状态 |
-|---|---|---|
-| Stage 1 | minimal Agent Runtime skeleton（fake provider + 内存会话 + 内置工具 + Agent Loop） | 已完成 |
-| Stage 2 | OpenAI-compatible provider + 流式工具调用片段组装 + 消息净化 + 危险命令护栏 | 已完成 |
-| Stage 3 | 实时终端 UI + 流式输出（prompt_toolkit 输入 + rich 输出 + ANSI Shadow banner + 颜文字 spinner） | 已完成 |
-| Stage 4 | Skills 子系统 + 动态系统提示注入（SKILL.md 发现/加载/路由、`skills_list`/`skill_view` 渐进式工具、`/skill-name` 斜杠命令、`SystemPromptBuilder` + `PromptContributor` 注入缝） | 已完成 |
-| Stage 5 | 轻量 MCP 客户端（stdio + Streamable HTTP、schema adapter 三阶段 pipeline、`MCPToolWrapper` 注册进 ToolRegistry、`MCPToolsGuidance` 提示注入、可选 `mcp` SDK 依赖） | 已完成 |
+| 分组 | 已完成能力 |
+|---|---|
+| Core runtime | Stage 1-3：最小 Agent Loop、OpenAI-compatible provider、流式工具调用、实时终端 UI。 |
+| Tools / skills / MCP | Stage 4-9：`SKILL.md` 技能、轻量 MCP、文件编辑、terminal/process、web tools、`skill_manage`。 |
+| Context / recovery | Stage 10-13：三阶段上下文压缩、reasoning_content、SQLite 持久化、快恢复快照、SQLite/Redis leases、动态系统提示。 |
+| Memory / search | Stage 14-16、19：personal/project long-term memory、relevance recall、background extraction、SQLite FTS5 `session_search`。 |
+| Interactive UX | Stage 17-18：REPL slash-command suite 与相关交互修复。 |
+| Multi-agent orchestration | Stage 20：`Agent` one-shot/fork/background subagents、`team_create` persistent teammates、`send_message` inter-agent messaging、`/agents` task introspection。 |
 
-> 注：`README.md` 顶部仍标注 "Stage 2"，未随 Stage 3 更新；以本文与 `docs/source-map.md` 为准。
+### 后续计划（尚未做）
 
-### 计划实现（尚未做）
-
-SQLite/Redis 会话存储、租约（lease）、resume/checkpoint 恢复、上下文压缩、
-多 provider failover/限流、并发工具执行、超大工具结果外置存储。
-均记录于 `docs/extraction-plan.md` 与 `docs/source-map.md` 的 Notes 节，源码中**未实现**。
+- 自定义 agent definitions loader（例如 `.aegis/agents/*.md`）；
+- durable / cross-process team mailbox、remote A2A transport、teammate restart recovery；
+- `/teams` 或更完整的 team roster / teammate inspection UI；
+- MCP reconnect / circuit breaker、guardrail circuit breaker、并发工具执行等更高阶运行时能力。
 
 ---
 
@@ -68,6 +68,7 @@ cli → runtime → models / tools / context / sessions
 | `sessions` | `SessionRepository` Protocol + 内存实现 | `repository.py`, `memory_store.py`, `models.py` |
 | `runtime` | Agent Runtime + Agent Loop + 迭代预算 + `TurnEvent` | `runtime.py` |
 | `events` | `ModelEvent` + `collect_response`（流→统一响应） | `events.py` |
+| `agents` | subagents、background tasks、teams、inter-agent messaging | `agents/definitions.py`, `agents/agent_tool.py`, `agents/manager.py`, `agents/team.py`, `agents/teammate.py`, `agents/messaging.py` |
 | `cli` / `tui` | Typer 入口 + prompt_toolkit/rich 终端 UI | `cli.py`, `tui.py` |
 | `exceptions`, `env` | 统一异常、无依赖 `.env` loader | `exceptions.py`, `env.py` |
 
@@ -328,37 +329,30 @@ uv run ruff check .
 uv run mypy src           # 可选
 ```
 
-### 实际结果（本次整理时复核）
+### 本次文档整理的直接验证范围
 
-- `uv run ruff check .` → **All checks passed**。
-- `uv run pytest -q` → **221 passed, 1 skipped**（skip 为 `test_openai_provider.py`
-  的 `@pytest.mark.integration` 真端点冒烟测试，需 `AEGIS_RUN_INTEGRATION=1` + `AEGIS_*` 配置）。
+本次是 docs-only 更新，最小相关测试集是 multi-agent 的直接覆盖：
+
+```bash
+uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_team.py
+```
+
+本节的具体执行结果以本文末尾 Stage 20 的 `Tests and evidence` 记录为准；未重新执行的全量命令不得写成通过。
 
 ### 测试策略与覆盖
 
-- **确定性 fake**：核心 Agent Loop 用 `FakeModelProvider`（脚本队列 + 规则兜底）和
-  `FakeOpenAIClient`（`tests/fakes.py`，模拟 OpenAI SDK 的 chunk/completion 形状），全程离线。
-- **不变量测试**（`CLAUDE.md` §9）：一个 `client_msg_id` 只持久化一条逻辑消息、单调 `seq`、
-  无重复模型请求、无跨会话历史、checkpoint recovery 等于全量重放（后者属未实现的 SQLite 阶段，
-  当前仅内存版）、context 不改原文（`test_context_builder_does_not_mutate_source`）。
-- **守卫测试**：`test_loop_does_not_import_concrete_provider` 读 `runtime.py` 源码断言不含
-  `openai_compat` / `OpenAICompatibleProvider`，强制保持 provider 无关。
-- 测试文件分布：`test_sessions`(6) + `test_runtime`(11) + `test_fake_provider`(9) +
-  `test_tools`(16) + `test_runtime_streaming`(7) + `test_openai_provider`(~17, 含 1 skip) +
-  `test_stream` + `test_sanitize` + `test_cli`(4) + `test_tui`(3) + `test_env` +
-  `test_skills_frontmatter`(9) + `test_skills_loader`(18) + `test_skills_prompt`(10) +
-  `test_skills_tools`(12) + `test_skills_router`(9) + `test_context_invariants`(6)。
+- **确定性 fake**：核心 Agent Loop、subagents、teams 和 memory side queries 使用 `FakeModelProvider` / fake clients，全程离线，不要求真实付费模型 API。
+- **不变量测试**（`CLAUDE.md` §9）：一个 `client_msg_id` 只持久化一条逻辑消息、单调 `seq`、无重复模型请求、无跨会话历史、checkpoint recovery 等于全量重放、context compression 不改原始消息。
+- **守卫测试**：runtime/provider 解耦、dangerous shell operator-only、context source-of-truth、subagent transcript isolation、team boundary enforcement。
+- **Multi-agent 覆盖**：`tests/test_subagent.py`、`tests/test_subagent_v2.py`、`tests/test_team.py` 覆盖 `Agent`、fresh/fork/background、notification drain、concurrency/depth guards、kill、`team_create`、`send_message`、persistent teammate idle/wake、broadcast、team boundary 和 `/agents`。
 
 ### 边界情况已覆盖
 
-工具异常转 `{"error":...}`、未知工具、畸形参数 JSON 修复、孤立代理项清洗、流式中途取消丢弃
-半成品、max-iterations 停止、危险命令默认拦截且模型不可绕过、`on_event` 事件顺序。
+工具异常转 `{"error":...}`、未知工具、畸形参数 JSON 修复、孤立代理项清洗、流式中途取消丢弃半成品、max-iterations 停止、危险命令默认拦截且模型不可绕过、`on_event` 事件顺序、subagent 中间历史不污染主会话、team 内消息不跨 team。
 
 ### 真实端点
 
-`test_real_endpoint_smoke` 是 opt-in 集成测试，本次整理**未运行**（无 key）。
-`README.md` 记载此前曾用 DashScope 的 Qwen OpenAI-compatible 模式验证过一轮真实
-`list_directory`→回填→最终答案；该结果为历史记录，非本次复核产出。
+`test_real_endpoint_smoke` 是 opt-in 集成测试，需 `AEGIS_RUN_INTEGRATION=1` + `AEGIS_*` 配置；默认测试不运行真实端点。
 
 ---
 
@@ -366,10 +360,10 @@ uv run mypy src           # 可选
 
 完整对照见 [`docs/source-map.md`](source-map.md)。关系图例：
 
-- **PORT**：几乎照搬，保留 Hermes 版权。
-- **ADAPT**：派生但解耦/简化，保留版权 + 署名头。
-- **REWRITE**：参考 Hermes 的**可观测行为**重写，Aegis 原创（无 Hermes 版权），但记录行为来源。
-- **original**：Aegis 原创，无 Hermes 派生。
+- **PORT**：几乎照搬 reference source，保留适用版权。
+- **ADAPT**：派生但解耦/简化，保留适用 attribution。
+- **REWRITE**：参考 reference source 的**可观测行为或架构**重写，Aegis 原创实现，但记录行为来源。
+- **original**：Aegis 原创 wiring / implementation，无复制或实质派生代码。
 
 ### 汇总
 
@@ -390,10 +384,12 @@ uv run mypy src           # 可选
 | `tui._ThinkingRenderable` | ADAPT | `agent/display.py:KawaiiSpinner` |
 | `tui` banner / `Tui` | REWRITE | `hermes_cli/banner.py`、`cli.py`（prompt_toolkit 输入） |
 | `skills.*` | ADAPT | `agent/skill_utils.py`、`agent/skill_commands.py`、`tools/skills_tool.py`、`agent/prompt_builder.py` |
+| `agents.Agent` / subagent lifecycle | ADAPT / REWRITE | Claude Code `Agent` tool、async subagent task、fork/background behavior |
+| `agents.team_*` / teammate messaging | ADAPT / REWRITE | Claude Code `team_create`、`send_message`、persistent teammate / mailbox behavior |
 | `context.system_prompt` | ADAPT | `agent/system_prompt.py:build_system_prompt_parts` |
 | `cli._select_provider`、`exceptions`、`env` 等 | original | — |
 
-适配/派生文件均带 Hermes 署名头（`# Portions adapted from Hermes ...`）；
+适配/派生文件按来源保留适用 attribution；Hermes-derived files use the existing `# Portions adapted from Hermes ...` header where required.
 `THIRD_PARTY_NOTICES.md` 收录 Hermes MIT 全文与运行时依赖许可（openai/typer/rich/pydantic/
 pyfiglet MIT，prompt_toolkit BSD-3，wcwidth MIT）。
 
@@ -403,36 +399,28 @@ pyfiglet MIT，prompt_toolkit BSD-3，wcwidth MIT）。
 
 ### 已知限制（实现层面）
 
-1. ~~**持久化**：只有内存会话~~ → 已实现（Stage 12：SQLite 会话存储 +
-   消息级幂等落盘 + 快照快速恢复 + SQLite/Redis 会话租约；`--resume` / `--db` /
-   `--ephemeral` / `--no-lease` / `--snapshot-every-n`）。无 Redis 真机集成测试。
-2. ~~**上下文压缩**：未实现~~ → 已实现（Stage 10 移植三阶段管线，Stage 11 接入
-   Agent Loop：`--context-max-tokens` / `--no-compress`，超大工具结果转存
-   `~/.aegis/tool-result-cache`）。
-3. **Skills**：未加载、未路由。
+1. **Team durability**：Stage 20 的 team / teammate transport 是 in-process；team roster、mailbox、teammate transcript 不具备跨进程或重启后的 durable recovery。
+2. **Custom agents**：当前只有内置 `explore` / `general-purpose` 和 implicit fork；还没有 `.aegis/agents/*.md` 这类自定义 agent definition loader。
+3. **Agent inspection UI**：`/agents` 只列 subagent task 状态，不是完整 team roster、teammate transcript 或 mailbox 管理界面。
 4. **多 provider**：无 failover / rate-guard / 凭证池（Stage 2 有意砍掉）。
 5. **工具执行**：顺序执行，无并发；无 guardrails 链。
-6. **TUI**：逐字符流式在**管道/重定向**下因 stdout 缓冲看不出渐进（真 TTY 才可见）；
-   banner 在 <120 列的窄终端会被 figlet 折行或由终端自行折行。
-7. **真实端点**：本会话未跑真 OpenAI e2e（无 key），仅 fake + 单元测试。
+6. **MCP**：无 reconnect / circuit breaker / per-tool progress policy；慢 upstream 只返回配置 timeout 的错误结果。
+7. **TUI**：逐字符流式在**管道/重定向**下因 stdout 缓冲看不出渐进（真 TTY 才可见）；banner 在 <120 列的窄终端会被 figlet 折行或由终端自行折行。
+8. **真实端点**：默认测试不跑真 OpenAI-compatible e2e；`test_real_endpoint_smoke` 仍是 opt-in integration。
 
 ### 已知缺陷 / 风险
 
-- `uv run mypy src` 报 1 个**既有**错误：`src/aegis_agent/models/openai_compat.py:182`
-  `sanitize_surrogates(message.tool_call_id)` 传了 `str | None`（`tool_call_id` 可空）。
-  属 Stage 2 遗留，与本次 Stage 3 无关，未在本任务范围修复。
-- `README.md` 顶部状态标注 "Stage 2"，未随 Stage 3 更新（文档滞后，非代码缺陷）。
+- `uv run ruff check .` 的最近记录仍有 2 个既有告警（`src/aegis_agent/cli.py:431` `DTZ005`、`src/aegis_agent/mcp/client.py:457` `SIM115`），与 multi-agent 文档更新无关。
 - `aegis-agent.png` 仅作项目品牌图（README/文档），终端不可靠显示 PNG，故 CLI 用 ASCII banner。
 
 ### 计划的后续里程碑（未实现）
 
-- SQLite 会话存储 + checkpoint/tail recovery + 恢复时 corrupted checkpoint 安全回退到全量重放。
-- SQLite/Redis 会话租约（单 owner）。
-- 分层上下文压缩（只改派生视图，原文不动）。
-- 超大工具结果外置存储 + 预览。
-- 循环检测与熔断。
-- Skill 加载与路由。
-- 真 OpenAI provider 的端到端冒烟（opt-in integration）常态化。
+- 自定义 agent definition discovery / loading；
+- durable / cross-process team mailbox、remote A2A transport、teammate restart recovery；
+- `/teams` 或增强 `/agents`，展示 team roster、teammate 状态、mailbox 与 transcript 摘要；
+- MCP reconnect / circuit breaker；
+- guardrail circuit breaker；
+- 并发工具执行。
 
 ---
 
@@ -440,8 +428,8 @@ pyfiglet MIT，prompt_toolkit BSD-3，wcwidth MIT）。
 
 按"一句话能复述"组织，快速复习用。
 
-1. **项目定位**：从 Hermes 抽核心链路做的轻量 Agent Runtime，只保留 CLI + Loop + provider 抽象 +
-   工具 + 上下文 + 会话；明确砍掉所有消息集成与品牌 UI。
+1. **项目定位**：从 Hermes 与 Claude Code reference sources 抽取/适配/重写核心 runtime 行为做的轻量 Agent Runtime，只保留 CLI + Loop + provider 抽象 +
+   工具 + 上下文 + 会话 + 记忆 + multi-agent orchestration；明确砍掉消息网关、品牌 UI 和远程 A2A 产品能力。
 2. **架构**：单向依赖 `cli → runtime → {models, tools, context, sessions}`；runtime 只依赖四个
    Protocol（`ModelProvider`/`SessionRepository`/`Tool`/`ContextBuilder`），不碰 Typer/SQL/Redis/具体 provider。
 3. **Agent Loop**：guard（interrupt + IterationBudget）→ build 派生上下文 → `provider.stream`
@@ -456,20 +444,19 @@ pyfiglet MIT，prompt_toolkit BSD-3，wcwidth MIT）。
 8. **会话不变量**：幂等于 `client_msg_id`、单调 `seq`、会话隔离；内存版线程安全。
 9. **流式 UI**：`on_event` 观察者缝把 `TurnEvent` 回调给 UI，runtime 零改动；prompt_toolkit 输入
    （光标移动/历史）+ rich 输出 + `pyfiglet` banner + `Live` 颜文字 spinner；`DONE` 不转发以免双发 `TURN_END`。
-10. **测试**：105 passed / 1 skipped，全离线确定性 fake；守卫测试强制 runtime 不 import 具体 provider；
-    integration 真端点 opt-in。
-11. **与 Hermes 的关系**：PORT / ADAPT / REWRITE / original 四档，ADAPT 文件带署名头，
-    `docs/source-map.md` 逐项可查，不把派生代码当完全原创。
+10. **测试**：默认测试全离线确定性 fake；multi-agent 直接覆盖在 `tests/test_subagent.py`、`tests/test_subagent_v2.py`、`tests/test_team.py`；integration 真端点 opt-in。
+11. **与 reference sources 的关系**：PORT / ADAPT / REWRITE / original 四档；Hermes / Claude Code 关系在 `docs/source-map.md` 逐项可查，不把派生代码当完全原创。
 12. **Skills 与动态 prompt**：`SystemPromptBuilder` + `PromptContributor` 缝 → `ContextBuilder` 每轮
     实时渲染系统提示；技能用 progressive disclosure（紧凑索引进 prompt、`skills_list`/`skill_view`
     工具按需取完整内容）；`/skill-name` 斜杠命令经 `SkillRouter.invocation_message` 注入；
     所有技能工具实现现有 `Tool` Protocol 插入 `ToolRegistry`，不搬 Hermes 的全局单例模式；
     原始会话消息全程不碰（source-of-truth 不变式）。
+13. **Multi-agent orchestration**：`Agent` 工具把一次性 subagent 跑在复用的 `AgentRuntime` 上，支持 typed fresh、implicit fork、foreground/background；team 则用 `team_create` / `send_message` 把 persistent teammate、in-process mailbox 和 idle wakeup 接进同一 runtime，不引入第二套 loop。
 
 ---
 
-*本文档由 `CLAUDE.md` 规定的开发流程产出，仅修改 `docs/development-log.md`，未改源码与测试。
-Hermes 仓库为只读参考，未修改。*
+*本文档由 `CLAUDE.md` 规定的开发流程产出；每个任务的实际改动范围以对应完成报告为准。
+Hermes / Claude Code reference repositories are read-only references and must not be modified.*
 
 ---
 
@@ -2599,4 +2586,120 @@ project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 ### Interview-ready explanation
 
 "这次我把用户实测的失败拆成两层：MCP 搜索能跑说明连接和 schema wrapper 没坏，`download_arxiv` 是单个外部 MCP 工具超过了配置的 180 秒 deadline，Aegis 正确把它转成 error result；真正的 Aegis bug 是 fallback shell 工具。Python 的 `communicate(timeout=...)` 在 text mode 下仍可能把 partial output 放在 `TimeoutExpired.output` 里作为 bytes，而且这个 partial 是累计值。旧代码把它当 str delta append，最后 join 就炸。修复后我们先把 partial 统一 decode 成 str，再替换累计缓存，超时时把已捕获输出放回标准 `{output, exit_code:124, error}` payload。测试覆盖 stdout/stderr 两条 partial-output timeout 路径，全量测试 562 passed。"
+
+---
+
+### Milestone 20 — Stage 20：Multi-agent orchestration（Agent / team_create / send_message / /agents）
+
+### Problem and goal
+
+Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由一个主 Agent 串行完成：大范围只读调查、当前上下文复核、后台长任务、以及多角色协作都缺少一等建模。目标是在不引入第二套 Agent Loop 的前提下，把 Aegis 扩展成 multi-agent orchestration runtime：
+
+- Main Agent 可以通过 `Agent` 工具派发一次性 subagent；
+- 支持 typed fresh subagent（`explore` / `general-purpose`）和省略 `subagent_type` 的 implicit fork；
+- 支持 foreground 直接返回结果与 background task completion notification；
+- 支持 `team_create` 创建 in-process persistent teammates；
+- 支持 `send_message` 在 lead、teammate、teammate 之间按 team boundary 传递消息；
+- 提供 `/agents` 查看 subagent task 状态。
+
+本阶段的核心约束是：复用 Aegis 已有 `AgentRuntime` / `ToolRegistry` / `SessionRepository` / `ModelProvider` Protocol，不让 Agent Loop 直接依赖 CLI、具体 provider、SQLite SQL、team transport 或全局状态。
+
+### Relevant Hermes and/or Claude Code behavior and source locations
+
+- Claude Code 是本阶段的主要行为与架构参考：`Agent` tool、typed subagents、forked context、background async agent task、completion notification、`team_create`、`send_message`、persistent teammate、message envelope / mailbox、idle wake-up。
+- Hermes 不是本阶段 multi-agent/team 的主要来源；它只间接影响了已有 slash-command registry pattern（Stage 17）和 Agent Loop 抽象方式。
+- Aegis 没有 port Claude Code 的完整 harness、remote sandbox、file mailbox、managed team UI 或产品特定 agent definitions；只保留当前 milestone 需要的 runtime 行为。
+
+### Migration decision: combined adaptation + rewrite
+
+- `AgentTool`、`SubagentManager`、`TeamManager`、`TeamCreateTool`、`SendMessageTool`、`PersistentTeammate` 采用 **ADAPT / REWRITE**：参考 Claude Code 可见行为和架构边界，用 Aegis 的 Python dataclass、Protocol、tool result 和 thread 模型重新实现。
+- `SubagentRunner` 是 **REWRITE**：关键决策是重新实例化同一个 `AgentRuntime`，只替换 agent config、system prompt、工具白名单和私有 session repository。
+- `runtime.py` / `cli.py` / `/agents` 是 **original wiring**：runtime 只注册工具和 drain queues，CLI 只在 turn 间注入通知/消息，不参与 spawn 或 team routing。
+- 没有迁移 Hermes/Claude Code 的大耦合入口文件，也没有复制 reference repository 的产品功能或品牌 UI。
+
+### Aegis design and data flow
+
+**One-shot subagent path**：
+
+1. Main Agent 模型调用 `Agent` tool，传入 `prompt`、可选 `subagent_type`、`run_in_background`。
+2. `AgentTool` 解析 definition：
+   - `subagent_type` 有值时选择内置 fresh agent（`explore` / `general-purpose`）；
+   - `subagent_type` 省略时创建 implicit fork，并从 parent session 读取历史。
+3. `SubagentManager.spawn()` 检查 depth / concurrency guard：
+   - foreground：当前控制流等待结果；
+   - background：daemon thread 运行，立即返回 task id。
+4. `SubagentRunner.run()` 创建 private repository/session，fork 时复制 parent messages 并清掉 `client_msg_id` / `seq`，按 `AgentDefinition.tool_names` 过滤工具，构造 child `AgentRuntime(config=AgentConfig(agent_name=...))`，然后调用同一个 `run_turn()`。
+5. 结果路径：foreground 把 final text 包成 `Agent` tool result；background 完成后把 `TaskNotification` 放进 manager queue，由 runtime/CLI 在后续 turn 之间 drain 并注入主会话。
+
+**Team path**：
+
+1. Main Agent 调 `team_create`，`TeamCreateTool` 创建/复用 active team，并按 `members` 调 `TeamManager.spawn_teammate()`。
+2. 每个 `PersistentTeammate` 有 stable `name`、unique `agent_id`、独立 `session_id` 和私有 `InMemorySessionRepository`。
+3. `InProcessTransport` 提供 per-recipient FIFO inbox + event wakeup；teammate thread 阻塞等待消息，不让模型轮询 inbox。
+4. `send_message` 可以从 lead-bound tool 或 teammate-bound tool 调用，recipient 支持 teammate name、`team-lead`、`*` broadcast。
+5. `TeamManager.send_message()` enforcement：sender 必须属于同一 team；未知成员或 cross-team delivery 返回工具级错误。
+6. Teammate 收到 `<agent-message ...>` 后用同一 transcript 跑一轮，结束后回到 IDLE；idle hook 给 lead inbox 发送状态通知。Runtime/CLI 在 turn 间 drain lead messages。
+
+### Key implementation
+
+- `src/aegis_agent/agents/definitions.py`：`AgentDefinition`、`builtin_agents()`、`fork_agent_definition()`、`READ_ONLY_TOOL_NAMES`。
+- `src/aegis_agent/agents/agent_tool.py`：`AgentTool` schema 与 run path，foreground/background result shaping。
+- `src/aegis_agent/agents/runner.py`：`SubagentRunner`、`SubagentResult`、`SubagentStatus`、fork message seeding、tool filtering、child `AgentRuntime` construction。
+- `src/aegis_agent/agents/manager.py`：`SubagentManager`、`SubagentTask`、`TaskNotification`、notification drain、kill/cancel、concurrency/depth guard。
+- `src/aegis_agent/agents/messaging.py`：`AgentMessage`、`AgentTransport`、`InProcessTransport`。
+- `src/aegis_agent/agents/team.py`：`TeamManager`、`Team`、`TeamMember`、team boundary enforcement、lead inbox drain。
+- `src/aegis_agent/agents/team_tools.py`：`TeamCreateTool`、`SendMessageTool`、`TEAM_CREATE`、`SEND_MESSAGE`。
+- `src/aegis_agent/agents/teammate.py`：`PersistentTeammate`、`TeammateStatus`、idle/wake loop。
+- `src/aegis_agent/runtime.py`：默认注册 `Agent` / `team_create` / `send_message`，暴露 drain seams。
+- `src/aegis_agent/cli.py`：REPL turn 间收集 subagent notifications 和 team messages。
+- `src/aegis_agent/slash_commands.py`：`/agents` task status command。
+
+### Reliability invariants, edge cases, and failure handling
+
+- **Main transcript isolation**：subagent intermediate messages 不写入 parent session；parent 只看到 final report 或 background notification。
+- **Fork isolation**：forked child repo 复制 parent messages，但清理 `client_msg_id` / `seq`，避免 idempotency key 与 ordering metadata 污染子会话。
+- **Tool filtering**：`explore` 是 read-only whitelist；`general-purpose` 默认移除 `Agent`，避免递归 fan-out。
+- **Depth / concurrency guard**：超过嵌套深度或并发上限时返回 failed result，不击穿主 Agent Loop。
+- **Background notification drain**：task completion notification 进入一次性 queue，drain 后不重复。
+- **Cancellation**：kill/cancel event 可标记 task killed，并传入 runner 路径。
+- **Team boundary**：消息只能投递给同 team teammate 或 `team-lead`；未知成员与 cross-team sender 被拒绝。
+- **Idle wake-up without polling**：transport event wakeup 驱动 teammate；模型不需要反复调用 inbox 工具。
+- **Teammate failure isolation**：一次 teammate turn failure 不杀死整个 team，后续消息仍可恢复运行。
+- **Source of truth**：原始 parent session 仍是 source of truth；context/fork/notification 都是派生结构，不覆盖原始消息日志。
+
+### Tests and evidence
+
+Direct multi-agent coverage:
+
+- `tests/test_subagent.py`：第一版 `Agent` acceptance、tool filtering、full tool loop、private transcript、subagent failure as tool error、disabled-subagents regression。
+- `tests/test_subagent_v2.py`：fresh vs fork、omitted `subagent_type` fork、background task handle、notification drain、runtime drain seam、concurrency/depth guard、kill/cancel、`/agents` command。
+- `tests/test_team.py`：team creation、persistent teammate identity/context、idle wakeup、lead → teammate、teammate → teammate、broadcast、team boundary、parallel teammates、runtime wiring、teammate failure isolation。
+
+Verification command for this docs milestone:
+
+```bash
+uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_team.py
+```
+
+Result for this docs update: `53 passed in 211.80s (0:03:31)`.
+
+### Source relationship
+
+- Primary reference: **Claude Code** behaviour and architecture for subagents, background tasks, team creation, inter-agent messaging, persistent teammates, and task notifications.
+- Hermes relationship: indirect only in this milestone; existing slash-command registry pattern came from Stage 17, but `/agents` task content and the multi-agent managers are Aegis-specific.
+- Aegis implementation is a **combined adaptation + rewrite**: no complete Claude Code or Hermes multi-agent module is copied; Aegis reuses its own runtime, tool registry, session repository, thread model, and tool-result conventions.
+- Full mapping is recorded in `docs/source-map.md` Stage 20.
+
+### Design trade-offs, limitations, and TODOs
+
+- Only built-in `explore` and `general-purpose` are available; custom `.aegis/agents/*.md` loading is future work.
+- Teams are in-process; no durable team roster, cross-process mailbox, remote A2A, or restart recovery yet.
+- Teammate sessions are continuous within the process but not persisted as durable teammate state.
+- `/agents` lists subagent tasks, not full teams or teammate transcripts.
+- Background daemon threads fit the lightweight CLI runtime, but are not distributed workers.
+- Agents currently reuse the configured provider path; there is no automatic cheap-worker/provider routing policy.
+
+### Interview summary
+
+"Stage 20 把 Aegis 从单 Agent Runtime 扩展成 multi-agent orchestration，但没有引入第二套 loop。`Agent` 工具通过 `SubagentManager`/`SubagentRunner` 重新实例化同一个 `AgentRuntime`，只换 `AgentConfig`、系统提示、工具白名单和私有 session repository；所以 subagent 的工具调用和中间历史不会污染主会话。typed subagent 默认 fresh context，省略 `subagent_type` 时走 fork，把父会话复制进子 repo 但清掉 seq/client_msg_id。后台 subagent 在线程里跑，完成后进入通知队列，CLI between turns 注入给主 Agent，不需要模型 polling。Team 部分把 one-shot subagent 扩展成长生命周期 teammate：每个 teammate 有稳定名字、私有连续 transcript 和 event-driven inbox；`send_message` 只在 team 内路由，idle teammate 收到消息后醒来继续同一上下文。整体参考 Claude Code 的 Agent/team 行为，但实现上保持 Aegis 的 dependency-injected runtime 和轻量线程模型。"
 

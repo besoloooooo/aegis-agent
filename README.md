@@ -1,12 +1,12 @@
 # Aegis Agent
 
-A lightweight, recoverable, and extensible **Agent Runtime**, built by extracting, simplifying, and evolving the core runtime behavior of [Hermes](https://github.com/NousResearch/hermes-agent).
+A lightweight, recoverable, and extensible **Agent Runtime**, built by extracting, simplifying, and evolving useful runtime behavior from [Hermes](https://github.com/NousResearch/hermes-agent) and Claude Code reference implementations.
 
-> Built for reliable long-running agents with session recovery, context compression, memory, tool use, and extensible runtime components.
+> Built for reliable long-running agents with session recovery, context compression, memory, tool use, subagents, teams, inter-agent messaging, and extensible runtime components.
 
 ## 🏁 Milestones delivered
 
-Eighteen milestones, from a minimal skeleton to the full runtime:
+Nineteen milestones, from a minimal skeleton to the full runtime:
 
 **Core runtime**
 1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
@@ -36,6 +36,9 @@ Eighteen milestones, from a minimal skeleton to the full runtime:
 **Interactive UX**
 18. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
 
+**Multi-agent orchestration**
+19. Multi-agent orchestration — `Agent`, `team_create`, `send_message`, `/agents`
+
 ---
 
 ## 🏗 Project layout
@@ -47,6 +50,7 @@ src/aegis_agent/
 ├── slash_commands.py  # interactive /command registry + dispatcher
 ├── runtime.py      # AgentRuntime — the agent loop
 ├── events.py       # model event stream
+├── agents/         # subagents, teams, inter-agent messaging
 ├── models/         # ModelProvider protocol, fake / OpenAI providers, Message / ToolCall
 ├── tools/          # tool registry, executor, builtin tools
 ├── context/        # context builder + compression
@@ -140,11 +144,84 @@ The interactive REPL understands `/commands` (type `/help` inside the REPL):
                 disk for audit) and prefill the composer for editing
 /title [name]   set or show the session title
 /sessions       list recorded sessions
+/agents         list subagent tasks and their status
 /exit           quit (alias: /quit)
 ```
 
 A `/token` matching no command falls through to skill routing, then to the
 model unchanged.
+
+---
+
+## Multi-agent orchestration
+
+Aegis includes built-in orchestration tools for splitting work without adding a
+second agent loop. Subagents and teammates reuse `AgentRuntime` with their own
+session repositories, tool sets, and transcripts.
+
+### `Agent`
+
+The `Agent` tool starts a one-shot subagent for a self-contained task:
+
+```text
+Agent
+- prompt: task instructions for the subagent
+- subagent_type: explore | general-purpose  (optional)
+- run_in_background: true | false
+```
+
+Typed subagents are **fresh** by default: they receive the requested task and
+their own private transcript, not the main session history. The built-in
+`explore` agent is read-only and is intended for broad code/documentation
+inspection. `general-purpose` has the normal built-in tool set but does not get
+`Agent` by default, avoiding recursive fan-out.
+
+If `subagent_type` is omitted, Aegis creates a fork subagent seeded from the
+main session history. This is useful for review, counterexamples, or a second
+opinion over the current context. In all modes, subagent intermediate turns stay
+private; the main session receives only the final result or a background
+completion notification.
+
+With `run_in_background: true`, `Agent` returns a task id immediately. The
+background task runs on a daemon thread and Aegis injects its completion notice
+between REPL turns, so the model does not need to poll.
+
+### `team_create` and `send_message`
+
+`team_create` creates an in-process team with named, long-lived teammates. Each
+teammate has a stable name, its own session repository, and continuous context
+for the current Aegis process. After handling a message it becomes idle, then
+wakes when a new team message arrives.
+
+```text
+team_create
+- description: what the team is for
+- members:
+  - name: researcher
+    agent_type: explore
+    task: initial task
+```
+
+`send_message` routes messages inside the active team:
+
+```text
+send_message
+- recipient: teammate-name | team-lead | *
+- message: text to deliver
+```
+
+The team lead can message a teammate, teammates can message each other or the
+lead, and `*` broadcasts to the other teammates. Delivery is team-scoped: a
+teammate cannot send across team boundaries.
+
+Use `/agents` inside the REPL to inspect subagent task ids, types, status,
+background flag, and descriptions. It is task introspection, not a full team
+roster or team administration UI.
+
+Current limits: teams and teammate mailboxes are in-process only; team state and
+teammate transcripts are not durable across process restarts; `/agents` does not
+yet list complete team membership; nested subagent creation is intentionally
+limited to prevent runaway recursion.
 
 ---
 
@@ -294,6 +371,10 @@ web_extract
 
 session_search
 
+Agent
+team_create
+send_message
+
 skills_list
 skill_view
 skill_manage
@@ -354,6 +435,8 @@ uv run aegis --project
 uv run aegis --version
 ```
 
+Inside the REPL, use `/agents` to inspect subagent tasks.
+
 Optional dependencies:
 
 ```bash
@@ -397,13 +480,16 @@ docs/source-map.md
 
 * `extraction-plan.md` — runtime extraction and development plan
 * `development-log.md` — implementation notes and engineering decisions
-* `source-map.md` — mapping between Aegis modules and their Hermes origins
+* `source-map.md` — mapping between Aegis modules and their Hermes / Claude Code reference origins
 
 ---
 
 ## 📄 Provenance
 
-Aegis extracts and adapts parts of the Hermes Agent runtime.
+Aegis extracts, adapts, and reimplements selected runtime behavior from Hermes
+and Claude Code reference sources where documented. Claude Code is used as a
+behavioral and architectural reference for memory and multi-agent/team features
+where noted in `docs/source-map.md`.
 
 Adapted source files retain attribution where required. See:
 

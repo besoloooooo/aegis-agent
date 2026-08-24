@@ -1,20 +1,24 @@
-# Source Map — Aegis Agent ↔ Hermes
+# Source Map — Aegis Agent ↔ Hermes / Claude Code
 
 This file records the provenance of Aegis Agent code relative to the Hermes
-(`hermes-agent`, © 2025 Nous Research, MIT) reference sources, per CLAUDE.md
-§7 and the extraction plan §8.6.
+(`hermes-agent`, © 2025 Nous Research, MIT) and Claude Code reference sources,
+per CLAUDE.md §7 and the extraction plan §8.6.
 
 Relationship legend:
 
-- **PORT** — copied with little or no change; retains Hermes copyright.
-- **ADAPT** — derived from Hermes but decoupled/simplified; retains Hermes
-  copyright and an attribution header.
-- **REWRITE** — written fresh in Aegis, referencing only Hermes' *observable
-  behaviour*; original Aegis code (no Hermes copyright), but the behavioural
-  source is noted here for traceability.
+- **PORT** — copied with little or no change from a reference source; retains
+  applicable copyright.
+- **ADAPT** — derived from a reference source but decoupled/simplified; retains
+  applicable attribution when code is substantially derived.
+- **REWRITE** — written fresh in Aegis, referencing only a reference source's
+  *observable behaviour* or architecture; original Aegis code, but the source
+  relationship is noted here for traceability.
+- **original** — Aegis-specific implementation or wiring with no copied/adapted
+  reference code.
 
-Only files with a Hermes relationship are listed.  All other Aegis files are
-original work with no Hermes derivation.
+Files with meaningful Hermes or Claude Code relationships are listed. Files
+marked **original** may also appear when they are part of a documented
+milestone's dependency closure.
 
 ## Stage 1 — minimal Agent Runtime skeleton
 
@@ -323,3 +327,33 @@ set.  Source is Claude Code (not Hermes).
 | `src/aegis_agent/cli.py` (`_scoped_db_path`, `_session_scope_hint`, resume/exit hints) | **ADAPT** | Claude Code per-project session storage (`~/.claude/projects/<project>/…`) | Project sessions live in `<project home>/state.db` (personal stays `~/.aegis/state.db`), so `--resume`/`--list`/`session_search`/leases bind to the scope naturally — no scope column on the sessions table. Explicit `--db`/`AEGIS_DB_PATH`/`session.db_path` wins; a missing resume target is probed read-only in the sibling scope's store(s) for a directional hint; the exit `Resume:` hint carries `--project`. |
 | `src/aegis_agent/tui.py` (startup panel) | **original** | — | Shows `Memory: on (personal)` / `Memory: on (project <id>)`. |
 | `tests/test_memory_project.py` | **original** | — | 15 tests: default-personal, both-scopes-share-USER.md, project-excludes-personal index/recall, project recall only searches its dir, project extract only writes its dir, `user`-type rejection, cross-project isolation, stable project-id (subdir/git-root), no personal regression. |
+
+## Stage 20 — multi-agent orchestration (subagents, teams, inter-agent messaging)
+
+Adds one-shot subagents, background subagent tasks, and in-process persistent
+teams. The source relationship is primarily Claude Code behavioural and
+architectural reference; Aegis reuses its own `AgentRuntime`, `ToolRegistry`,
+`SessionRepository`, and thread-based execution model rather than copying the
+Claude Code harness.
+
+| Aegis file | Relationship | Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/agents/definitions.py` | **REWRITE** | Claude Code subagent definitions / built-in agent behaviour | `AgentDefinition` records the declarative agent registry surface: name, prompt, tool whitelist, max iterations, recursion allowance, and fork flag. Built-ins are `explore` and `general-purpose`; omitted `subagent_type` maps to an implicit fork; `explore` uses a read-only whitelist and built-ins default to no recursive `Agent` access. |
+| `src/aegis_agent/agents/agent_tool.py` | **ADAPT** | Claude Code `Agent` tool behaviour | User-visible `Agent` schema (`prompt`, optional `subagent_type`, `run_in_background`), typed fresh subagents, omitted-type fork, foreground final-result return, background task handle, and private intermediate transcript. |
+| `src/aegis_agent/agents/runner.py` | **REWRITE** | Claude Code child-agent run loop behaviour | Reuses Aegis `AgentRuntime` instead of adding a second loop; creates private repositories/sessions, seeds forked parent messages, filters the tool registry per `AgentDefinition`, and supports persistent teammate repository/session injection. |
+| `src/aegis_agent/agents/manager.py` | **ADAPT** | Claude Code async agent task / notification behaviour | `SubagentManager`, `SubagentTask`, and task lifecycle (`running` / `completed` / `failed` / `killed`), foreground/background spawn, daemon-thread execution, notification queue, concurrency/depth guards, and cancellation event. |
+| `src/aegis_agent/agents/messaging.py` | **REWRITE** | Claude Code teammate message envelope / mailbox behaviour | `AgentMessage`, `AgentTransport`, and same-process `InProcessTransport`: per-recipient FIFO inboxes, event wakeups, lead/teammate rendering, and a future seam for file-backed or remote transports. |
+| `src/aegis_agent/agents/team.py` | **ADAPT** | Claude Code team / teammate routing behaviour | `TeamManager` creates teams, spawns persistent teammates, maintains the `team-lead` boundary, enforces no cross-team delivery, drains the lead inbox, and emits idle notifications. |
+| `src/aegis_agent/agents/team_tools.py` | **ADAPT** | Claude Code `team_create` / `send_message` tool surfaces | Aegis tool wrappers for team creation and messaging: lead-bound and teammate-bound send tools, recipient names, `team-lead`, `*` broadcast, JSON results, and tool-level error results. |
+| `src/aegis_agent/agents/teammate.py` | **ADAPT** | Claude Code persistent teammate behaviour | `PersistentTeammate` keeps a stable name/id, long-lived thread, private continuous transcript, idle → wake → one-turn run → idle loop, stop handling, and failure isolation so one failed turn does not kill the whole team. |
+| `src/aegis_agent/runtime.py` | **original** | — | Registers `Agent`, `team_create`, and `send_message` in `with_defaults`; stores the managers; exposes `subagent_manager`, `team_manager`, `drain_subagent_notifications`, and `drain_team_messages` while keeping spawn/routing out of the core loop. |
+| `src/aegis_agent/cli.py` | **original** | — | REPL drains background subagent notifications and lead messages between turns and injects them as input, so the model does not poll inboxes. |
+| `src/aegis_agent/slash_commands.py` | **original** | — | `/agents` lists subagent task id/type/status/background/description. It reuses the Stage 17 slash-command registry but the command content is Aegis-specific. |
+| `tests/test_subagent.py`, `tests/test_subagent_v2.py` | **original** | — | Foreground/background/fork subagent behaviour, tool filtering, private transcript, failures as tool errors, notification drain, concurrency/depth guards, kill, runtime wiring, and `/agents`. |
+| `tests/test_team.py` | **original** | — | Team creation, persistent teammate identity/context, idle wakeup, lead ↔ teammate and teammate ↔ teammate `send_message`, broadcast, team boundary, parallel teammates, runtime wiring, and failure isolation. |
+
+Notes:
+
+- Teams and teammate transports are in-process in this stage; durable rosters,
+  cross-process mailboxes, and remote A2A transports are future work.
+- No Hermes or Claude Code reference repository was modified.
