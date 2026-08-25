@@ -47,6 +47,7 @@ from enum import Enum
 from pathlib import Path
 
 from aegis_agent.models.base import Message, ModelProvider, Role, ToolDefinition
+from aegis_agent.sessions.titles import fallback_session_title, sanitize_title
 
 
 def _local_now() -> datetime:
@@ -123,24 +124,6 @@ def help_lines() -> list[str]:
         alias_note = f" (aliases: {', '.join('/' + a for a in cmd.aliases)})" if cmd.aliases else ""
         lines.append(f"  {usage:<22} {cmd.description}{alias_note}")
     return lines
-
-
-# ---------------------------------------------------------------------------
-# Title sanitisation (adapted from hermes_state.SessionDB.sanitize_title)
-# ---------------------------------------------------------------------------
-
-MAX_TITLE_LENGTH = 60
-
-
-def sanitize_title(raw: str) -> str:
-    """Normalise a user-supplied session title; ``""`` means invalid.
-
-    Strips control/non-printable characters, collapses whitespace, and caps
-    the length so titles stay one-line and safe to echo in lists.
-    """
-    cleaned = "".join(ch for ch in raw if ch.isprintable())
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:MAX_TITLE_LENGTH]
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +211,9 @@ def format_session_table(sessions: list[dict]) -> list[str]:
     lines = [f"{'SESSION ID':<32} {'TITLE':<20} {'MSGS':>5}  CREATED", "-" * 80]
     for s in sessions:
         sid = str(s["id"])[:32]
-        title = str(s.get("title") or "")[:20]
-        count = s.get("message_count", 0)
         ts = s.get("created_at")
+        title = str(s.get("title") or fallback_session_title(ts))[:20]
+        count = s.get("message_count", 0)
         created = _local_fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
         lines.append(f"{sid:<32} {title:<20} {count:>5}  {created}")
     return lines
@@ -308,7 +291,12 @@ class SlashHandler:
     # -- Session commands --------------------------------------------------
 
     def _cmd_new(self, arg: str) -> SlashResult:
-        self._new_session(arg or None)
+        title = None
+        if arg:
+            title = sanitize_title(arg)
+            if not title:
+                self._emit("  Title is empty after cleanup. Starting an untitled session.")
+        self._new_session(title)
         return SlashResult(SlashKind.HANDLED)
 
     def _cmd_clear(self, arg: str) -> SlashResult:
@@ -431,9 +419,13 @@ class SlashHandler:
         if not arg:
             session = self._repository.get_session(self.session_id)
             title = session.title if session else None
+            source = session.title_source if session else None
             self._emit(f"  Session ID: {self.session_id}")
-            self._emit(f"  Title: {title}" if title else
-                       "  No title set. Usage: /title <your session title>")
+            if title:
+                suffix = f" ({source})" if source else ""
+                self._emit(f"  Title: {title}{suffix}")
+            else:
+                self._emit("  No title set. Usage: /title <your session title>")
             return SlashResult(SlashKind.HANDLED)
         title = sanitize_title(arg)
         if not title:
@@ -446,9 +438,9 @@ class SlashHandler:
         if self._repository.get_session(self.session_id) is None:
             # Session not created yet (no messages sent) — create it with the
             # title so nothing is lost.
-            self._repository.create_session(self.session_id, title=title)
+            self._repository.create_session(self.session_id, title=title, title_source="manual")
             self._emit(f"  Session title set: {title}")
-        elif set_title(self.session_id, title):
+        elif set_title(self.session_id, title, source="manual"):
             self._emit(f"  Session title set: {title}")
         else:
             self._emit("  Session not found in the store.")

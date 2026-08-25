@@ -352,6 +352,22 @@ Claude Code harness.
 | `tests/test_subagent.py`, `tests/test_subagent_v2.py` | **original** | — | Foreground/background/fork subagent behaviour, tool filtering, private transcript, failures as tool errors, notification drain, concurrency/depth guards, kill, runtime wiring, and `/agents`. |
 | `tests/test_team.py` | **original** | — | Team creation, persistent teammate identity/context, idle wakeup, lead ↔ teammate and teammate ↔ teammate `send_message`, broadcast, team boundary, parallel teammates, runtime wiring, and failure isolation. |
 
+## Stage 21 — automatic session titles (heuristic fallback + async LLM enhancement)
+
+Session titles are now derived metadata for the interactive REPL and session
+lists. The Aegis implementation combines Hermes' first-response async title
+generation with Claude Code's manual-vs-auto priority split, but rewrites the
+logic in Python and keeps the source message log as the only truth source.
+
+| Aegis file | Relationship | Hermes / Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/sessions/titles.py` | **REWRITE** | Hermes title sanitisation / Claude Code title formatting behaviour | Standalone helpers for title cleanup, redaction, heuristic derivation, and timestamp fallback. No reference code copied; behaviour is combined from both repos. |
+| `src/aegis_agent/sessions/title_generator.py` | **ADAPT** | Hermes `agent/title_generator.py` → async title generation; Claude Code `sessionTitle.ts` → AI title generation path | Best-effort background LLM generation over the first user/assistant exchange; failures never block the turn. Uses the active provider protocol rather than a dedicated SDK. |
+| `src/aegis_agent/sessions/models.py`, `sessions/repository.py`, `sessions/memory_store.py`, `sessions/sqlite_store.py` | **ADAPT** | Claude Code `ai-title` / `custom-title` priority; Hermes manual-title protection | Session metadata now carries `title_source` so manual titles are never overwritten by automatic ones. SQLite migration backfills older rows with manual source when a title already exists. |
+| `src/aegis_agent/slash_commands.py` | **REWRITE** | Hermes `/title` / `/new`; Claude Code `/title` priority and fallback display | `/title` writes manual titles, `/new` sanitises input, and `/sessions` now shows a fallback timestamp title when metadata is missing. |
+| `src/aegis_agent/cli.py` | **REWRITE** | Hermes async first-response trigger; Claude Code fire-and-forget title jobs | CLI REPL now ensures a heuristic title after each turn and schedules a single async LLM title attempt for final answers only. |
+| `tests/test_session_titles.py`, `tests/test_sessions.py`, `tests/test_sessions_sqlite.py`, `tests/test_slash_commands.py` | **original** | — | Cover heuristic sanitisation, manual-vs-auto precedence, SQLite metadata persistence, and slash-command integration. |
+
 Notes:
 
 - Teams and teammate transports are in-process in this stage; durable rosters,

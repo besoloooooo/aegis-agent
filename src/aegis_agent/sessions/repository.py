@@ -24,7 +24,13 @@ from aegis_agent.sessions.models import Session
 class SessionRepository(Protocol):
     """Structural interface for session persistence."""
 
-    def create_session(self, session_id: str | None = None, title: str | None = None) -> Session:
+    def create_session(
+        self,
+        session_id: str | None = None,
+        title: str | None = None,
+        *,
+        title_source: str | None = None,
+    ) -> Session:
         """Create and return a new session. Generates an id when not given."""
         ...
 
@@ -47,6 +53,18 @@ class SessionRepository(Protocol):
 
     def message_count(self, session_id: str) -> int:
         """Return the number of stored messages in the session."""
+        ...
+
+    def set_session_title(self, session_id: str, title: str, *, source: str = "manual") -> bool:
+        """Set a user-visible session title. Returns False when unknown."""
+        ...
+
+    def set_auto_session_title(self, session_id: str, title: str, *, source: str = "heuristic") -> bool:
+        """Best-effort automatic title write that never overwrites manual titles."""
+        ...
+
+    def list_sessions(self) -> list[dict]:
+        """Return session metadata dictionaries, newest first."""
         ...
 
 

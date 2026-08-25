@@ -20,6 +20,7 @@ class Session:
     id: str
     created_at: float = field(default_factory=time.time)
     title: str | None = None
+    title_source: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

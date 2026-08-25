@@ -21,7 +21,8 @@ from aegis_agent import __version__
 from aegis_agent.env import load_dotenv
 from aegis_agent.exceptions import AegisError
 from aegis_agent.models.base import Message, Role
-from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime
+from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime, StopReason
+from aegis_agent.sessions.title_generator import SessionTitleService
 from aegis_agent.slash_commands import (
     SlashHandler,
     SlashKind,
@@ -289,6 +290,7 @@ def _main(
             raise typer.Exit(code=1)
 
     runtime: AgentRuntime | None = None
+    title_service: SessionTitleService | None = None
     try:
         runtime = AgentRuntime.with_defaults(
             provider=provider,
@@ -322,7 +324,7 @@ def _main(
         def _rotate_session(title: str | None) -> str | None:
             nonlocal session_id
             new_id = _new_session_id()
-            repository.create_session(new_id, title=title)
+            repository.create_session(new_id, title=title, title_source="manual" if title else None)
             if lease_manager is not None and not lease_manager.switch_session(new_id):
                 return None
             session_id = new_id
@@ -339,6 +341,11 @@ def _main(
             rotate_session=_rotate_session,
             clear_screen=tui.clear_screen,
         )
+        title_service = SessionTitleService(
+            repository,
+            inner_provider,
+            enable_llm=getattr(inner_provider, "name", "") != "fake",
+        )
         _repl(
             runtime,
             slash,
@@ -346,10 +353,13 @@ def _main(
             interrupt=interrupt,
             lease_lost=lease_lost,
             snapshot_every_n=snapshot_n,
+            title_service=title_service,
         )
     finally:
         # Wait for any in-flight background memory work (recall/extract) before
         # the process exits, mirroring Claude Code's drain-before-exit.
+        if title_service is not None:
+            title_service.shutdown()
         if runtime is not None:
             runtime.shutdown()
         if lease_manager is not None:
@@ -623,6 +633,7 @@ def _repl(
     interrupt: threading.Event | None = None,
     lease_lost: threading.Event | None = None,
     snapshot_every_n: int = 20,
+    title_service: SessionTitleService | None = None,
 ) -> None:
     """Read user lines, run turns, stream replies until an exit command / EOF.
 
@@ -682,11 +693,15 @@ def _repl(
             # (via the interrupt event) rather than raising KeyboardInterrupt.
             _turn_active = True
             try:
-                runtime.run_turn(
+                result = runtime.run_turn(
                     session_id, turn_input, interrupt=interrupt, on_event=tui.on_event_factory(state)
                 )
             finally:
                 _turn_active = False
+            if title_service is not None:
+                title_service.ensure_heuristic_title(session_id, result.messages)
+                if result.stop_reason is StopReason.FINAL_ANSWER:
+                    title_service.maybe_schedule_llm_title(session_id, result.messages)
         except AegisError as exc:
             tui.say(f"[error] {exc}")
             continue

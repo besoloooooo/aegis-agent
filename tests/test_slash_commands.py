@@ -231,7 +231,7 @@ def test_new_rotates_session_with_title(tmp_path):
 
     def rotate(title: str | None) -> str:
         rotated.append(title)
-        repo.create_session("s2", title=title)
+        repo.create_session("s2", title=title, title_source="manual" if title else None)
         return "s2"
 
     handler, runtime, _, _out = _make_handler(repo, tmp_path, rotate=rotate)
@@ -240,6 +240,7 @@ def test_new_rotates_session_with_title(tmp_path):
     assert handler.session_id == "s2"
     assert rotated == ["My Title"]
     assert repo.get_session("s2").title == "My Title"
+    assert repo.get_session("s2").title_source == "manual"
     # The old session's history is untouched (isolation invariant).
     assert repo.message_count("s1") == 2
     assert repo.message_count("s2") == 0
@@ -288,6 +289,7 @@ def test_title_before_first_message_creates_session(tmp_path):
     handler, _, _, out = _make_handler(repo, tmp_path)
     handler.handle("/title Early Bird")
     assert repo.get_session("s1").title == "Early Bird"
+    assert repo.get_session("s1").title_source == "manual"
     assert any("title set" in line.lower() for line in out)
 
 
@@ -308,6 +310,7 @@ def test_sessions_lists_sessions(tmp_path):
     text = "\n".join(out)
     assert "SESSION ID" in text
     assert "s1" in text
+    assert "Session " in text
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +452,9 @@ def test_sqlite_set_session_title(tmp_path):
     repo = SQLiteSessionRepository(tmp_path / "state.db")
     repo.create_session("s1")
     assert repo.set_session_title("s1", "titled") is True
+    assert repo.get_session("s1").title == "titled"
+    assert repo.get_session("s1").title_source == "manual"
+    assert repo.set_auto_session_title("s1", "auto", source="llm") is False
     assert repo.get_session("s1").title == "titled"
     assert repo.set_session_title("missing", "x") is False
     repo.close()

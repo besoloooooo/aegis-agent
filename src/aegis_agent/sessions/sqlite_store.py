@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT,                        -- 来源：cli / test …
     title TEXT,
+    title_source TEXT,
     created_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,
@@ -273,9 +274,24 @@ class SQLiteSessionRepository:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            self._ensure_session_title_columns(self._conn.cursor())
             self._conn.executescript(IDEMPOTENCY_INDEX_SQL)
             self._init_fts(self._conn.cursor())
             self._conn.commit()
+
+    @staticmethod
+    def _column_names(cursor: sqlite3.Cursor, table: str) -> set[str]:
+        return {str(row[1]) for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _ensure_session_title_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Migrate older stores so automatic title metadata is available."""
+        columns = self._column_names(cursor, "sessions")
+        if "title_source" not in columns:
+            cursor.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT")
+            cursor.execute(
+                "UPDATE sessions SET title_source = 'manual' "
+                "WHERE title IS NOT NULL AND title != '' AND title_source IS NULL"
+            )
 
     # ── FTS5 初始化与同步（PORT）──────────────────────────────────────────
 
@@ -531,38 +547,71 @@ class SQLiteSessionRepository:
 
     # ── SessionRepository Protocol ───────────────────────────────────────
 
-    def create_session(self, session_id: str | None = None, title: str | None = None) -> Session:
+    def create_session(
+        self,
+        session_id: str | None = None,
+        title: str | None = None,
+        *,
+        title_source: str | None = None,
+    ) -> Session:
         import uuid
 
         sid = session_id or uuid.uuid4().hex
+        source = title_source if title else None
 
         def _do(conn):
             conn.execute(
-                "INSERT OR IGNORE INTO sessions (id, source, title, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (sid, self._source, title, time.time()),
+                "INSERT OR IGNORE INTO sessions (id, source, title, title_source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sid, self._source, title, source, time.time()),
             )
 
         self._execute_write(_do)
-        return Session(id=sid, title=title)
+        existing = self.get_session(sid)
+        return existing or Session(id=sid, title=title, title_source=source)
 
     def get_session(self, session_id: str) -> Session | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, title, created_at FROM sessions WHERE id = ?",
+                "SELECT id, title, title_source, created_at FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
             return None
-        return Session(id=row["id"], title=row["title"], created_at=row["created_at"])
+        title_source = row["title_source"]
+        if row["title"] and title_source is None:
+            title_source = "manual"
+        return Session(
+            id=row["id"],
+            title=row["title"],
+            title_source=title_source,
+            created_at=row["created_at"],
+        )
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(self, session_id: str, title: str, *, source: str = "manual") -> bool:
         """更新会话标题（``/title`` 命令）。会话不存在返回 False。"""
 
         def _do(conn):
             cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+                "UPDATE sessions SET title = ?, title_source = ? WHERE id = ?",
+                (title, source, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def set_auto_session_title(self, session_id: str, title: str, *, source: str = "heuristic") -> bool:
+        """Best-effort automatic title write that never overwrites manual titles."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET title = ?, title_source = ?
+                   WHERE id = ?
+                     AND (title_source IS NULL OR title_source != 'manual')
+                     AND (title IS NULL OR title = '' OR title_source IS NULL
+                          OR title_source = 'heuristic' OR ? = 'llm')""",
+                (title, source, session_id, source),
             )
             return cursor.rowcount > 0
 
@@ -790,7 +839,7 @@ class SQLiteSessionRepository:
         """Return all sessions with message counts, newest first."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, source, title, message_count, created_at FROM sessions "
+                "SELECT id, source, title, title_source, message_count, created_at FROM sessions "
                 "ORDER BY created_at DESC"
             ).fetchall()
         return [
@@ -798,6 +847,7 @@ class SQLiteSessionRepository:
                 "id": r["id"],
                 "source": r["source"],
                 "title": r["title"],
+                "title_source": r["title_source"] or ("manual" if r["title"] else None),
                 "message_count": r["message_count"],
                 "created_at": r["created_at"],
             }

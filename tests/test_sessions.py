@@ -15,8 +15,9 @@ def _msg(content, client_msg_id=None):
 
 def test_create_and_get_session():
     repo = InMemorySessionRepository()
-    session = repo.create_session("s1", title="demo")
+    session = repo.create_session("s1", title="demo", title_source="manual")
     assert session.id == "s1"
+    assert session.title_source == "manual"
     assert repo.get_session("s1") is session
     assert repo.get_session("nope") is None
 
@@ -54,6 +55,20 @@ def test_append_to_unknown_session_raises():
     repo = InMemorySessionRepository()
     with pytest.raises(SessionNotFoundError):
         repo.append_message("ghost", _msg("x"))
+
+
+def test_auto_title_update_rules():
+    repo = InMemorySessionRepository()
+    repo.create_session("s1")
+    assert repo.set_auto_session_title("s1", "First", source="heuristic") is True
+    assert repo.get_session("s1").title == "First"
+    assert repo.set_auto_session_title("s1", "Better", source="llm") is True
+    assert repo.get_session("s1").title == "Better"
+    assert repo.set_auto_session_title("s1", "Worse", source="heuristic") is False
+    assert repo.get_session("s1").title == "Better"
+    assert repo.set_session_title("s1", "Manual", source="manual") is True
+    assert repo.set_auto_session_title("s1", "Auto", source="llm") is False
+    assert repo.get_session("s1").title == "Manual"
 
 
 def test_sessions_isolated():

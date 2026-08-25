@@ -25,13 +25,19 @@ class InMemorySessionRepository:
         self._messages: dict[str, list[Message]] = {}
         self._lock = threading.Lock()
 
-    def create_session(self, session_id: str | None = None, title: str | None = None) -> Session:
+    def create_session(
+        self,
+        session_id: str | None = None,
+        title: str | None = None,
+        *,
+        title_source: str | None = None,
+    ) -> Session:
         with self._lock:
             sid = session_id or uuid.uuid4().hex
             existing = self._sessions.get(sid)
             if existing is not None:
                 return existing
-            session = Session(id=sid, title=title)
+            session = Session(id=sid, title=title, title_source=title_source if title else None)
             self._sessions[sid] = session
             self._messages[sid] = []
             return session
@@ -40,13 +46,26 @@ class InMemorySessionRepository:
         with self._lock:
             return self._sessions.get(session_id)
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(self, session_id: str, title: str, *, source: str = "manual") -> bool:
         """Update the session title (``/title``).  False when unknown."""
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 return False
             session.title = title
+            session.title_source = source
+            return True
+
+    def set_auto_session_title(self, session_id: str, title: str, *, source: str = "heuristic") -> bool:
+        """Update an automatic title without overwriting a manual one."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.title_source == "manual":
+                return False
+            if session.title and session.title_source == "llm" and source != "llm":
+                return False
+            session.title = title
+            session.title_source = source
             return True
 
     def rewind_from_seq(self, session_id: str, seq: int) -> int:
@@ -93,6 +112,7 @@ class InMemorySessionRepository:
                 result.append({
                     "id": sid,
                     "title": session.title,
+                    "title_source": session.title_source,
                     "message_count": len(self._messages.get(sid, [])),
                     "created_at": session.created_at,
                 })

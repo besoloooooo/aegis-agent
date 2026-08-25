@@ -94,6 +94,24 @@ def test_append_to_missing_session_raises(tmp_path) -> None:
     repo.close()
 
 
+def test_sqlite_title_sources_and_auto_update_rules(tmp_path) -> None:
+    repo = SQLiteSessionRepository(tmp_path / "s.db")
+    repo.create_session("s", title="Manual", title_source="manual")
+    assert repo.get_session("s").title_source == "manual"
+    assert repo.set_auto_session_title("s", "Auto", source="llm") is False
+    assert repo.get_session("s").title == "Manual"
+
+    repo.create_session("auto")
+    assert repo.set_auto_session_title("auto", "Heuristic", source="heuristic") is True
+    assert repo.get_session("auto").title_source == "heuristic"
+    assert repo.set_auto_session_title("auto", "LLM", source="llm") is True
+    assert repo.get_session("auto").title == "LLM"
+    assert repo.get_session("auto").title_source == "llm"
+    assert repo.set_auto_session_title("auto", "Old heuristic", source="heuristic") is False
+    assert repo.get_session("auto").title == "LLM"
+    repo.close()
+
+
 def test_persistence_across_instances(tmp_path) -> None:
     """Committed rows are visible to a brand-new connection (crash durability)."""
     db = tmp_path / "s.db"
