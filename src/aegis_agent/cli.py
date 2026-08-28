@@ -354,6 +354,7 @@ def _main(
             lease_lost=lease_lost,
             snapshot_every_n=snapshot_n,
             title_service=title_service,
+            startup_info=runtime.startup_info,
         )
     finally:
         # Wait for any in-flight background memory work (recall/extract) before
@@ -634,6 +635,7 @@ def _repl(
     lease_lost: threading.Event | None = None,
     snapshot_every_n: int = 20,
     title_service: SessionTitleService | None = None,
+    startup_info: dict[str, int | str] | None = None,
 ) -> None:
     """Read user lines, run turns, stream replies until an exit command / EOF.
 
@@ -642,6 +644,10 @@ def _repl(
     through to skill routing and then to the model unchanged.  ``/retry``
     re-queues the last user message as a fresh turn; ``/undo`` prefills the
     next composer with the backed-up text.
+
+    ``startup_info`` is the same dict shown in the startup banner; its
+    ``subagent_running`` value is refreshed between turns so the status line
+    stays accurate while background subagents run.
     """
     global _turn_active
     prefill = ""
@@ -709,7 +715,30 @@ def _repl(
         # Deliver any background-subagent completions and teammate messages as
         # the next turn's input (push model — no polling).
         pending_inject = _collect_agent_notifications(runtime, tui)
+        _refresh_subagent_status(runtime, tui, startup_info)
     tui.bye()
+
+
+def _refresh_subagent_status(
+    runtime: AgentRuntime, tui: Tui, startup_info: dict[str, int | str] | None
+) -> None:
+    """Keep the startup panel's subagent count live between turns.
+
+    Subagents keep running after a turn that spawned them (background mode),
+    so a static startup number would go stale.  The count is refreshed only
+    while it changes and the panel is in effect; the status line is appended
+    rather than re-rendered, avoiding terminal churn with the active
+    prompt_toolkit input.
+    """
+    manager = runtime.subagent_manager
+    if manager is None or not startup_info:
+        return
+    if not startup_info.get("subagent_types"):
+        return
+    running = manager.running_count()
+    if startup_info.get("subagent_running", 0) != running:
+        startup_info["subagent_running"] = running
+        tui.info(f"aegis subagents: {running} running")
 
 
 def _collect_agent_notifications(runtime: AgentRuntime, tui: Tui) -> str | None:

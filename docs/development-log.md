@@ -2703,3 +2703,63 @@ Result for this docs update: `53 passed in 211.80s (0:03:31)`.
 
 "Stage 20 把 Aegis 从单 Agent Runtime 扩展成 multi-agent orchestration，但没有引入第二套 loop。`Agent` 工具通过 `SubagentManager`/`SubagentRunner` 重新实例化同一个 `AgentRuntime`，只换 `AgentConfig`、系统提示、工具白名单和私有 session repository；所以 subagent 的工具调用和中间历史不会污染主会话。typed subagent 默认 fresh context，省略 `subagent_type` 时走 fork，把父会话复制进子 repo 但清掉 seq/client_msg_id。后台 subagent 在线程里跑，完成后进入通知队列，CLI between turns 注入给主 Agent，不需要模型 polling。Team 部分把 one-shot subagent 扩展成长生命周期 teammate：每个 teammate 有稳定名字、私有连续 transcript 和 event-driven inbox；`send_message` 只在 team 内路由，idle teammate 收到消息后醒来继续同一上下文。整体参考 Claude Code 的 Agent/team 行为，但实现上保持 Aegis 的 dependency-injected runtime 和轻量线程模型。"
 
+---
+
+### Milestone 20.1 — Stage 20 增量：启动面板 Subagents 数字改为实时运行中数
+
+### Problem and goal
+
+Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类型注册表大小**（`explore` / `general-purpose` 两个类型，`definitions.py:BUILTIN_AGENTS`），是静态配置数，与"当前到底有几个 subagent 正在跑"无关。用户希望显示实时状态：后台 subagent 正在运行时数字应为 1，全部结束后回到 0。
+
+### Relevant Hermes and/or Claude Code behavior and source locations
+
+- Hermes `hermes_cli/banner.py` 的启动横幅概念此前已用于 `_startup_panel`（Stage 3）。本次不新增任何 Hermes/Claude Code 行为参考。
+- 实时数量的数据源是 Aegis 自己的 `SubagentManager.running_count()`（`agents/manager.py`，Stage 20 已有，遍历 task 表统计 `RUNNING`）。
+
+### Migration decision
+
+**New implementation（original）**：不改数据源（`running_count()` 已存在），只调整 startup_info 组装与 TUI/CLI 渲染。无 port、无 copy。
+
+### Aegis design and data flow
+
+- `runtime.py:with_defaults` 把静态 `"subagents": len(agents)` 替换成两个键：
+  - `"subagent_types"`：仍为类型注册表大小（用于面板门控，功能启用才有这一行）；
+  - `"subagent_running"`：`subagent_manager.running_count()`，启动瞬间为 0。
+- `tui.py:_startup_panel` 改为 `Subagents: {running} running`，且只在 `subagent_types` 非零时显示。
+- `cli.py:_repl` 新增可选参数 `startup_info`（传入 `runtime.startup_info` 同一 dict 对象）；每轮 turn 之后在 `_collect_agent_notifications` 之后调用 `_refresh_subagent_status`：
+  - 取 `manager.running_count()`，与 `startup_info["subagent_running"]` 比较；
+  - 只在变化时更新 dict 并追加打印一行 `aegis subagents: N running`。
+  - 采用"追加式"而非整块重绘：banner 是一次性打印，`Live` spinner 与 prompt_toolkit 输入都在场，回合间整块重绘会造成终端闪烁/抢行。
+- 数据流：`SubagentManager`（后台线程更新 task 状态）→ `runtime.startup_info["subagent_running"]`（turn 间由 CLI 刷新）→ 下一轮状态行。
+
+### Key implementation
+
+- `src/aegis_agent/runtime.py`：`with_defaults` 的 `startup_info` 改 `subagent_types` / `subagent_running`。
+- `src/aegis_agent/tui.py`：`_startup_panel` 渲染运行中数。
+- `src/aegis_agent/cli.py`：`_repl(..., startup_info=...)`、`_refresh_subagent_status`。
+- `tests/test_subagent.py`：两处 startup_info 断言改键。
+- `tests/test_subagent_v2.py`：`test_subagent_manager_present_in_with_defaults` 断新键；新增 `test_startup_info_reflects_running_count` 验证后台 spawn 后 running 数上升、结束后回到 0（容忍后台线程抢先完成的竞态）。
+
+### Reliability invariants, edge cases, and failure handling
+
+- 竞态：后台 daemon 线程可能在 `running_count()` 查询前就完成；`_refresh_subagent_status` 只反映瞬时值（1 或 0 都可能），测试用轮询 `_wait_done` 收敛到 0，不用强断言"spawn 后必为 1"。
+- 功能禁用：`subagent_manager is None` 或 `subagent_types` 为 0 时 `_refresh_subagent_status` 直接返回，不打印、不改 dict。
+- 只更新同一 `startup_info` dict 对象，banner 持有的引用与刷新路径一致。
+
+### Tests and evidence
+
+- `uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_tui.py tests/test_cli.py` → `51 passed in 10.48s`。
+- `uv run pytest -q` → `634 passed, 2 skipped in 54.32s`。
+- `uv run ruff check src/aegis_agent/runtime.py src/aegis_agent/tui.py tests/test_subagent.py tests/test_subagent_v2.py` → `All checks passed!`。
+- `cli.py` 的 `DTZ005 datetime.now() 无 tz` 为 pre-existing 问题（git stash 验证干净树同样报），不在本次改动范围。
+
+### Design trade-offs, limitations, and TODOs
+
+- 启动横幅仍是打印一次，只有变化时追加状态行；不会实时原地刷新面板数字。
+- 前台 foreground subagent 在 turn 内同步完成，turn 结束后 running 数恒为 0，只有 background 路径能观察到非 0。
+- 类型数不再显示在面板里（`subagent_types` 仅作门控）；如需"2 types"可改回并排显示。
+
+### Interview summary
+
+"把启动面板的 `Subagents: 2` 从'可用类型数'改成'实时运行中数'。数据源是现成的 `SubagentManager.running_count()`；runtime 只把 startup_info 拆成 `subagent_types`（门控）+ `subagent_running`（实时值），TUI 渲染 `Subagents: N running`，CLI 每轮 turn 后对比 running_count 与缓存值，变化时追加打印一行。没有整块重绘 banner，因为 `Live` spinner 和 prompt_toolkit 输入同时在场，追加式更稳。测试覆盖启动快照为 0、后台 spawn 后 running 升为 1、结束后归 0，并容忍后台线程抢先完成的竞态。"
+

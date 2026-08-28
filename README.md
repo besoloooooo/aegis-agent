@@ -184,7 +184,10 @@ completion notification.
 
 With `run_in_background: true`, `Agent` returns a task id immediately. The
 background task runs on a daemon thread and Aegis injects its completion notice
-between REPL turns, so the model does not need to poll.
+between REPL turns, so the model does not need to poll. The startup panel shows
+how many subagents are currently running (`Subagents: N running`); the REPL
+refreshes the number between turns, so it drops back to 0 once background tasks
+finish.
 
 ### `team_create` and `send_message`
 

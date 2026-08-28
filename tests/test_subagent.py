@@ -260,7 +260,8 @@ def test_enable_subagents_false_removes_agent_tool():
         enable_subagents=False,
     )
     assert AGENT_TOOL_NAME not in runtime._registry.names()
-    assert runtime.startup_info.get("subagents", 0) == 0
+    assert runtime.startup_info.get("subagent_types", 0) == 0
+    assert runtime.startup_info.get("subagent_running", 0) == 0
 
 
 def test_agent_tool_present_by_default():
@@ -269,7 +270,8 @@ def test_agent_tool_present_by_default():
         provider=provider, repository=InMemorySessionRepository()
     )
     assert AGENT_TOOL_NAME in runtime._registry.names()
-    assert runtime.startup_info.get("subagents") == 2
+    assert runtime.startup_info.get("subagent_types") == 2
+    assert runtime.startup_info.get("subagent_running") == 0
 
 
 def test_subagent_reuses_agentruntime_type():

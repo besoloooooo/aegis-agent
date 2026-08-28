@@ -135,9 +135,11 @@ def test_background_spawn_returns_task_and_notifies():
     spawned = manager.spawn(builtin_agents()["explore"], "bg task", background=True)
     # A task handle is returned immediately, status RUNNING (or already done).
     assert spawned.task_id
+    assert manager.running_count() <= 1
     # Wait for the daemon thread to finish, then a notification is queued.
     spawned.thread.join(timeout=10)
     assert spawned.status is TaskStatus.COMPLETED
+    assert manager.running_count() == 0
 
     notes = manager.drain_notifications()
     assert len(notes) == 1
@@ -356,6 +358,42 @@ def test_subagent_manager_present_in_with_defaults():
         provider=FakeModelProvider(), repository=InMemorySessionRepository()
     )
     assert runtime.subagent_manager is not None
+    assert runtime.startup_info.get("subagent_types") == 2
+    assert runtime.startup_info.get("subagent_running") == 0
+
+
+def test_startup_info_reflects_running_count():
+    """The startup panel's subagent number is the live running count, not the
+    static type registry size (2 built-in types, 0 running at startup)."""
+    provider = FakeModelProvider(script=[FakeReply(text="done")])
+    runtime = AgentRuntime.with_defaults(provider=provider, repository=InMemorySessionRepository())
+    info = dict(runtime.startup_info)
+
+    def _wait_done() -> None:
+        for _ in range(100):
+            if runtime.subagent_manager.running_count() == 0:
+                return
+            time.sleep(0.02)
+        raise AssertionError("background subagent did not finish")
+
+    # While the background task is in flight the live count must be 1; the
+    # startup_info dict is mutated in place (the same object the banner uses).
+    runtime.subagent_manager.spawn(
+        builtin_agents()["explore"], "slow investigation", background=True
+    )
+    if runtime.startup_info.get("subagent_running") != 1:
+        _wait_done()
+        assert runtime.startup_info.get("subagent_running") == 0
+    else:
+        assert runtime.subagent_manager.running_count() == 1
+        _wait_done()
+        assert runtime.startup_info.get("subagent_running") == 0
+
+    # Startup snapshot itself is untouched: 2 types configured, 0 running.
+    assert info.get("subagent_types") == 2
+    assert info.get("subagent_running") == 0
+    assert runtime.subagent_manager.running_count() == 0
+    assert runtime.startup_info.get("subagent_running") == 0
 
 
 def test_subagent_manager_absent_when_disabled():
