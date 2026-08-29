@@ -314,7 +314,7 @@ def _main(
         if resume:
             tui.say(f"Resumed session {session_id} "
                     f"({repository.message_count(session_id)} messages).")
-            _print_resume_preview(repository, session_id)
+            _print_resume_preview(repository, session_id, tui=tui)
 
         # ---- slash commands ----------------------------------------------
         # Session rotation (/new, /clear): create the fresh session row, then
@@ -526,12 +526,17 @@ def _session_scope_hint(session_id: str, project: str | None) -> str | None:
     return None
 
 
-def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> None:
+def _print_resume_preview(repository, session_id: str, exchanges: int = 4, tui: Tui | None = None) -> None:
     """Print the last few exchanges so the user can see what was discussed.
 
     Mirrors Hermes' resumed-session preview: last N user messages and
     the corresponding assistant first line, showing enough to recognise
     the conversation without scrolling.
+
+    When *tui* is provided the preview is routed through the TUI output
+    system so it participates in the managed output buffer and is cleared
+    correctly on ``/clear`` or screen refresh.  Without a TUI (e.g. when
+    stdout is not a tty) the preview falls back to ``typer.echo``.
     """
     try:
         msgs = repository.list_messages(session_id)
@@ -556,18 +561,25 @@ def _print_resume_preview(repository, session_id: str, exchanges: int = 4) -> No
     if not to_show:
         return
 
-    typer.echo("─" * 70)
+    lines: list[str] = []
+    lines.append("─" * 70)
     for user, assistant in to_show:
         u_text = user.content.strip()
         # Collapse to one line, truncate.
         u_line = u_text.replace("\n", " ")[:120]
-        typer.echo(f"  you> {u_line}{'…' if len(u_text) > 120 else ''}")
+        lines.append(f"  you> {u_line}{'…' if len(u_text) > 120 else ''}")
         if assistant is not None:
             a_text = assistant.content.strip()
             a_line = a_text.replace("\n", " ")[:120]
-            typer.echo(f"aegis> {a_line}{'…' if len(a_text) > 120 else ''}")
-        typer.echo()
-    typer.echo("─" * 70)
+            lines.append(f"aegis> {a_line}{'…' if len(a_text) > 120 else ''}")
+        lines.append("")
+    lines.append("─" * 70)
+    preview = "\n".join(lines)
+
+    if tui is not None:
+        tui.out(preview)
+    else:
+        typer.echo(preview)
 
 
 def _print_session_list(repository) -> None:

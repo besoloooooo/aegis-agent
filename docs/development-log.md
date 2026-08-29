@@ -3089,3 +3089,247 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
 Markdown；VT100 wheel 则交给内层 Window，而真正的 scroll offset 在外层 ScrollablePane。现在
 streaming 与 final 共用同一个 Rich Markdown renderable，wheel 和 PageUp/PageDown 也共用一个
 clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了离底/回底 sticky 状态。"
+
+---
+
+## Stage 18 repair follow-up — stable streaming frames and precision wheel
+
+### Task goal and original problem
+
+实时 Markdown 和滚轮路由修复后，用户仍观察到 streaming 中偶尔闪回开场 history 一帧，滚轮移动
+也显得偏猛、偏卡。目标是在不更换 prompt_toolkit 布局的前提下消除中间空帧，并把滚动步长调到
+更接近 Claude Code 的精细体验。
+
+### Relevant reference behavior and migration decision
+
+- Aegis 当前 `TEXT_DELTA` 路径的直接证据：每个 delta 都先调用 `state.stop_spinner()`，而
+  full-screen 的实现会执行 `shell.set_live(None)`，随后才写入新的 Markdown renderable。
+- Claude Code `src/components/ScrollKeybindingHandler.tsx` 明确规定 precision scroll 的基准为
+  `1 event = 1 row`；其后还有设备识别和加速曲线，本次只采用最低风险的基准步长。
+- 选择 **targeted repair / behavioural adaptation**：修正 Aegis 自身竞态，将 wheel 常量从 3 降到
+  1；不迁移 Claude Code 的 pending-delta、bounce detection 或 acceleration 系统。
+
+### Aegis design and main data flow
+
+- `Tui._render_event(TEXT_DELTA)` 只在 `state.started_text` 为 false 时清除 thinking spinner。
+  第一个 delta 之后，live slot 始终从一个 Markdown renderable 原子替换为下一个，不再经过 `None`。
+- `_WHEEL_SCROLL_LINES = 1`；已有 `_scroll_history()` 继续负责 clamp、离底关闭 follow、回底恢复
+  follow，因此只改变手感，不改变边界语义。
+
+### Important files and interfaces
+
+- `src/aegis_agent/tui.py`：`_WHEEL_SCROLL_LINES`、`Tui._render_event`。
+- `tests/test_tui.py`：扩展 streaming 测试以断言第二个 delta 之间没有 `None` live update；wheel
+  测试断言单事件只移动一行。
+- `README.md`、`docs/source-map.md`：记录 precision wheel 和无中间空帧行为。
+
+### Reliability invariants and edge cases
+
+- thinking spinner 仍会在第一个 text delta 前正确清除。
+- 第二个及后续 delta 不清空 live slot；不再产生可被 UI thread 捕获的空历史帧。
+- tool/error/turn boundary 仍可显式清空 live slot并提交最终 segment。
+- wheel 始终 clamp 在 `[0, _last_max_scroll]`，只是每事件移动量从 3 变为 1。
+- non-TTY streaming 路径不变。
+
+### Tests and measured results
+
+- `uv run pytest -q tests/test_tui.py` → `12 passed in 0.88s`（实现后首轮）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `649 passed, 2 skipped in 526.15s`。
+- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+
+### Trade-offs, remaining limitations, and TODOs
+
+- 单事件一行优先保证精细与稳定；没有 Claude Code 针对快速连续滚动的自适应加速，长距离回看应使用
+  PageUp/PageDown。
+- prompt_toolkit `ScrollablePane` 仍会重绘其虚拟内容；非常长的 4,000 行历史可能需要后续做窗口化，
+  本次没有以高风险重构换取尚未量化的性能收益。
+
+### Concise interview-ready explanation
+
+"闪屏不是 Markdown 本身，而是每个 token 都把 live slot 先设成 None，再放回新 renderable；UI
+线程偶尔会画到这个中间态。现在只在首个 delta 清 spinner，后续 frame 直接 Markdown-to-Markdown
+替换。滚轮则从 3 行降到 Claude Code 的 precision baseline 1 行，边界和 sticky 逻辑保持不变。"
+
+---
+
+## Viewport Clipping Optimization for TUI Scrolling Performance
+
+### 问题
+
+终端界面滑动时卡顿，特别是当历史记录很长时。原因是 `_formatted_output()` 每次渲染都连接所有行（最多 4000 行），即使只有视口内（约 50 行）的内容可见。
+
+### 参考实现
+
+Claude Code 使用前端/后端帧缓冲和 Yoga 布局引擎，只渲染视口内的内容。Aegis 需要在 prompt_toolkit 框架下实现类似的视口裁剪。
+
+### 实现方案
+
+在 `_FullscreenShell._formatted_output()` 中添加视口裁剪：
+
+1. **计算视口范围**：基于滚动位置和视口高度，计算需要渲染的行范围
+2. **添加缓冲区**：在视口上下各添加 50 行缓冲区，确保平滑滚动
+3. **只渲染可见部分**：只连接和渲染视口范围内的行，而不是所有历史行
+
+### 关键修改
+
+**文件**: `src/aegis_agent/tui.py`
+
+1. 添加常量 `_VIEWPORT_BUFFER_SIZE = 50`
+2. 修改 `_formatted_output()` 方法：
+   ```python
+   # 计算视口范围（带缓冲区）
+   scroll_pos = self.scroll.vertical_scroll
+   start = max(0, scroll_pos - _VIEWPORT_BUFFER_SIZE)
+   end = min(len(lines), scroll_pos + viewport_height + _VIEWPORT_BUFFER_SIZE)
+
+   # 只渲染可见部分
+   visible_lines = lines[start:end]
+   text = "\n".join(visible_lines)
+   ```
+
+### 性能测试结果
+
+- **优化前**：渲染 10000 行需要连接所有行
+- **优化后**：只渲染 98 行（视口高度 48 + 2×50 缓冲区）
+- **渲染时间**：0.0017s（10000 行中只渲染 1%）
+
+### Changed files
+
+- `src/aegis_agent/tui.py` — 添加视口裁剪优化
+
+### Tests executed
+
+- `uv run pytest -q tests/test_tui.py` → 12 passed
+- `uv run pytest -q` → 649 passed, 2 skipped
+
+### Trade-offs
+
+- 缓冲区大小（50 行）是经验值，需要在平滑滚动和内存使用之间平衡
+- 极端情况下（快速滚动大量内容），可能需要调整缓冲区大小
+
+### Remaining TODOs
+
+- 监控实际使用中的性能表现
+- 考虑添加自适应缓冲区大小（基于滚动速度）
+
+---
+
+## Stage 18 viewport clipping correctness follow-up
+
+### Problem and root cause
+
+The first viewport-clipping pass reduced the formatted history to a buffered
+slice, but continued to use `ScrollablePane.vertical_scroll` as if it were an
+absolute position in the complete history. Once the slice started beyond line
+zero, prompt_toolkit received a history-sized offset for a roughly
+viewport-sized document. During a long live response this could freeze or
+blank a manually scrolled view; the same mismatch could put the live thinking
+status outside the effective pane.
+
+### Implementation
+
+- `_FullscreenShell._history_scroll` now owns the absolute position in the
+  complete history.
+- `_formatted_output()` calculates clipping boundaries from that absolute
+  position, then assigns `scroll.vertical_scroll = _history_scroll - start` so
+  the pane receives a valid slice-local coordinate.
+- Mouse wheel, Home/End, clear, tail-following, and history truncation update
+  the logical coordinate consistently.
+- Manual scroll position stays fixed while live content grows; reaching the
+  tail restores follow mode.
+
+### Verification
+
+- `tests/test_tui.py` covers global-to-local translation beyond the 50-line
+  buffer, a visible live thinking status at the history tail, and 100 growing
+  live frames while the viewport is manually scrolled.
+- `uv run pytest -q tests/test_tui.py` → `15 passed in 0.95s`.
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
+- `uv run pytest -q` → `652 passed, 2 skipped in 526.04s`.
+- Full-repository Ruff remains at the six pre-existing findings in
+  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
+  `tests/test_session_titles.py`; files touched for the TUI repair pass their
+  targeted checks.
+
+### Trade-offs and remaining work
+
+The scrollbar describes the buffered slice rather than the entire logical
+history because prompt_toolkit owns it. Wheel and paging behavior use the
+logical history position and remain correct; a full-history proportional thumb
+would require a custom scrollbar or a different virtualized container.
+
+---
+
+## Stage 18 follow-up — remove misleading scrollbar and add jump-to-tail
+
+### Task goal and original problem
+
+Viewport clipping made prompt_toolkit's built-in scrollbar describe only the
+buffered slice. Its thumb therefore changed size inconsistently, could not be
+used to drag through the complete history, and communicated a false position.
+The interface also needed a fast way to leave a manually scrolled position and
+return to live output.
+
+### Relevant reference behavior and migration decision
+
+- Claude Code `src/keybindings/defaultBindings.ts` maps `ctrl+end` to
+  `scroll:bottom`; its ScrollBox then restores sticky tail-following.
+- Aegis adopts that observable binding and follow behavior as a small
+  behavioural adaptation. It does not port Claude Code's custom ScrollBox or
+  proportional scrollbar.
+- The slice-local prompt_toolkit scrollbar is removed rather than replaced,
+  because implementing a truthful draggable thumb would require a separate
+  full-history virtual-scroll control.
+
+### Aegis design and main data flow
+
+- `ScrollablePane(show_scrollbar=False)` removes the inaccurate visual thumb.
+- A global `Keys.ControlEnd` binding calls `_jump_to_bottom()` even while the
+  composer has focus.
+- `_jump_to_bottom()` assigns `_last_max_scroll` to `_history_scroll`, enables
+  `_follow_output`, and invalidates the application. The next formatted frame
+  performs the existing absolute-to-slice-local coordinate translation.
+- Bare End keeps its normal input-cursor behavior when the composer is focused.
+
+### Reliability invariants and edge cases
+
+- Wheel and PageUp/PageDown remain available after hiding the scrollbar.
+- `Ctrl+End` works from a long manually scrolled history and restores live
+  tail-following.
+- Short histories clamp normally because `_last_max_scroll` is zero.
+- No model, runtime, persistence, or non-TTY behavior changes.
+
+### Tests and measured results
+
+- `tests/test_tui.py` asserts the scrollbar is disabled, the global
+  `Keys.ControlEnd` binding exists, and jumping to the bottom restores both the
+  maximum logical position and follow mode.
+- `uv run pytest -q tests/test_tui.py` → `16 passed in 0.70s`.
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
+- `uv run pytest -q` → `653 passed, 2 skipped in 525.45s`.
+- `git diff --check` → passed.
+- Full-repository Ruff remains at the same six pre-existing findings in
+  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
+  `tests/test_session_titles.py`; this follow-up introduces no new finding.
+
+### Trade-offs, remaining limitations, and TODOs
+
+There is intentionally no visible full-history position indicator. A truthful
+draggable scrollbar would require a custom control that maps the complete
+history to the clipped pane; this is deferred unless user testing shows it is
+worth the added complexity.
+
+### Concise interview-ready explanation
+
+"The built-in thumb described a hundred-line render slice rather than the full
+conversation, so its size and position were misleading and it was not useful
+for dragging. Aegis now hides it and follows Claude Code's established
+Ctrl+End shortcut: one action jumps the logical history position to the tail
+and re-enables sticky live output, while the existing viewport translation
+keeps rendering bounded."

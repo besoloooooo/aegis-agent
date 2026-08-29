@@ -17,8 +17,11 @@ import io
 
 import pytest
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.formatted_text import fragment_list_to_text, to_formatted_text
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
+from rich.text import Text
 from typer.testing import CliRunner
 
 from aegis_agent.cli import app
@@ -29,6 +32,7 @@ from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.tui import (
     _PROMPT_PLACEHOLDER,
     _THEME,
+    _VIEWPORT_BUFFER_SIZE,
     Tui,
     _FullscreenShell,
     _highlight_input_line,
@@ -184,12 +188,13 @@ def test_fullscreen_history_does_not_snap_back_after_scroll_up(monkeypatch):
     shell._append_lines("\n".join(f"line {i}" for i in range(10)))
     shell._formatted_output()
     shell._follow_output = False
-    shell.scroll.vertical_scroll = 2
+    shell._history_scroll = 2
 
     shell._append_lines("new output")
     shell._formatted_output()
 
     assert shell.scroll.vertical_scroll == 2
+    assert shell._history_scroll == 2
     assert shell._last_max_scroll == 6
 
 
@@ -197,9 +202,11 @@ class _RecordingShell:
     def __init__(self) -> None:
         self.rendered = []
         self.live = None
+        self.live_updates = []
 
     def set_live(self, renderable) -> None:
         self.live = renderable
+        self.live_updates.append(renderable)
 
     def print_renderable(self, renderable) -> None:
         self.rendered.append(renderable)
@@ -254,6 +261,15 @@ def test_fullscreen_streaming_preview_is_markdown_rendered():
     assert "bold while streaming" in preview
     assert "**" not in preview
 
+    updates_before_next_delta = len(shell.live_updates)
+    tui._render_event(
+        state,
+        TurnEvent(kind=TurnEventKind.TEXT_DELTA, text="\n\nMore text"),
+    )
+    new_updates = shell.live_updates[updates_before_next_delta:]
+    assert new_updates
+    assert None not in new_updates
+
 
 def test_fullscreen_mouse_wheel_scrolls_history(monkeypatch):
     shell = _FullscreenShell(theme=_THEME)
@@ -261,6 +277,7 @@ def test_fullscreen_mouse_wheel_scrolls_history(monkeypatch):
     shell._append_lines("\n".join(f"line {i}" for i in range(10)))
     shell._formatted_output()
     assert shell.scroll.vertical_scroll == 5
+    assert shell._history_scroll == 5
 
     scroll_up = MouseEvent(
         position=Point(x=0, y=0),
@@ -276,8 +293,92 @@ def test_fullscreen_mouse_wheel_scrolls_history(monkeypatch):
     )
 
     assert shell.output_control.mouse_handler(scroll_up) is None
-    assert shell.scroll.vertical_scroll == 2
+    shell._formatted_output()
+    assert shell.scroll.vertical_scroll == 4
+    assert shell._history_scroll == 4
     assert shell._follow_output is False
     assert shell.output_control.mouse_handler(scroll_down) is None
+    shell._formatted_output()
     assert shell.scroll.vertical_scroll == 5
+    assert shell._history_scroll == 5
     assert shell._follow_output is True
+
+
+def test_viewport_clipping_translates_absolute_scroll_to_slice(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+    shell._append_lines("\n".join(f"line {i}" for i in range(200)))
+
+    rendered = shell._formatted_output()
+    text = fragment_list_to_text(to_formatted_text(rendered))
+
+    assert shell._last_max_scroll == 195
+    assert shell._history_scroll == 195
+    assert shell.scroll.vertical_scroll == 50
+    assert "line 199" in text
+    assert "line 0\n" not in text
+
+    shell._scroll_history(-1)
+    rendered = shell._formatted_output()
+    text = fragment_list_to_text(to_formatted_text(rendered))
+
+    assert shell._history_scroll == 194
+    assert shell.scroll.vertical_scroll == 50
+    assert "line 194" in text
+
+
+def test_viewport_clipping_keeps_live_status_at_history_tail(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+    shell._append_lines("\n".join(f"line {i}" for i in range(200)))
+    shell.set_live(Text("THINKING STATUS"))
+
+    rendered = shell._formatted_output()
+    text = fragment_list_to_text(to_formatted_text(rendered))
+
+    assert shell._follow_output is True
+    assert shell._history_scroll == shell._last_max_scroll
+    assert "THINKING STATUS" in text
+
+
+def test_stream_growth_does_not_freeze_scrolled_viewport(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 8)
+    shell._append_lines("\n".join(f"history {i}" for i in range(300)))
+    shell._formatted_output()
+
+    for _ in range(20):
+        shell._scroll_history(-1)
+        shell._formatted_output()
+
+    anchored_scroll = shell._history_scroll
+    assert shell._follow_output is False
+
+    for chunk in range(100):
+        shell.set_live(Text("\n".join(f"stream {i}" for i in range(chunk + 1))))
+        rendered = shell._formatted_output()
+        text = fragment_list_to_text(to_formatted_text(rendered))
+
+        assert shell._history_scroll == anchored_scroll
+        assert 0 <= shell.scroll.vertical_scroll <= _VIEWPORT_BUFFER_SIZE
+        assert f"history {anchored_scroll}" in text
+
+
+def test_ctrl_end_jumps_to_bottom_and_restores_follow(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    assert not shell.scroll.show_scrollbar()
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+    shell._append_lines("\n".join(f"line {i}" for i in range(200)))
+    shell._formatted_output()
+    shell._scroll_history(-20)
+    shell._formatted_output()
+
+    assert shell._follow_output is False
+    assert shell._history_scroll < shell._last_max_scroll
+    assert shell.app.key_bindings.get_bindings_for_keys((Keys.ControlEnd,))
+
+    shell._jump_to_bottom()
+    shell._formatted_output()
+
+    assert shell._follow_output is True
+    assert shell._history_scroll == shell._last_max_scroll

@@ -36,7 +36,8 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 **Interactive UX**
 18. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
     plus a full-screen TTY layout with scrollable chat history, fixed bottom
-    composer, Markdown replies, and highlighted input tokens.
+    composer, Markdown replies, highlighted input tokens, and `Ctrl+End` to
+    jump back to the live tail.
 
 **Multi-agent orchestration**
 19. Multi-agent orchestration — `Agent`, `team_create`, `send_message`, `/agents`
@@ -174,13 +175,23 @@ appear as compact status lines between response segments.
 Interactive TTY sessions use a prompt_toolkit full-screen layout: the chat
 history lives in a scrollable output pane and the composer stays fixed at the
 bottom. Mouse wheel events are routed to the history pane, and PageUp/PageDown
-scroll it from the keyboard, while the input row remains visible. New output
-follows the tail only while the user is already
-at the bottom, so streaming does not pull a manually scrolled history view away.
+scroll it from the keyboard, while the input row remains visible. Each wheel
+event moves one history row for precise native-terminal scrolling. Press
+`Ctrl+End` at any time to jump directly to the bottom and resume following live
+output. The clipped pane intentionally has no scrollbar because a slice-local
+thumb cannot accurately represent or drag through the complete history. New
+output follows the tail only while the user is already at the bottom, so
+streaming does not pull a manually scrolled history view away.
 The composer keeps prompt_toolkit history, cursor editing, and token highlighting
 in one clean row. User messages, assistant Markdown, tool status, and errors all
 share the history pane. Non-TTY input/output keeps the simpler plain streaming
 path so pipes, logs, and tests remain stable.
+
+The history pane uses **viewport clipping** to maintain scrolling performance
+even with long conversations. Only the visible lines plus a buffer zone are
+rendered. A separate absolute history position is translated into the clipped
+slice's local scroll position, so manual scrolling remains stable while live
+output keeps extending the conversation.
 
 ---
 

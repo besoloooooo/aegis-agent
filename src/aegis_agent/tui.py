@@ -72,7 +72,8 @@ _TOOL_ARGS_MAX = 120
 _MARKDOWN_THEME = "monokai"
 _HISTORY_MAX_LINES = 4000
 _RENDERED_SEGMENT_MAX_LINES = 300
-_WHEEL_SCROLL_LINES = 3
+_WHEEL_SCROLL_LINES = 1
+_VIEWPORT_BUFFER_SIZE = 50  # Extra lines above/below viewport for smooth scrolling
 _PROMPT_PLACEHOLDER = "Ask Aegis..."
 _KNOWN_SLASH_COMMANDS = {
     "/agents",
@@ -219,7 +220,6 @@ class _FullscreenShell:
     def __init__(self, *, theme: Theme) -> None:
         from prompt_toolkit.application import Application
         from prompt_toolkit.document import Document
-        from prompt_toolkit.filters import Condition
         from prompt_toolkit.formatted_text import ANSI
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.key_binding import KeyBindings
@@ -244,6 +244,10 @@ class _FullscreenShell:
         self._last_input: str | None = None
         self._last_default = ""
         self._follow_output = True
+        # Absolute position in the complete history. ScrollablePane itself
+        # only receives a viewport-sized slice, so its vertical_scroll is a
+        # separate, slice-local coordinate.
+        self._history_scroll = 0
         self._last_max_scroll = 0
         self._thread: threading.Thread | None = None
 
@@ -268,9 +272,6 @@ class _FullscreenShell:
             ("mention", "ansigreen"),
             ("tag", "ansiblue"),
             ("input-frame", _BLUE),
-            ("scrollbar.background", "bg:default"),
-            ("scrollbar.button", f"bg:{_LIGHT_BLUE}"),
-            ("scrollbar.arrow", _LIGHT_BLUE),
         ])
 
         kb = KeyBindings()
@@ -302,12 +303,18 @@ class _FullscreenShell:
         def _scroll_down(event) -> None:
             self._scroll_history(5)
 
+        @kb.add(Keys.ControlEnd, is_global=True)
+        def _scroll_to_bottom(event) -> None:
+            self._jump_to_bottom()
+
         @kb.add("home")
         def _scroll_top(event) -> None:
             if event.app.layout.current_control is self.input_area.control:
                 event.app.current_buffer.cursor_position = 0
             else:
+                self._history_scroll = 0
                 self.scroll.vertical_scroll = 0
+                self._follow_output = False
                 event.app.invalidate()
 
         @kb.add("end")
@@ -315,9 +322,7 @@ class _FullscreenShell:
             if event.app.layout.current_control is self.input_area.control:
                 event.app.current_buffer.cursor_position = len(event.app.current_buffer.text)
             else:
-                self.scroll.vertical_scroll = self._last_max_scroll
-                self._follow_output = True
-                event.app.invalidate()
+                self._jump_to_bottom()
 
         self.output_control = _HistoryControl(
             self._formatted_output,
@@ -331,7 +336,7 @@ class _FullscreenShell:
         )
         self.scroll = ScrollablePane(
             output_window,
-            show_scrollbar=Condition(self._history_overflows),
+            show_scrollbar=False,
             display_arrows=False,
             keep_cursor_visible=False,
             keep_focused_window_visible=False,
@@ -414,6 +419,7 @@ class _FullscreenShell:
         with self._lock:
             self._lines.clear()
             self._follow_output = True
+            self._history_scroll = 0
             self._last_max_scroll = 0
         self.scroll.vertical_scroll = 0
         self.invalidate()
@@ -439,7 +445,10 @@ class _FullscreenShell:
             for line in text.splitlines() or [text]:
                 self._lines.append(line.rstrip("\n"))
             if len(self._lines) > _HISTORY_MAX_LINES:
-                del self._lines[: len(self._lines) - _HISTORY_MAX_LINES]
+                removed = len(self._lines) - _HISTORY_MAX_LINES
+                del self._lines[:removed]
+                if not self._follow_output:
+                    self._history_scroll = max(0, self._history_scroll - removed)
         self.invalidate()
 
     def _prompt_fragments(self):
@@ -455,13 +464,18 @@ class _FullscreenShell:
         return NotImplemented
 
     def _scroll_history(self, delta: int) -> None:
-        current = min(self.scroll.vertical_scroll, self._last_max_scroll)
+        current = min(self._history_scroll, self._last_max_scroll)
         target = max(0, min(self._last_max_scroll, current + delta))
-        self.scroll.vertical_scroll = target
+        self._history_scroll = target
         if delta < 0:
             self._follow_output = False
         elif delta > 0:
             self._follow_output = target >= self._last_max_scroll
+        self.invalidate()
+
+    def _jump_to_bottom(self) -> None:
+        self._history_scroll = self._last_max_scroll
+        self._follow_output = True
         self.invalidate()
 
     def _formatted_output(self):
@@ -474,16 +488,35 @@ class _FullscreenShell:
                 lines.extend(live_text.splitlines())
         if not lines:
             return [("class:aegis.dim", "")]
-        text = "\n".join(lines[-_HISTORY_MAX_LINES:])
+
+        # Viewport clipping: only render visible lines plus a buffer for smooth scrolling
         viewport_height = self._history_viewport_height()
         self._last_max_scroll = max(0, len(lines) - viewport_height)
+
         if self._follow_output:
-            self.scroll.vertical_scroll = self._last_max_scroll
+            self._history_scroll = self._last_max_scroll
         else:
-            self.scroll.vertical_scroll = min(
-                self.scroll.vertical_scroll,
+            self._history_scroll = min(
+                self._history_scroll,
                 self._last_max_scroll,
             )
+
+        # Calculate viewport range with buffer for smooth scrolling
+        scroll_pos = self._history_scroll
+
+        # Start from scroll position (with buffer above)
+        start = max(0, scroll_pos - _VIEWPORT_BUFFER_SIZE)
+        # End at scroll position + viewport height (with buffer below)
+        end = min(len(lines), scroll_pos + viewport_height + _VIEWPORT_BUFFER_SIZE)
+
+        # Only render the visible portion plus buffer
+        visible_lines = lines[start:end]
+        # ScrollablePane sees only visible_lines, so translate the absolute
+        # history position into that slice's coordinate system. Reusing the
+        # absolute value here makes a long stream appear frozen or blank once
+        # the slice starts beyond line zero.
+        self.scroll.vertical_scroll = scroll_pos - start
+        text = "\n".join(visible_lines)
         return self._ANSI(text)
 
     def _history_viewport_height(self) -> int:
@@ -492,12 +525,6 @@ class _FullscreenShell:
             return max(1, self.app.output.get_size().rows - 2)
         except Exception:  # noqa: BLE001 - terminal probing is best-effort.
             return 22
-
-    def _history_overflows(self) -> bool:
-        with self._lock:
-            line_count = len(self._lines) + (1 if self._live_renderable is not None else 0)
-        return line_count > self._history_viewport_height()
-
 
 class _TurnState:
     """Per-turn render state."""
@@ -620,7 +647,11 @@ class Tui:
 
     def _render_event(self, state: _TurnState, event: TurnEvent) -> None:
         if event.kind is TurnEventKind.TEXT_DELTA:
-            state.stop_spinner()
+            # Clear the thinking spinner only for the first text delta. Doing
+            # this for every chunk briefly replaced the live Markdown with an
+            # empty frame, which could expose the banner/history for one paint.
+            if not state.started_text:
+                state.stop_spinner()
             if self._shell is not None:
                 state.append_text(event.text)
                 self._shell.set_live(_assistant_markdown_renderable(state.peek_text()))
