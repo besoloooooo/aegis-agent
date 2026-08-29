@@ -28,6 +28,9 @@ web = [
 redis = [
     "redis>=5.0.0",
 ]
+observability = [
+    "langfuse>=4.15.1,<5",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]

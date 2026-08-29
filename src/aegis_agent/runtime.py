@@ -46,7 +46,19 @@ from aegis_agent.memory.prompt import (
     UserProfileContributor,
     default_memory_index_contributor,
 )
-from aegis_agent.models.base import Message, ModelProvider, Role, ToolCall, ToolResult
+from aegis_agent.models.base import (
+    ChatResponse,
+    Message,
+    ModelProvider,
+    Role,
+    ToolCall,
+    ToolResult,
+)
+from aegis_agent.observability import (
+    NoopObservability,
+    Observability,
+    create_observability,
+)
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.sessions.repository import SessionRepository
 from aegis_agent.skills.loader import SkillLoader
@@ -235,6 +247,7 @@ class AgentRuntime:
         config: AgentConfig | None = None,
         subagent_manager: object | None = None,
         team_manager: object | None = None,
+        observability: Observability | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -249,6 +262,10 @@ class AgentRuntime:
         # single source of truth and ``max_iterations`` is ignored.
         self._config = config or AgentConfig(max_iterations=max_iterations)
         self._max_iterations = self._config.max_iterations
+        self._observability = observability or NoopObservability()
+        # The executor is a concrete injected collaborator, so attach the same
+        # tracer here as a backstop for manually-assembled runtimes.
+        self._executor.set_observability(self._observability)
         self._skill_router = skill_router
         self._startup_info = startup_info or {}
         # Personal long-term memory (Stage 2/3): recall before the turn, extract
@@ -304,6 +321,7 @@ class AgentRuntime:
         context_token_budget: int | None = None,
         compress_storage_dir: str | None = None,
         summary_provider: ModelProvider | None = None,
+        observability: Observability | None = None,
     ) -> AgentRuntime:
         """Build a runtime wired with builtin tools and sensible defaults.
 
@@ -340,6 +358,7 @@ class AgentRuntime:
         ``summary_provider`` (default: the main provider).  The source history
         is never modified; compression only affects the derived view.
         """
+        active_observability = observability or create_observability()
         if provider is None:
             from aegis_agent.models.fake import FakeModelProvider
 
@@ -358,7 +377,7 @@ class AgentRuntime:
             if tool_cwd
             else ToolContext(allow_dangerous_shell=allow_dangerous_shell)
         )
-        executor = ToolExecutor(registry, context)
+        executor = ToolExecutor(registry, context, active_observability)
 
         identity = system_prompt if system_prompt is not None else DEFAULT_IDENTITY
         prompt_builder = SystemPromptBuilder(identity=identity)
@@ -450,6 +469,7 @@ class AgentRuntime:
                 registry,
                 cwd=context.cwd,
                 allow_dangerous_shell=allow_dangerous_shell,
+                observability=active_observability,
             )
             subagent_manager = SubagentManager(runner, agents)
             registry.register(
@@ -557,6 +577,7 @@ class AgentRuntime:
             memory_manager=memory_manager,
             subagent_manager=subagent_manager,
             team_manager=team_manager,
+            observability=active_observability,
         )
 
     @property
@@ -635,10 +656,66 @@ class AgentRuntime:
         The CLI calls this on exit so queued memory extraction isn't cut off
         mid-write.  A no-op when no memory manager is wired in.
         """
-        if self._memory_manager is not None:
-            self._memory_manager.drain()
+        try:
+            if self._memory_manager is not None:
+                self._memory_manager.drain()
+        finally:
+            self._observability.shutdown()
 
     def run_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        *,
+        interrupt: threading.Event | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+        on_event: Callable[[TurnEvent], None] | None = None,
+    ) -> TurnResult:
+        """Run one fully-observed user task without changing loop semantics."""
+        from aegis_agent import __version__
+
+        is_subagent = self._config.agent_name != MAIN_AGENT_NAME
+        with self._observability.agent_run(
+            task=user_message,
+            session_id=session_id,
+            agent_name=self._config.agent_name,
+            version=__version__,
+            is_subagent=is_subagent,
+        ) as observation:
+            try:
+                result = self._run_turn_impl(
+                    session_id,
+                    user_message,
+                    interrupt=interrupt,
+                    is_cancelled=is_cancelled,
+                    on_event=on_event,
+                )
+            except Exception as exc:
+                observation.update(error=exc, success=False)
+                raise
+
+            success = result.stop_reason is StopReason.FINAL_ANSWER
+            error = result.final_text if result.stop_reason is StopReason.ERROR else None
+            with self._observability.final_result() as final_observation:
+                final_observation.update(
+                    output=result.final_text,
+                    error=error,
+                    success=success,
+                    metadata={"stop_reason": result.stop_reason.value},
+                )
+            observation.update(
+                output=result.final_text,
+                error=error,
+                success=success,
+                metadata={
+                    "stop_reason": result.stop_reason.value,
+                    "iterations": result.iterations,
+                    "tool_calls_made": result.tool_calls_made,
+                },
+            )
+            return result
+
+    def _run_turn_impl(
         self,
         session_id: str,
         user_message: str,
@@ -742,11 +819,7 @@ class AgentRuntime:
                 )
 
             try:
-                response = collect_response(
-                    self._provider.stream(api_messages, tools=self._registry.definitions()),
-                    is_cancelled=cancel_check,
-                    on_event=_emit,
-                )
+                response = self._call_model(api_messages, cancel_check, _emit)
             except OperationCancelled:
                 # Interrupt fired mid-stream: discard the partial response.
                 stop_reason = StopReason.INTERRUPTED
@@ -812,6 +885,40 @@ class AgentRuntime:
             stop_reason=stop_reason,
             tool_calls_made=tool_calls_made,
         )
+
+    def _call_model(
+        self,
+        api_messages: list[Message],
+        cancel_check: Callable[[], bool] | None,
+        on_event: Callable[[ModelEvent], None],
+    ) -> ChatResponse:
+        """Call the provider inside one generation observation."""
+        model = getattr(self._provider, "model", None)
+        if model is not None:
+            model = str(model)
+        with self._observability.model_call(
+            provider=self._provider.name,
+            model=model,
+            messages=api_messages,
+        ) as observation:
+            try:
+                response = collect_response(
+                    self._provider.stream(api_messages, tools=self._registry.definitions()),
+                    is_cancelled=cancel_check,
+                    on_event=on_event,
+                )
+            except Exception as exc:
+                observation.update(error=exc, success=False)
+                raise
+            observation.update(
+                output={
+                    "content": response.content,
+                    "tool_calls": response.tool_calls,
+                    "finish_reason": response.finish_reason,
+                },
+                success=True,
+            )
+            return response
 
     def _persist(self, session_id: str, message: Message) -> Message:
         """Mint an idempotency key if absent, then append to the session."""

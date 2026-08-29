@@ -2763,3 +2763,329 @@ Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类�
 
 "把启动面板的 `Subagents: 2` 从'可用类型数'改成'实时运行中数'。数据源是现成的 `SubagentManager.running_count()`；runtime 只把 startup_info 拆成 `subagent_types`（门控）+ `subagent_running`（实时值），TUI 渲染 `Subagents: N running`，CLI 每轮 turn 后对比 running_count 与缓存值，变化时追加打印一行。没有整块重绘 banner，因为 `Live` spinner 和 prompt_toolkit 输入同时在场，追加式更稳。测试覆盖启动快照为 0、后台 spawn 后 running 升为 1、结束后归 0，并容忍后台线程抢先完成的竞态。"
 
+---
+
+## Stage 18 addendum — interactive TTY rendering polish
+
+### Problem and goal
+
+用户反馈当前 Aegis CLI 界面“各种渲染”比较弱，至少应该支持特殊字体、高亮和代码显示；同时输入框在普通终端 scrollback 中，滚轮翻历史时会跟着输出一起移动。目标是参考 Claude Code CLI 的界面体验，先在 Aegis 现有 Python 架构里提升 TTY 渲染质量与输入提示，而不是迁移 Claude Code 的 TypeScript/Ink/React UI 栈。
+
+### Relevant Hermes and/or Claude Code behavior and source locations
+
+- Claude Code `src/components/Markdown.tsx` / `src/utils/markdown.ts`：Markdown token 渲染、纯文本 fast path、streaming markdown 的稳定前缀思路。
+- Claude Code `src/components/HighlightedCode.tsx`：代码块单独高亮。
+- Claude Code `src/components/BaseTextInput.tsx` / `src/hooks/useTextInput.ts`：输入组件把高亮、placeholder、viewport、键盘编辑和提示拆开。
+- Claude Code `src/ink/components/ScrollBox.tsx` / `src/hooks/useVirtualScroll.ts`：输出区滚动、输入区固定底部、长历史虚拟滚动的结构。
+- Hermes 关系：本次没有新增 Hermes 行为参考；Aegis `tui.py` 原有 banner/spinner 基础仍沿用早期 Hermes attribution。
+
+### Migration decision
+
+**REWRITE / behavioural reference**：只借鉴 Claude Code 的可观察 UI 行为与结构（Markdown/code rendering、composer highlighting、scrollable output + fixed bottom composer 方向），不复制 TypeScript/Ink 代码，也不引入 React/Ink 依赖。实现使用 Aegis 已有的 Rich + prompt_toolkit。
+
+### Aegis design, data flow, and key interfaces
+
+- `TurnEvent.TEXT_DELTA` 在 TTY 下先写入 `_TurnState._text_buffer`；遇到工具调用、工具结果、错误或 `TURN_END` 时由 `_flush_assistant_text()` flush。
+- `_render_markdown_text()` 使用 Rich `Markdown(..., code_theme="monokai", hyperlinks=False)` + `Padding` 渲染；任何 Rich 渲染异常都回退到 plain text，确保 UI 不影响 Agent Loop。
+- 非 TTY 路径保持原来的直接 streaming text 输出，保证 `CliRunner`、管道、日志和脚本化使用不被 Markdown 重排影响。
+- `_FullscreenShell` 使用 prompt_toolkit `Application(full_screen=True)` + `HSplit` + `ScrollablePane`：聊天记录进入上方可滚动 output pane，composer 固定在底部；鼠标滚轮和 PageUp/PageDown 滚动 output pane，不再把输入行一起卷走。
+- prompt_toolkit composer 增加 `_AegisInputLexer`、`bottom_toolbar` 和 inline placeholder：输入中已知 slash command、未知 slash command、引号字符串、路径、`@mention`、`#tag` 会分别着色；底部只保留一条 `/undo`、`/title` 等轻量提示，顶部 placeholder 不再重复 `/help`。
+- 工具调用行用 `Text.assemble` 分层渲染，工具名使用 Aegis info 色，参数摘要保持 dim。
+
+### Important files, classes, functions, and fields
+
+- `src/aegis_agent/tui.py`：`_FullscreenShell`、`_TurnState.append_text` / `pop_text`、`Tui._flush_assistant_text`、`_render_markdown_text`、`_render_to_ansi`、`_AegisInputLexer`、`_highlight_input_line`、`_input_token_style`、`_slash_hint`。
+- `tests/test_tui.py`：新增 Markdown rendering、input lexer、slash hint 测试；保留事件顺序与非 TTY CLI 输出测试。
+- `README.md`：Interactive UX 和 Interactive TTY rendering 说明。
+- `docs/source-map.md`：Stage 18 addendum 记录 Claude Code 行为参考与 Aegis 重写关系。
+
+### Reliability invariants, edge cases, and failure handling
+
+- **UI failure containment**：Markdown 渲染异常不会中断 turn；fallback plain text。
+- **TTY / non-TTY separation**：交互式 TTY 使用 full-screen output pane + fixed composer，并 buffer + Markdown render；非 TTY 保持逐 chunk plain output，测试和脚本依赖稳定。
+- **Tool boundary flushing**：工具调用前先 flush 已有助手文本，避免回复片段与工具状态行混在一起。
+- **Input highlighting is cosmetic**：lexer 只改变展示 fragment style，不影响发送给 slash handler、skill router 或 model 的原始文本。
+- **No source-of-truth change**：所有改动都在 presentation layer；runtime/session/message log 不变。
+
+### Tests, fault injection, and measured results
+
+- `uv run pytest -q tests/test_tui.py` → `7 passed in 0.82s`。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- Windows UNC 路径直接运行 `uv run pytest -q tests/test_tui.py` 曾因 uv 创建 `.venv/lib64` symlink 失败（Windows/UNC 环境限制）中止；改为 `wsl -d Ubuntu -- bash -lc 'cd /home/nacha/aegis-agent && ...'` 后通过。
+
+### Trade-offs, remaining limitations, and TODOs
+
+- full-screen backend 是轻量实现：输出区可滚动、输入区固定，但没有迁移 Claude Code 的完整 virtual-scroll/windowing 算法。
+- TTY 下助手文本会先以 plain live preview 更新，再在工具边界或 turn end 渲染成 Markdown；后续可参考 Claude Code `StreamingMarkdown` 的 stable prefix + unstable suffix 做真正结构化 streaming Markdown。
+- 不支持 full-screen 的终端会自动 fallback 到原 PromptSession 路径。
+
+### Concise interview-ready explanation
+
+"这次把 Aegis 的 CLI 展示层从普通 scrollback PromptSession 升级成 TTY 下的 full-screen layout：上方是 prompt_toolkit `ScrollablePane` 聊天记录，底部 composer 固定，不会跟着滚轮翻历史一起移走；鼠标滚轮和 PageUp/PageDown 滚的是输出区。模型 deltas 先以 plain live preview 显示，完成一个回复片段后用 Rich Markdown 渲染，所以标题、列表、粗体、inline code、代码块都有样式和语法高亮；非 TTY 仍保持逐 chunk plain streaming，避免破坏脚本和测试。输入侧用 prompt_toolkit Lexer + bottom toolbar 做 composer polish，高亮 slash command、路径、引号、mention/tag，且 placeholder 只显示 `Ask Aegis...`，不再和底部 `/help` 提示重复。参考的是 Claude Code 的 Markdown/TextInput/ScrollBox 行为，但代码完全用 Aegis 的 Python/Rich/prompt_toolkit 重写，没有迁移 Ink/React UI 栈。"
+
+---
+
+## Aegis Agent Quality Stage 0 — Langfuse observability
+
+### Problem and goal
+
+本阶段只为现有 Aegis Agent 增加一次完整任务执行的 Langfuse Trace。要求一个
+`AgentRuntime.run_turn` 对应一个顶层 Agent observation，内部模型、工具、子 Agent 和最终
+结果可见，同时保证观测后端任何故障都不改变 Runtime 行为。本阶段不包含
+Evaluation、Harbor、Process Evaluation、Failure Attribution、Regression 或 Quality Gate。
+
+### Relevant current Aegis source locations
+
+- Agent Run / Final Result：`src/aegis_agent/cli.py::_repl` 调用
+  `src/aegis_agent/runtime.py::AgentRuntime.run_turn`；内部 loop 返回 `TurnResult`。
+- Model Call：`AgentRuntime` 原有的统一边界是
+  `collect_response(self._provider.stream(...))`，现由 `_call_model` 在同一位置包装。
+- Tool Call：`src/aegis_agent/tools/executor.py::ToolExecutor.execute_one` 是所有工具的
+  统一执行入口；本次没有修改任何具体 Tool。
+- Subagent：`AgentTool.run` → `SubagentManager.spawn/_execute` →
+  `SubagentRunner.run` → 子 `AgentRuntime.run_turn`。
+- 文档与源码存在差异时，以上当前源码调用链为准。
+
+### External reference and implementation decision
+
+- 使用 Langfuse Python SDK v4 推荐的 `Langfuse` client、
+  `start_as_current_observation(...)` 和 `propagate_attributes(...)`。
+- 选择 **original additive implementation**：Aegis Runtime 仅依赖内部 `Observability`
+  协议，Langfuse 隔离在 adapter 中，以后可替换为 OpenTelemetry 或其他后端。
+- Langfuse 是 `observability` optional extra；未安装 SDK、未配置完整密钥或初始化
+  失败时自动使用 `NoopObservability`。
+- 本阶段没有使用 Hermes 或 Claude Code 作为观测行为参考，也没有修改两个
+  reference repository。
+
+### Aegis design, data flow, and trace hierarchy
+
+```text
+AgentRuntime.run_turn
+└── Aegis Run (agent)
+    ├── Model Call (generation)
+    ├── Tool Call: <name> (tool)
+    ├── Tool Call: Agent (tool)
+    │   └── Subagent Run: <type> (agent)
+    │       ├── Model Call (generation)
+    │       ├── Tool Call: <name> (tool)
+    │       └── Final Result (span)
+    ├── Model Call (generation)
+    └── Final Result (span)
+```
+
+- 顶层 Agent 记录 task、session id、agent name、Aegis version、result、success/error；
+  latency 由 SDK observation 的开始/结束时间自动得出。
+- Model generation 记录 provider、可用时的 model、messages、output、finish reason、
+  tool calls 和 error。
+- Tool observation 记录 name、arguments、result、success/error；例外仍按原来语义
+  返回或抛出。
+- 子 Runtime 共享同一 Observability 实例。后台线程使用 `contextvars.copy_context()`
+  携带当前 observation parent，使子 Agent 内部 model/tool 挂在子 Agent 节点下。
+- `sanitize` 在 adapter 边界统一处理输入、输出和 metadata：递归脱敏常见
+  credential key、Bearer/token 模式，限制递归深度/集合大小，并将长字符串截断为
+  20,000 字符且保留原始长度。
+
+### Important files and interfaces
+
+- `src/aegis_agent/observability/tracer.py`：`Observability` / `Observation` 协议、
+  `NoopObservability`、`LangfuseObservability`、`create_observability`。
+- `src/aegis_agent/observability/sanitize.py`：`sanitize`。
+- `src/aegis_agent/runtime.py`：Agent/Model/Final 观测边界与子 Runtime 共享。
+- `src/aegis_agent/tools/executor.py`：统一 Tool observation。
+- `src/aegis_agent/agents/runner.py`, `agents/manager.py`：子 Runtime 传递与背景上下文传播。
+- `tests/test_observability.py`：本阶段的确定性 Trace/故障注入测试。
+
+### Reliability invariants and failure handling
+
+- Langfuse 创建、更新、关闭 observation，属性传播、flush/shutdown 任一步异常
+  都在 adapter 内捕获，不进入 Agent 业务错误路径。
+- `ToolExecutor` 先保留原有 result/exception/cancellation，再以最小包装更新 Trace，
+  不改变工具错误如何返馈给模型。
+- 未配置时的 no-op 不进行网络请求。配置后 SDK 的异步上报在进程 shutdown
+  路径 flush，上报失败仍不影响 Aegis shutdown。
+- 不将密钥硬编码或写入 Trace；配置只从 `LANGFUSE_PUBLIC_KEY`、
+  `LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` 读取。
+
+### Tests, fault injection, and measured results
+
+- `uv run pytest -q tests/test_observability.py` → `6 passed`：普通 Model→Tool→Model→Final、
+  Tool failure recovery、Subagent 父子层级、未配置 no-op、模拟 Langfuse 不可用、
+  sanitize 和 SDK v4 adapter 参数。
+- `uv run pytest -q tests/test_runtime.py tests/test_runtime_streaming.py tests/test_runtime_config.py tests/test_tools.py tests/test_subagent.py tests/test_subagent_v2.py`
+  → `68 passed in 509.06s`，覆盖相关 Runtime/Tool/Subagent 回归。
+- `uv run pytest -q` → `643 passed, 2 skipped in 530.69s`。
+- `uv run ruff check src/aegis_agent/observability src/aegis_agent/runtime.py src/aegis_agent/tools/executor.py src/aegis_agent/agents/runner.py src/aegis_agent/agents/manager.py tests/test_observability.py`
+  → `All checks passed!`。
+- `uv run mypy src/aegis_agent/observability` → `Success: no issues found in 3 source files`。
+- 全仓 `ruff check .` 仍报 6 个与本阶段无关的已有文件问题，另外已修复并验证
+  本次 `runtime.py` import 格式；全仓 `mypy src` 的剩余 22 个错误位于既有
+  session/MCP/web/skills/runtime/agents/CLI 代码，新增 observability 包单独检查通过。
+
+### Trade-offs, current gaps, and TODOs
+
+- 当前 `ChatResponse` / model event stream 没有 token usage、cache token 或 cost 字段，
+  因此本阶段不伪造或估算这些值。
+- model 名称仅在当前 provider 暴露时采集；provider 类型始终作为 metadata。
+- 本阶段只增加 Trace，不生成 score、grader、dataset、dashboard、alert 或 quality gate。
+- 没有为实现 Trace 而重构 Agent Loop；新接口是后端中立的，下一阶段若需
+  OpenTelemetry 可在 adapter 层扩展。
+
+### Concise interview-ready explanation
+
+"这次接入选择了五个现成统一边界：`run_turn`、provider stream、`ToolExecutor.execute_one`、
+子 `run_turn` 和 `TurnResult`。Runtime 只依赖内部 Observability protocol，Langfuse v4 是一个
+optional adapter。一次 turn 形成 Aegis Run，model/tool/final 是子 observation；Agent 工具下的
+子 Runtime 再形成 Subagent Run，并用 ContextVar 在后台线程传播 parent。所有 SDK 操作都
+fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reason。进入 backend 前所有数据
+统一脱敏和截断。当前 Aegis 模型层拿不到 token/cache/cost，所以明确留空，不伪造。"
+
+---
+
+## Stage 18 repair — fixed composer and usable scrollback
+
+### Task goal and original problem
+
+修复 `master` 上刚加入的 full-screen TTY：历史窗启动后是空白，提交消息仍看不到交互记录；
+工具调用、工具结果和错误直接写到底层 terminal，破坏 full-screen 重绘；底部同时出现 placeholder
+与整行反色提示，视觉噪声过多。目标收敛为上方独立可滚动的完整交互历史，以及底部始终可见的
+单行用户输入框，同时保留已有 Rich Markdown 和代码高亮。
+
+### Relevant reference behavior and migration decision
+
+- Claude Code `src/components/FullscreenLayout.tsx` 的行为参考：消息区与 bottom slot 分离；
+  手动离开底部后 streaming 不强制拉回，重新提交时恢复 tail following。
+- Hermes `cli.py` 的 prompt_toolkit 固定底部输入布局作为轻量结构参考。
+- 选择 **behavioural rewrite / repair**：未复制 React/Ink 或 Hermes CLI 代码，只修正 Aegis
+  已有的 Python `ScrollablePane` 实现并保持依赖不变。
+
+### Aegis design and main data flow
+
+- `_FullscreenShell._formatted_output()` 根据历史实际物理行数和 terminal 高度计算
+  `_last_max_scroll`，不再用 `10**9` 作为滚动位置。`_follow_output=True` 时贴住尾部；PageUp/
+  mouse wheel 向上后关闭跟随，新增 streaming 内容保持当前位置；滚回底部或提交新输入后恢复跟随。
+- Rich 的 ANSI 预渲染宽度预留一个 scrollbar cell，避免 scrollbar 出现时 Panel 多包一列、
+  高度翻倍并把最新内容挤出视口。
+- full-screen `prompt()` 提交后将原始用户文本以 `you❯` 写入历史。assistant Markdown、tool call、
+  tool result、runtime error 和 terminal stop status 都经 `_FullscreenShell.print_renderable()` 进入同一
+  history buffer，禁止再向底层 `Console` 穿透输出。
+- bottom slot 只保留一条分隔线和单行 `❯` composer；删除 full-screen placeholder 与反色 hint row。
+  非 full-screen PromptSession fallback 仍保留 placeholder、slash hint、历史和 token lexer。
+
+### Important files and interfaces
+
+- `src/aegis_agent/tui.py`：`_FullscreenShell.prompt`、`_formatted_output`、
+  `_history_viewport_height`、`_history_overflows`、`Tui._emit`、`_render_to_ansi`。
+- `tests/test_tui.py`：tail clamp、manual-scroll stickiness、full-screen tool-output containment 回归测试。
+- `README.md`、`docs/source-map.md`：更新可观察行为与参考关系；未新增 milestone 编号。
+
+### Reliability invariants and edge cases
+
+- full-screen 模式下不存在绕过 history buffer 的 turn-event 输出。
+- 空/短历史从第 0 行显示；长历史的最大 scroll 位置等于 `line_count - viewport_height`，不会出现
+  整片空白。
+- 用户主动滚动历史时，异步 spinner、streaming text 和 tool status 不改变其阅读位置；提交下一条
+  输入明确恢复贴尾。
+- non-TTY streaming 路径完全保留，因此管道、日志和 CliRunner 的文本契约不变。
+- full-screen 初始化失败仍自动回退到 PromptSession。
+
+### Tests and measured results
+
+- `uv run pytest -q tests/test_tui.py` → `10 passed in 0.95s`（最终复跑）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `647 passed, 2 skipped in 542.49s`。
+- `uv run ruff check .` → 仍有 6 个与本修复无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+- 100×30 tmux PTY 手工验证：启动 banner 可见；`you❯` / `aegis❯` / tool call / tool result 同处
+  history；PageUp 只滚动 history；底部 composer 保持固定。
+
+### Trade-offs, remaining limitations, and TODOs
+
+- 当前保留最多 4,000 个预渲染 history lines，没有 Claude Code 的 virtualized message list。
+- prompt_toolkit scrollbar 是轻量指示条；本阶段验证 mouse wheel 与 PageUp/PageDown，不实现
+  unseen-message pill、turn jump 或复杂 selection-preserving scroll。
+- Rich streaming preview 仍在 segment 完成后转换为 Markdown，不是 stable-prefix 增量 Markdown。
+
+### Concise interview-ready explanation
+
+"这个 bug 不是配色问题，而是滚动状态和输出通道错了：代码把 scroll 直接设为十亿，在 history
+window 不持有 focus 时 prompt_toolkit 不会替它 clamp，于是内容全被滚出屏幕；同时 tool/error 还在
+写原 terminal。修复后用实际行数减 viewport 算最大滚动位置，并维护 follow-tail 状态；手动上滚后
+新 token 不抢位置，下一次提交再回到底部。所有用户、assistant、tool、error 输出统一进入 history，
+bottom 只剩单行 composer。Rich Markdown 渲染保留，TTY 与非 TTY 的行为边界也没变。"
+
+---
+
+## Stage 18 repair follow-up — live Markdown and working mouse wheel
+
+### Task goal and original problem
+
+第一次布局修复后，full-screen assistant 在 streaming 阶段仍以 plain `Text` 显示，只有收到
+tool boundary 或 `TURN_END` 才变成 Rich Markdown；同时 PageUp/PageDown 可滚动，但 Windows
+Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外层 `ScrollablePane` 的
+`vertical_scroll`。目标是在不改变固定 composer 和最终字体风格的前提下修复这两条交互路径。
+
+### Relevant reference behavior and migration decision
+
+- Claude Code `src/components/Markdown.tsx::StreamingMarkdown` 提供 streaming 阶段已有格式的
+  可观察行为参考；Aegis 不迁移其 stable-prefix/Ink 实现，而是在现有 10 Hz full-screen refresh
+  中重渲染累计 Rich Markdown。
+- Claude Code `src/components/ScrollKeybindingHandler.tsx::scroll:lineUp/lineDown` 提供 wheel
+  直接控制 message scroll box、离底后关闭 sticky、回到底部恢复 sticky 的行为参考。
+- Hermes 当前 `cli.py` 明确使用 `mouse_support=False`，因此不适合作为本次 wheel 修复来源。
+- 决策为 **behavioural rewrite / targeted repair**，没有复制参考代码或增加依赖。
+
+### Aegis design and main data flow
+
+- `Tui._render_event(TEXT_DELTA)` 继续将 delta 累加到 `_TurnState`，但 live slot 现在接收
+  `_assistant_markdown_renderable(state.peek_text())`，和最终 `_flush_assistant_text()` 使用完全相同的
+  Rich `Group(label, Markdown)` 结构。每次 prompt_toolkit refresh 都显示当前累计 Markdown。
+- `_HistoryControl` 扩展 `FormattedTextControl.mouse_handler()`：只截获 `SCROLL_UP` /
+  `SCROLL_DOWN`，其余点击行为交回基类。wheel 事件经 `_FullscreenShell._scroll_history()` 修改
+  外层 pane，而不再落到高度等于全部内容的内层 `Window`。
+- wheel 与 PageUp/PageDown 共用 clamp 和 sticky 状态：向上滚设置 `_follow_output=False`；向下
+  到 `_last_max_scroll` 时恢复；所有目标都限制在 `[0, _last_max_scroll]`。
+
+### Important files and interfaces
+
+- `src/aegis_agent/tui.py`：`_HistoryControl`、`_handle_history_mouse`、`_scroll_history`、
+  `_assistant_markdown_renderable`、`Tui._render_event`。
+- `tests/test_tui.py`：`test_fullscreen_streaming_preview_is_markdown_rendered` 和
+  `test_fullscreen_mouse_wheel_scrolls_history`。
+- `README.md`、`docs/source-map.md`：更新 streaming 与 wheel 的用户可见行为和参考关系。
+
+### Reliability invariants and edge cases
+
+- turn 未结束时 live preview 已是 Markdown，结束时只从 live slot 原样提交到 history，不出现
+  plain-to-Markdown 的突然替换。
+- incomplete Markdown 允许在后续 delta 到来时自然重排；UI 渲染异常仍走已有 plain fallback。
+- wheel burst 不会产生负 scroll 或越过 history tail；短历史下 scroll clamp 为 0。
+- 用户上滚后新 token 不抢走阅读位置；向下滚到底后 streaming 才继续贴尾。
+- non-TTY char-by-char output 路径未改变。
+
+### Tests and measured results
+
+- `uv run pytest -q tests/test_tui.py` → `12 passed in 1.58s`（最终复跑）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `649 passed, 2 skipped in 528.69s`。
+- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+- 100×30 tmux VT100 实测：连续三轮工具输出后发送三次 SGR wheel-up 序列，history 从尾部移动到
+  banner/第一轮消息，固定 composer 保持在底部。
+
+### Trade-offs, remaining limitations, and TODOs
+
+- 当前对累计文本做完整 Rich Markdown 重渲染；实现简单且刷新上限为 10 Hz，但超长单段回复的
+  渲染成本高于 stable-prefix/unstable-suffix 增量方案。
+- incomplete fenced code/table 在 streaming 中可能短暂重排，这是 Markdown 流式渲染的预期行为。
+- scrollbar 仍是 prompt_toolkit 指示条，不实现抓住 thumb 拖拽或 selection-preserving scroll。
+
+### Concise interview-ready explanation
+
+"两个现象来自两条不同的事件路由：delta live slot 用的是 plain Text，所以最终 flush 才出现
+Markdown；VT100 wheel 则交给内层 Window，而真正的 scroll offset 在外层 ScrollablePane。现在
+streaming 与 final 共用同一个 Rich Markdown renderable，wheel 和 PageUp/PageDown 也共用一个
+clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了离底/回底 sticky 状态。"

@@ -26,6 +26,7 @@ guard against duplicate task-notifications.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -221,9 +222,13 @@ class SubagentManager:
             self._tasks[task_id] = task
 
         if background:
+            # Preserve the active observability context in the worker thread so
+            # the child Agent/Model/Tool observations remain attached to the
+            # parent trace.  ``copy_context`` is otherwise behavior-neutral.
+            worker_context = contextvars.copy_context()
             thread = threading.Thread(
-                target=self._run_and_notify,
-                args=(task, definition, prompt, child_ctx, parent_messages),
+                target=worker_context.run,
+                args=(self._run_and_notify, task, definition, prompt, child_ctx, parent_messages),
                 name=f"aegis-subagent-{task_id}",
                 daemon=True,
             )

@@ -27,6 +27,7 @@ from typing import Any
 from aegis_agent.exceptions import OperationCancelled
 from aegis_agent.models.base import Message, Role, ToolCall, ToolResult
 from aegis_agent.models.sanitize import repair_tool_call_arguments
+from aegis_agent.observability import NoopObservability, Observability
 from aegis_agent.tools.registry import ToolContext, ToolRegistry
 
 
@@ -38,9 +39,19 @@ class ToolExecutor:
     plan, Stage 4).
     """
 
-    def __init__(self, registry: ToolRegistry, context: ToolContext | None = None) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        context: ToolContext | None = None,
+        observability: Observability | None = None,
+    ) -> None:
         self._registry = registry
         self._context = context or ToolContext()
+        self._observability = observability or NoopObservability()
+
+    def set_observability(self, observability: Observability) -> None:
+        """Attach the runtime's shared tracer after dependency construction."""
+        self._observability = observability
 
     def execute(
         self,
@@ -55,6 +66,34 @@ class ToolExecutor:
         ]
 
     def execute_one(
+        self,
+        tool_call: ToolCall,
+        is_cancelled: Callable[[], bool] | None = None,
+        session_id: str | None = None,
+    ) -> ToolResult:
+        """Trace one tool call while preserving the executor's error contract."""
+        with self._observability.tool_call(
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+        ) as observation:
+            try:
+                result = self._execute_one(
+                    tool_call,
+                    is_cancelled=is_cancelled,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                observation.update(error=exc, success=False)
+                raise
+            observation.update(
+                output=result.content,
+                error=result.content if result.is_error else None,
+                success=not result.is_error,
+                metadata={"tool_call_id": tool_call.id},
+            )
+            return result
+
+    def _execute_one(
         self,
         tool_call: ToolCall,
         is_cancelled: Callable[[], bool] | None = None,

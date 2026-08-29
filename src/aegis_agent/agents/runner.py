@@ -45,6 +45,7 @@ from aegis_agent.context.prompt_sections import (
 )
 from aegis_agent.context.system_prompt import SystemPromptBuilder
 from aegis_agent.models.base import Message, ModelProvider
+from aegis_agent.observability import NoopObservability, Observability
 from aegis_agent.runtime import AgentConfig, AgentRuntime, StopReason
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
 from aegis_agent.tools.executor import ToolExecutor
@@ -108,12 +109,14 @@ class SubagentRunner:
         cwd: str | None = None,
         allow_dangerous_shell: bool = False,
         allowed_agent_types: frozenset[str] | None = None,
+        observability: Observability | None = None,
     ) -> None:
         self._provider = provider
         self._parent_registry = parent_registry
         self._cwd = cwd
         self._allow_dangerous_shell = allow_dangerous_shell
         self._allowed_agent_types = allowed_agent_types
+        self._observability = observability or NoopObservability()
         # Optional extra tools merged into every sub-registry this runner
         # builds (e.g. the team ``send_message`` tool a teammate needs).  Set by
         # the Team layer via :meth:`add_extra_tool`; empty for plain subagents.
@@ -201,6 +204,7 @@ class SubagentRunner:
                 agent_name=definition.name,
                 max_iterations=definition.max_iterations,
             ),
+            observability=self._observability,
         )
 
         # Reuse the caller's session (persistent teammate) or create a private

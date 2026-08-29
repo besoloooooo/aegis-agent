@@ -373,3 +373,51 @@ Notes:
 - Teams and teammate transports are in-process in this stage; durable rosters,
   cross-process mailboxes, and remote A2A transports are future work.
 - No Hermes or Claude Code reference repository was modified.
+
+## Stage 18 addendum — interactive TTY rendering polish
+
+Improves the existing Aegis REPL presentation layer without changing the agent
+loop. Claude Code is used as a behavioural reference for Markdown rendering,
+code highlighting, compact status separation, scrollable output with a fixed
+bottom composer, and highlighted composer tokens; Aegis implements the behaviour
+in Python with its existing Rich and prompt_toolkit dependencies rather than
+migrating the TypeScript/Ink UI stack.
+
+| Aegis file | Relationship | Claude Code reference → symbol | Notes |
+|---|---|---|---|
+| `src/aegis_agent/tui.py` (`_assistant_markdown_renderable`, `_TurnState` text buffering, `_flush_assistant_text`) | **REWRITE** | `src/components/Markdown.tsx` (`Markdown`, `StreamingMarkdown`), `src/utils/markdown.ts`, `src/components/HighlightedCode.tsx` | Each full-screen assistant delta updates a cumulative Rich Markdown live renderable, so headings, lists, emphasis, and code styling appear before turn end; the same renderable shape is committed at tool boundaries or turn end. Non-TTY output keeps the plain streaming path. This borrows the observable Markdown/code-rendering goal, not Claude Code's marked/Ink implementation. |
+| `src/aegis_agent/tui.py` (`_FullscreenShell`, `_HistoryControl`) | **REWRITE** | Claude Code `src/components/FullscreenLayout.tsx`, `src/components/ScrollKeybindingHandler.tsx`, `src/ink/components/ScrollBox.tsx`; Hermes `cli.py` fixed-bottom prompt layout | Adds a prompt_toolkit full-screen layout with a scrollable output pane and fixed one-row bottom composer. The 2026-08-29 repairs clamp tail-following to the real viewport, preserve position after manual scroll-up, record submitted user text, route tool/error output through the history buffer, and explicitly forward VT100 wheel events from the inner history control to the outer `ScrollablePane`. It does not port Claude Code's DOM/Ink ScrollBox, virtual-scroll implementation, or Hermes' full CLI layout. |
+| `src/aegis_agent/tui.py` (`_AegisInputLexer`, `_highlight_input_line`, `_slash_hint`, prompt_toolkit style) | **REWRITE** | `src/components/BaseTextInput.tsx`, `src/hooks/useTextInput.ts` | Adds lightweight composer token highlighting for known slash commands, unknown slash commands, quoted strings, path-like tokens, mentions, and tags. The full-screen composer intentionally stays one clean row; `_slash_hint` remains available only to the non-full-screen PromptSession fallback. It stays within prompt_toolkit instead of porting Claude Code's React input component. |
+| `src/aegis_agent/tui.py` (tool status styling) | **REWRITE** | Claude Code REPL status/output separation | Tool call names now have clearer colour hierarchy while results remain compact one-line summaries. |
+| `tests/test_tui.py` | **original** | — | Adds coverage for Markdown rendering safety/ANSI styling, live Markdown before turn end, mouse-wheel scrolling, tail stickiness, composer token classification, and slash hints while preserving existing event-order and CLI plain-output tests. |
+| `README.md`, `docs/development-log.md` | **original** | — | Documents the interactive UX improvement and records the migration decision. |
+
+Limit: the full-screen backend is intentionally lightweight: it gives the output
+pane its own prompt_toolkit scroll region and keeps the composer fixed at the
+bottom, but it does not implement Claude Code's full virtual-scroll/windowing
+algorithm or unseen-message pill. Unsupported terminals still fall back to
+PromptSession.
+
+## Aegis Agent Quality Stage 0 — Langfuse observability
+
+This stage is an original, additive Aegis integration. It follows Langfuse's
+documented Python SDK v4 observation model, but does not copy code or runtime
+behaviour from the Hermes or Claude Code reference repositories.
+
+| Aegis file | Relationship | External reference | Notes |
+|---|---|---|---|
+| `src/aegis_agent/observability/tracer.py` | **original** | Langfuse Python SDK v4 `start_as_current_observation` / `propagate_attributes` | Defines the backend-neutral Aegis observability protocols, a no-op backend, and a fail-open Langfuse adapter. |
+| `src/aegis_agent/observability/sanitize.py` | **original** | — | Recursive secret redaction and bounded payload conversion before data reaches a backend. |
+| `src/aegis_agent/runtime.py` | **original additive change** | — | Wraps each turn, unified model seam, and final result without changing the agent loop's decisions. |
+| `src/aegis_agent/tools/executor.py` | **original additive change** | — | Instruments the existing centralized tool executor; concrete tools remain untouched. |
+| `src/aegis_agent/agents/runner.py`, `agents/manager.py` | **original additive change** | — | Shares the tracer with child runtimes and propagates the active context into background subagent threads. |
+| `tests/test_observability.py` | **original** | — | Deterministic hierarchy, tool failure, subagent nesting, sanitization, and fail-open coverage. |
+| `pyproject.toml`, `uv.lock`, `THIRD_PARTY_NOTICES.md` | **dependency metadata** | Langfuse 4.x (MIT) | Keeps Langfuse optional under the `observability` extra. |
+
+Official SDK references used for compatibility decisions:
+
+- <https://langfuse.com/docs/observability/sdk/overview>
+- <https://langfuse.com/docs/observability/sdk/instrumentation>
+- <https://langfuse.com/docs/observability/features/observation-types>
+
+No Hermes or Claude Code reference repository was modified for this stage.

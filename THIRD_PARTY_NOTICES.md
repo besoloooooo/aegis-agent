@@ -61,6 +61,7 @@ licences:
 | pyfiglet  | MIT      |
 | pyyaml    | MIT      |
 | mcp (optional) | MIT      |
+| langfuse (optional) | MIT      |
 | prompt_toolkit | BSD-3-Clause |
 | wcwidth   | MIT      |
 

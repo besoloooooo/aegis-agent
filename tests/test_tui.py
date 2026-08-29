@@ -13,14 +13,29 @@ Two concerns:
 
 from __future__ import annotations
 
+import io
+
 import pytest
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from rich.console import Console
 from typer.testing import CliRunner
 
 from aegis_agent.cli import app
 from aegis_agent.events import ModelEvent
-from aegis_agent.models.base import ToolCall
+from aegis_agent.models.base import ToolCall, ToolResult
 from aegis_agent.runtime import AgentRuntime, StopReason, TurnEvent, TurnEventKind
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
+from aegis_agent.tui import (
+    _PROMPT_PLACEHOLDER,
+    _THEME,
+    Tui,
+    _FullscreenShell,
+    _highlight_input_line,
+    _render_markdown_text,
+    _render_to_ansi,
+    _slash_hint,
+)
 
 runner = CliRunner()
 
@@ -114,3 +129,155 @@ def test_cli_streams_plain_echo():
     # Streamed char-by-char, but the concatenation must still appear verbatim.
     assert "Echo: hello aegis" in result.output
     assert "bye." in result.output
+
+
+def test_render_markdown_text_handles_common_markdown():
+    console = Console(record=True, force_terminal=True, width=100)
+
+    _render_markdown_text(
+        console,
+        "# Title\n\n- **bold** and `code`\n\n```python\nprint('hi')\n```",
+    )
+
+    output = console.export_text(styles=True)
+    assert "Title" in output
+    assert "bold" in output
+    assert "code" in output
+    assert "print" in output
+    assert "\x1b[" in output
+
+
+def test_input_highlight_line_marks_slash_and_paths():
+    fragments = _highlight_input_line('/undo 2 "quoted" ./src @agent #tag')
+
+    assert ("class:slash.known", "/undo") in fragments
+    assert ("class:string", '"quoted"') in fragments
+    assert ("class:path", "./src") in fragments
+    assert ("class:mention", "@agent") in fragments
+    assert ("class:tag", "#tag") in fragments
+
+
+def test_prompt_placeholder_does_not_duplicate_bottom_help():
+    assert "/help" not in _PROMPT_PLACEHOLDER
+
+
+def test_slash_hint_reports_known_and_unknown_commands():
+    assert "back up" in _slash_hint("/undo 2")
+    assert "unknown slash command" in _slash_hint("/does-not-exist")
+    assert "/help" in _slash_hint("hello")
+
+
+def test_fullscreen_history_follows_tail_without_overscrolling(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+
+    shell._append_lines("\n".join(f"line {i}" for i in range(10)))
+    shell._formatted_output()
+
+    assert shell.scroll.vertical_scroll == 5
+    assert shell._last_max_scroll == 5
+
+
+def test_fullscreen_history_does_not_snap_back_after_scroll_up(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+    shell._append_lines("\n".join(f"line {i}" for i in range(10)))
+    shell._formatted_output()
+    shell._follow_output = False
+    shell.scroll.vertical_scroll = 2
+
+    shell._append_lines("new output")
+    shell._formatted_output()
+
+    assert shell.scroll.vertical_scroll == 2
+    assert shell._last_max_scroll == 6
+
+
+class _RecordingShell:
+    def __init__(self) -> None:
+        self.rendered = []
+        self.live = None
+
+    def set_live(self, renderable) -> None:
+        self.live = renderable
+
+    def print_renderable(self, renderable) -> None:
+        self.rendered.append(renderable)
+
+
+def test_fullscreen_tool_status_stays_inside_history():
+    tui = Tui(console=Console(file=io.StringIO(), force_terminal=False))
+    shell = _RecordingShell()
+    tui._shell = shell
+    state = tui.begin_turn()
+
+    tui._render_event(
+        state,
+        TurnEvent(
+            kind=TurnEventKind.TOOL_CALL,
+            tool_call=ToolCall(id="c1", name="list_directory", arguments='{"path":"."}'),
+        ),
+    )
+    tui._render_event(
+        state,
+        TurnEvent.from_tool_result(
+            ToolResult(
+                tool_call_id="c1",
+                name="list_directory",
+                content='{"entries": [1, 2]}',
+            )
+        ),
+    )
+
+    rendered_text = "\n".join(str(item) for item in shell.rendered)
+    assert "🔧 list_directory" in rendered_text
+    assert "✓ list_directory" in rendered_text
+
+
+def test_fullscreen_streaming_preview_is_markdown_rendered():
+    tui = Tui(console=Console(file=io.StringIO(), force_terminal=False))
+    shell = _RecordingShell()
+    tui._shell = shell
+    state = tui.begin_turn()
+
+    tui._render_event(
+        state,
+        TurnEvent(
+            kind=TurnEventKind.TEXT_DELTA,
+            text="# Live title\n\n- **bold while streaming**",
+        ),
+    )
+
+    assert shell.live is not None
+    preview = _render_to_ansi(shell.live, theme=_THEME)
+    assert "Live title" in preview
+    assert "bold while streaming" in preview
+    assert "**" not in preview
+
+
+def test_fullscreen_mouse_wheel_scrolls_history(monkeypatch):
+    shell = _FullscreenShell(theme=_THEME)
+    monkeypatch.setattr(shell, "_history_viewport_height", lambda: 5)
+    shell._append_lines("\n".join(f"line {i}" for i in range(10)))
+    shell._formatted_output()
+    assert shell.scroll.vertical_scroll == 5
+
+    scroll_up = MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=MouseEventType.SCROLL_UP,
+        button=MouseButton.NONE,
+        modifiers=frozenset(),
+    )
+    scroll_down = MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=MouseEventType.SCROLL_DOWN,
+        button=MouseButton.NONE,
+        modifiers=frozenset(),
+    )
+
+    assert shell.output_control.mouse_handler(scroll_up) is None
+    assert shell.scroll.vertical_scroll == 2
+    assert shell._follow_output is False
+    assert shell.output_control.mouse_handler(scroll_down) is None
+    assert shell.scroll.vertical_scroll == 5
+    assert shell._follow_output is True

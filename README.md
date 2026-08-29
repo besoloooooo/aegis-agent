@@ -35,9 +35,15 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 
 **Interactive UX**
 18. Slash-command suite — `/save` `/new` `/history` `/undo` `/retry` `/title` …
+    plus a full-screen TTY layout with scrollable chat history, fixed bottom
+    composer, Markdown replies, and highlighted input tokens.
 
 **Multi-agent orchestration**
 19. Multi-agent orchestration — `Agent`, `team_create`, `send_message`, `/agents`
+
+**Agent quality foundation**
+- Quality Stage 0 — optional Langfuse end-to-end traces for Agent runs, model
+  calls, tool calls, subagents, and final results
 
 ---
 
@@ -51,6 +57,7 @@ src/aegis_agent/
 ├── runtime.py      # AgentRuntime — the agent loop
 ├── events.py       # model event stream
 ├── agents/         # subagents, teams, inter-agent messaging
+├── observability/  # fail-open tracing API, sanitization, Langfuse adapter
 ├── models/         # ModelProvider protocol, fake / OpenAI providers, Message / ToolCall
 ├── tools/          # tool registry, executor, builtin tools
 ├── context/        # context builder + compression
@@ -149,7 +156,31 @@ The interactive REPL understands `/commands` (type `/help` inside the REPL):
 ```
 
 A `/token` matching no command falls through to skill routing, then to the
-model unchanged.
+model unchanged. In an interactive TTY, the composer highlights known slash
+commands, quoted strings, path-like tokens, mentions, and tags, and shows a
+small command hint while typing.
+
+---
+
+## 🖥 Interactive TTY rendering
+
+The live terminal UI uses Rich and prompt_toolkit. In an interactive TTY, the
+current assistant segment is re-rendered as Rich Markdown while tokens stream,
+then committed to history at a tool boundary or turn end. Headings, lists,
+emphasis, inline code, fenced code blocks, and tables therefore keep their
+terminal styling during generation as well as afterward. Tool calls still
+appear as compact status lines between response segments.
+
+Interactive TTY sessions use a prompt_toolkit full-screen layout: the chat
+history lives in a scrollable output pane and the composer stays fixed at the
+bottom. Mouse wheel events are routed to the history pane, and PageUp/PageDown
+scroll it from the keyboard, while the input row remains visible. New output
+follows the tail only while the user is already
+at the bottom, so streaming does not pull a manually scrolled history view away.
+The composer keeps prompt_toolkit history, cursor editing, and token highlighting
+in one clean row. User messages, assistant Markdown, tool status, and errors all
+share the history pane. Non-TTY input/output keeps the simpler plain streaming
+path so pipes, logs, and tests remain stable.
 
 ---
 
@@ -225,6 +256,48 @@ Current limits: teams and teammate mailboxes are in-process only; team state and
 teammate transcripts are not durable across process restarts; `/agents` does not
 yet list complete team membership; nested subagent creation is intentionally
 limited to prevent runaway recursion.
+
+---
+
+## 🔭 Langfuse Observability (Quality Stage 0)
+
+Langfuse tracing is an optional, fail-open side channel. Install the extra and
+provide both credentials to enable it:
+
+```bash
+uv sync --extra observability
+
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_BASE_URL=https://cloud.langfuse.com  # optional
+
+uv run aegis
+```
+
+Each `AgentRuntime.run_turn` creates one top-level trace. Model calls, centralized
+tool execution, subagent runs, and the final result appear as nested observations:
+
+```text
+Aegis Run
+├── Model Call
+├── Tool Call: list_directory
+├── Tool Call: Agent
+│   └── Subagent Run: explore
+│       ├── Model Call
+│       ├── Tool Call: read_file
+│       └── Final Result
+├── Model Call
+└── Final Result
+```
+
+If the SDK is absent, credentials are incomplete, or Langfuse reporting fails,
+Aegis automatically uses a no-op backend and preserves the original runtime
+result and error handling. Trace payloads are recursively redacted for common
+credential fields and secret patterns; long strings are capped at 20,000
+characters with their original length retained as metadata.
+
+The current Aegis model-event contract does not expose token usage, cache tokens,
+or cost, so those fields are intentionally left unset instead of being estimated.
 
 ---
 
