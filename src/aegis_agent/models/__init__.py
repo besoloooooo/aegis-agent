@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from aegis_agent.models.anthropic import AnthropicProvider
 from aegis_agent.models.base import (
     ChatResponse,
     Message,
     ModelProvider,
+    ModelUsage,
     Role,
     ToolCall,
     ToolDefinition,
@@ -17,11 +19,13 @@ from aegis_agent.models.sanitize import repair_tool_call_arguments, sanitize_sur
 from aegis_agent.models.stream import StreamAssembler, assemble_stream
 
 __all__ = [
+    "AnthropicProvider",
     "ChatResponse",
     "FakeModelProvider",
     "FakeReply",
     "Message",
     "ModelProvider",
+    "ModelUsage",
     "OpenAICompatibleProvider",
     "Role",
     "StreamAssembler",

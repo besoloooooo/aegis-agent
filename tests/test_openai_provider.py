@@ -27,6 +27,8 @@ from tests.fakes import (
     make_completion,
     make_completion_tool_call,
     make_tool_call_delta,
+    make_usage,
+    make_usage_only_chunk,
 )
 
 
@@ -47,6 +49,27 @@ def test_streaming_text_response():
     response = collect_response(provider.stream(_user("q")))
     assert response.content == "hi there"
     assert client.calls[0]["stream"] is True
+    assert client.calls[0]["stream_options"] == {"include_usage": True}
+    assert response.usage is None
+
+
+def test_streaming_final_chunk_carries_usage():
+    usage = make_usage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    client = FakeOpenAIClient(
+        results=[
+            [
+                make_chunk(content="answer"),
+                make_chunk(finish_reason="stop"),
+                make_usage_only_chunk(usage),
+            ]
+        ]
+    )
+
+    response = collect_response(_provider(client, stream=True).stream(_user("q")))
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 100
+    assert response.usage.output_tokens == 20
 
 
 def test_streaming_tool_call():
@@ -68,6 +91,30 @@ def test_non_streaming_text_response():
     response = collect_response(provider.stream(_user("q")))
     assert response.content == "answer"
     assert client.calls[0]["stream"] is False
+    assert "stream_options" not in client.calls[0]
+    assert response.usage is None
+
+
+def test_non_streaming_usage_and_direct_cost_are_normalized():
+    usage = make_usage(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        cached_tokens=80,
+        cache_write_tokens=10,
+        cost=0.0123,
+    )
+    completion = make_completion(content="answer", usage=usage)
+
+    response = collect_response(
+        _provider(FakeOpenAIClient(results=[completion]), stream=False).stream(_user("q"))
+    )
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 10
+    assert response.usage.cache_read_tokens == 80
+    assert response.usage.cache_write_tokens == 10
+    assert response.usage.cost == 0.0123
 
 
 def test_non_streaming_tool_call():

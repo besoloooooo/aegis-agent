@@ -32,6 +32,7 @@ from aegis_agent.exceptions import ModelProviderError, ModelTimeoutError
 from aegis_agent.models.base import Message, Role, ToolCall, ToolDefinition
 from aegis_agent.models.sanitize import sanitize_surrogates
 from aegis_agent.models.stream import assemble_stream
+from aegis_agent.models.usage import parse_openai_usage
 
 ENV_API_KEY = "AEGIS_API_KEY"
 ENV_BASE_URL = "AEGIS_BASE_URL"
@@ -160,6 +161,10 @@ class OpenAICompatibleProvider:
             kwargs["max_tokens"] = self._max_tokens
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
+        if self._stream:
+            # Standard Chat Completions streaming only includes token usage on
+            # a final usage-only chunk when explicitly requested.
+            kwargs["stream_options"] = {"include_usage": True}
         return kwargs
 
     def _ensure_client(self) -> Any:
@@ -213,6 +218,9 @@ def _to_wire_message(message: Message) -> dict[str, Any]:
 
 def _events_from_response(response: Any) -> Iterator[ModelEvent]:
     """Turn a non-streaming ChatCompletion into the same ModelEvent stream."""
+    usage = parse_openai_usage(getattr(response, "usage", None))
+    if usage is not None:
+        yield ModelEvent.usage_update(usage)
     choice = _first(response.choices) if getattr(response, "choices", None) else None
     if choice is None:
         yield ModelEvent.done("stop")

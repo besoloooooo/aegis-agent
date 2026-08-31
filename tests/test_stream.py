@@ -6,7 +6,12 @@ import json
 
 from aegis_agent.events import ModelEventKind, collect_response
 from aegis_agent.models.stream import assemble_stream
-from tests.fakes import make_chunk, make_tool_call_delta, make_usage_only_chunk
+from tests.fakes import (
+    make_chunk,
+    make_tool_call_delta,
+    make_usage,
+    make_usage_only_chunk,
+)
 
 
 def _collect(chunks):
@@ -26,9 +31,51 @@ def test_streamed_text_reassembled():
     assert response.finish_reason == "stop"
 
 
-def test_usage_only_chunk_ignored():
+def test_empty_usage_only_chunk_ignored():
     chunks = [make_chunk(content="hi"), make_usage_only_chunk(), make_chunk(finish_reason="stop")]
-    assert _collect(chunks).content == "hi"
+    response = _collect(chunks)
+    assert response.content == "hi"
+    assert response.usage is None
+
+
+def test_final_streaming_usage_chunk_is_aggregated():
+    usage = make_usage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    chunks = [
+        make_chunk(content="hi"),
+        make_chunk(finish_reason="stop"),
+        make_usage_only_chunk(usage),
+    ]
+
+    response = _collect(chunks)
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 100
+    assert response.usage.output_tokens == 20
+    assert response.usage.total_tokens == 120
+
+
+def test_cache_read_and_write_are_separate_exclusive_buckets():
+    usage = make_usage(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        cached_tokens=80,
+        cache_write_tokens=10,
+    )
+
+    response = _collect([make_usage_only_chunk(usage)])
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 10
+    assert response.usage.cache_read_tokens == 80
+    assert response.usage.cache_write_tokens == 10
+    assert response.usage.usage_details() == {
+        "input": 10,
+        "output": 20,
+        "total": 120,
+        "cache_read_input_tokens": 80,
+        "cache_creation_input_tokens": 10,
+    }
 
 
 def test_tool_call_arguments_fragmented_across_chunks():

@@ -421,3 +421,35 @@ Official SDK references used for compatibility decisions:
 - <https://langfuse.com/docs/observability/features/observation-types>
 
 No Hermes or Claude Code reference repository was modified for this stage.
+
+### Quality Stage 0 follow-up — model usage and direct cost propagation
+
+| Aegis file | Relationship | External reference | Notes |
+|---|---|---|---|
+| `src/aegis_agent/models/base.py` (`ModelUsage`, `ChatResponse.usage`) | **original** | Langfuse mutually-exclusive usage-bucket contract | Adds a provider-neutral shape for ordinary input/output, cache read/write, total tokens, and direct upstream cost. |
+| `src/aegis_agent/models/usage.py` | **original adapter code** | OpenAI `CompletionUsage` schema | Converts inclusive OpenAI `prompt_tokens` plus `prompt_tokens_details` into exclusive Aegis buckets; no pricing or token estimation. |
+| `src/aegis_agent/events.py`, `models/stream.py`, `models/openai_compat.py` | **original additive change** | OpenAI Chat Completions final usage-only streaming chunk | Carries usage through a `USAGE` event and preserves it in the assembled `ChatResponse`; requests `stream_options.include_usage`. |
+| `src/aegis_agent/runtime.py` | **original additive change** | — | Passes normalized usage and direct cost through the existing backend-neutral Observation update API. |
+| `tests/test_stream.py`, `tests/test_openai_provider.py`, `tests/test_observability.py` | **original** | — | Covers normal, cached, final streaming, missing usage, direct cost, Langfuse adapter, and no-op behavior. |
+
+Official compatibility reference:
+<https://langfuse.com/docs/observability/features/token-and-cost-tracking>.
+
+### Native Anthropic provider
+
+| Aegis file | Relationship | Reference source | Notes |
+|---|---|---|---|
+| `src/aegis_agent/models/anthropic.py` | **REWRITE + BEHAVIOURAL ADAPT** | Hermes `agent/transports/anthropic.py`; Claude Code `src/services/api/claude.ts` | Implements a small synchronous Anthropic Messages adapter around Aegis's existing provider-neutral protocol. Anthropic `tool_use` / `tool_result`, stop-reason mapping, and separate cache-read/cache-creation buckets follow the reference behavior. Product-specific auth, Bedrock/Vertex routing, prompt construction, retries, and telemetry were not ported. |
+| `src/aegis_agent/models/usage.py` (`parse_anthropic_usage`) | **original adapter code** | Anthropic SDK `Usage`; Claude Code streaming usage merge | Merges `message_start` input/cache usage with final `message_delta` output usage. Non-zero start buckets survive zero-valued final fields; no total or cost is synthesized. |
+| `src/aegis_agent/cli.py`, `models/__init__.py`, `slash_commands.py` | **original additive change** | — | Adds explicit/automatic Anthropic selection, a bounded non-streaming compression sibling, public export, and model-id passthrough through wire capture for observability. |
+| `tests/test_anthropic_provider.py` | **original** | — | Deterministic message/tool conversion, streaming tool assembly, usage/cache merge, missing usage, error normalization, and CLI selection coverage. |
+| `pyproject.toml`, `uv.lock`, `THIRD_PARTY_NOTICES.md` | **dependency metadata** | Anthropic Python SDK (MIT) | Adds the native SDK as a direct runtime dependency. |
+
+Official SDK references used for wire compatibility:
+
+- <https://github.com/anthropics/anthropic-sdk-python>
+- <https://github.com/anthropics/anthropic-sdk-python/blob/main/api.md>
+- <https://github.com/anthropics/anthropic-sdk-python/blob/main/helpers.md>
+- <https://github.com/anthropics/anthropic-sdk-python/blob/main/tools.md>
+
+Neither the Hermes nor Claude Code reference repository was modified.

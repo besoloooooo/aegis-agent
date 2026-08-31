@@ -33,6 +33,7 @@ from typing import Any
 from aegis_agent.events import ModelEvent
 from aegis_agent.models.base import ToolCall
 from aegis_agent.models.sanitize import repair_tool_call_arguments
+from aegis_agent.models.usage import parse_openai_usage
 
 
 @dataclass
@@ -76,6 +77,12 @@ class StreamAssembler:
 
     def feed(self, chunk: Any) -> Iterator[ModelEvent]:
         """Process one chunk, yielding any text-delta events it carries."""
+        usage = parse_openai_usage(getattr(chunk, "usage", None))
+        if usage is not None:
+            # OpenAI emits this on a trailing choices=[] chunk when
+            # stream_options.include_usage is enabled.
+            yield ModelEvent.usage_update(usage)
+
         choice = _first_choice(chunk)
         if choice is None:
             return

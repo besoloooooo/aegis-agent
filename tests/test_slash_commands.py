@@ -73,6 +73,13 @@ def test_resolve_canonical_alias_and_slash_prefix():
     assert resolve_command("nosuch") is None
 
 
+def test_wire_capture_exposes_wrapped_model() -> None:
+    inner = FakeModelProvider()
+    inner.model = "fake-model"  # type: ignore[attr-defined]
+
+    assert WireCaptureProvider(inner).model == "fake-model"
+
+
 def test_registry_names_unique_and_aliases_resolve():
     names = [c.name for c in COMMAND_REGISTRY]
     assert len(names) == len(set(names))

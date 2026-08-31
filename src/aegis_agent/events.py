@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from aegis_agent.exceptions import ModelProviderError, OperationCancelled
-from aegis_agent.models.base import ChatResponse, ToolCall
+from aegis_agent.models.base import ChatResponse, ModelUsage, ToolCall
 
 
 class ModelEventKind(str, Enum):
@@ -28,6 +28,7 @@ class ModelEventKind(str, Enum):
     TEXT_DELTA = "text_delta"      # incremental assistant text
     REASONING_DELTA = "reasoning_delta"  # incremental chain-of-thought text
     TOOL_CALL = "tool_call"        # a complete tool-call request
+    USAGE = "usage"                # cumulative provider usage, usually final
     DONE = "done"                  # terminal event carrying the finish reason
     ERROR = "error"                # terminal event carrying an error message
 
@@ -41,6 +42,7 @@ class ModelEvent:
     tool_call: ToolCall | None = None  # TOOL_CALL payload
     finish_reason: str | None = None   # DONE payload
     error: str | None = None           # ERROR payload
+    usage: ModelUsage | None = None    # USAGE payload
 
     @classmethod
     def text_delta(cls, text: str) -> ModelEvent:
@@ -53,6 +55,10 @@ class ModelEvent:
     @classmethod
     def tool(cls, tool_call: ToolCall) -> ModelEvent:
         return cls(kind=ModelEventKind.TOOL_CALL, tool_call=tool_call)
+
+    @classmethod
+    def usage_update(cls, usage: ModelUsage) -> ModelEvent:
+        return cls(kind=ModelEventKind.USAGE, usage=usage)
 
     @classmethod
     def done(cls, finish_reason: str = "stop") -> ModelEvent:
@@ -93,6 +99,7 @@ def collect_response(
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: list[ToolCall] = []
+    usage: ModelUsage | None = None
     finish_reason = "stop"
     for event in events:
         if on_event is not None:
@@ -106,6 +113,12 @@ def collect_response(
         elif event.kind is ModelEventKind.TOOL_CALL:
             if event.tool_call is not None:
                 tool_calls.append(event.tool_call)
+        elif event.kind is ModelEventKind.USAGE:
+            # Chat Completions usage is cumulative.  Keep the latest event
+            # rather than summing and double-counting providers that emit it
+            # on more than one terminal chunk.
+            if event.usage is not None:
+                usage = event.usage
         elif event.kind is ModelEventKind.DONE:
             finish_reason = event.finish_reason or "stop"
         elif event.kind is ModelEventKind.ERROR:
@@ -115,6 +128,7 @@ def collect_response(
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         reasoning_content="".join(reasoning_parts),
+        usage=usage,
     )
 
 

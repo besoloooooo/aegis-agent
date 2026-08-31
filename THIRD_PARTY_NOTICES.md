@@ -54,6 +54,7 @@ licences:
 
 | Package   | License  |
 |-----------|----------|
+| anthropic | MIT      |
 | openai    | MIT      |
 | typer     | MIT      |
 | rich      | MIT      |

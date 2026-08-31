@@ -3333,3 +3333,156 @@ for dragging. Aegis now hides it and follows Claude Code's established
 Ctrl+End shortcut: one action jumps the logical history position to the tail
 and re-enables sticky live output, while the existing viewport translation
 keeps rendering bounded."
+
+---
+
+## Quality Stage 0 follow-up — Token Usage / Cache Tokens / Cost data chain
+
+### Root cause and targeted call chain
+
+The installed OpenAI SDK exposes `usage` on both `ChatCompletion` and
+`ChatCompletionChunk`. Standard usage contains `prompt_tokens`,
+`completion_tokens`, `total_tokens`, and optional
+`prompt_tokens_details.cached_tokens` / `cache_write_tokens`. Before this
+follow-up, Aegis lost those values at four boundaries:
+
+1. streaming requests did not set `stream_options.include_usage`;
+2. `StreamAssembler` ignored the final `choices=[]` usage-only chunk, while
+   `_events_from_response` ignored non-streaming `response.usage`;
+3. `ModelEvent` and `ChatResponse` had no usage field;
+4. `AgentRuntime._call_model` updated only generation output.
+
+The existing Langfuse adapter already accepted `usage_details` and
+`cost_details`, so no concrete SDK dependency was added to Runtime.
+
+### Data model and propagation
+
+- `ModelUsage` is the provider-neutral structure: `input_tokens`,
+  `output_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+  and optional direct `cost`.
+- `parse_openai_usage` is the OpenAI-compatible adapter. OpenAI
+  `prompt_tokens` is inclusive, so cache read/write detail is subtracted before
+  constructing ordinary `input_tokens`. This produces mutually-exclusive
+  Langfuse buckets and prevents double-counted inferred cost.
+- The provider emits a `ModelEventKind.USAGE`; `collect_response` keeps the
+  latest cumulative usage event in `ChatResponse.usage`. Usage appearing only
+  on the final streaming chunk therefore survives aggregation.
+- Runtime forwards `input`, `output`, `total`, `cache_read_input_tokens`, and
+  `cache_creation_input_tokens` through the existing Observation API.
+- If an OpenAI-compatible gateway directly returns `usage.cost` (or an
+  equivalent direct total cost field), Aegis sends `cost_details.total`.
+  Standard OpenAI Chat Completions does not return cost, so it remains unset.
+  Aegis does not contain a price table or estimate cost.
+
+### Provider compatibility and invariants
+
+- `OpenAICompatibleProvider`: captures standard Chat Completions usage in both
+  streaming and one-shot modes, plus known compatible cache/direct-cost fields.
+- `FakeModelProvider`: accepts optional deterministic `ModelUsage` for tests;
+  normal replies still default to `usage=None`.
+- Providers that return no usage preserve the previous runtime result and
+  event behavior. `USAGE` is a non-UI event, so TUI semantics are unchanged.
+- Observability remains fail-open; No-op Langfuse receives no network traffic,
+  and adding usage cannot fail a model call or turn.
+
+### Tests and verification
+
+- Focused provider/stream/observability/fake tests initially passed:
+  `45 passed, 1 skipped`.
+- Coverage includes normal input/output usage, separate cache read/write,
+  usage only in the final streaming chunk, missing usage, direct API cost,
+  Langfuse v4 update fields, and disabled/failing Langfuse.
+- `uv run pytest -q` → `659 passed, 2 skipped in 527.77s`.
+- Ruff over all files changed in this follow-up → `All checks passed!`.
+- `uv run mypy src/aegis_agent/models src/aegis_agent/events.py src/aegis_agent/observability`
+  → `Success: no issues found in 11 source files`.
+
+### Out of scope and remaining gaps
+
+- No model price database, cost prediction, Evaluation, Harbor, Regression,
+  Quality Gate, or unrelated provider refactor was added.
+- Cost remains `None` whenever the upstream API does not return it. Langfuse
+  may independently infer cost from its configured model definitions, but
+  Aegis does not manufacture or ingest such an estimate.
+
+---
+
+## Quality Stage 0 follow-up — native Anthropic provider
+
+### Goal and provider boundary
+
+This follow-up adds Anthropic as the second real Aegis model adapter without
+changing the Runtime, tool executor, or observability abstractions. The native
+Messages API is used instead of routing Anthropic through the OpenAI-compatible
+wire format:
+
+```text
+Anthropic Messages response/stream
+  -> AnthropicProvider
+  -> provider-neutral ModelEvent / ModelUsage
+  -> collect_response / ChatResponse
+  -> AgentRuntime
+  -> existing Langfuse observation update
+```
+
+`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, and optional `ANTHROPIC_BASE_URL`
+configure the provider. `--model-backend anthropic` forces it; `auto` preserves
+the existing OpenAI-compatible precedence and then chooses Anthropic when its
+key and model are present. Missing configuration still falls back to the fake
+provider in automatic mode.
+
+### Message, tool, and streaming behavior
+
+- System messages are extracted into the Messages API `system` parameter.
+- Aegis assistant tool calls become Anthropic `tool_use` blocks; tool messages
+  become user-role `tool_result` blocks. Tool schemas use `input_schema`.
+- Streaming `text_delta`, `thinking_delta`, and `input_json_delta` events become
+  the existing Aegis text, reasoning, and completed tool-call events.
+- `end_turn`, `tool_use`, `max_tokens`, refusal, and context-window stop reasons
+  are normalized to the same finish-reason vocabulary used by the runtime.
+- SDK/transport errors are normalized to `ModelProviderError` or
+  `ModelTimeoutError`, retaining the existing Runtime error path.
+
+### Usage, cache, total, and cost
+
+Anthropic supplies input/cache usage on `message_start`, then final output
+usage on `message_delta`. `parse_anthropic_usage` cumulatively merges the two;
+zero input/cache values on the final delta do not overwrite previously observed
+non-zero counts. Anthropic `input_tokens` is kept as the ordinary, non-cache
+bucket, while `cache_read_input_tokens` and
+`cache_creation_input_tokens` remain distinct.
+
+The Messages API does not directly return `total_tokens` or monetary cost.
+Both remain `None`; Aegis does not sum a synthetic total, apply a price table,
+or estimate cost. The existing observability adapter receives the reliable
+input/output/cache buckets unchanged.
+
+### Source relationship and scope
+
+- Hermes `agent/transports/anthropic.py` informed the native tool-block and
+  stop-reason normalization shape.
+- Claude Code `src/services/api/claude.ts` informed the cumulative streaming
+  usage rule that protects non-zero start fields from final zero values.
+- The implementation is a compact rewrite for Aegis's synchronous
+  `ModelProvider` protocol. Hermes/Claude Code authentication stacks,
+  Bedrock/Vertex variants, retry systems, and product telemetry are omitted.
+- No Evaluation, pricing database, fallback router, or unrelated provider
+  refactor was added.
+
+### Verification
+
+Deterministic tests cover native message/tool conversion, streaming text and
+tool JSON assembly, separate cache read/write usage, final-only usage, missing
+usage, one-shot responses, normalized failures, CLI selection, and summary
+provider construction.
+
+- Focused provider/stream/observability/compression tests:
+  `88 passed, 1 skipped in 0.39s`.
+- `uv run pytest -q` → `668 passed, 2 skipped in 525.13s`.
+- Ruff over the repository reports only the same six pre-existing findings in
+  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
+  `tests/test_session_titles.py`; no new Anthropic finding was introduced.
+- Targeted mypy over the model/event/observability/wrapper boundary passes.
+  Including all of `runtime.py` still exposes its two pre-existing dynamic
+  manager attribute findings (`drain_lead_messages`, `drain_notifications`).
+- `git diff --check` passes.

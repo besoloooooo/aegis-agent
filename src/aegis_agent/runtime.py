@@ -917,6 +917,8 @@ class AgentRuntime:
                     "finish_reason": response.finish_reason,
                 },
                 success=True,
+                usage_details=(response.usage.usage_details() if response.usage is not None else None),
+                cost_details=(response.usage.cost_details() if response.usage is not None else None),
             )
             return response
 

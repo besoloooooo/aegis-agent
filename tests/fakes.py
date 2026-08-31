@@ -21,23 +21,46 @@ def make_tool_call_delta(index: int, *, id=None, name=None, arguments=None) -> S
     return SimpleNamespace(index=index, id=id, function=_fn(name, arguments))
 
 
-def make_chunk(*, content=None, tool_calls=None, finish_reason=None) -> SimpleNamespace:
+def make_chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None) -> SimpleNamespace:
     """One ``ChatCompletionChunk``-shaped object."""
     delta = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice])
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
-def make_usage_only_chunk() -> SimpleNamespace:
-    """A trailing chunk with empty choices (usage-only), which must be ignored."""
-    return SimpleNamespace(choices=[])
+def make_usage_only_chunk(usage=None) -> SimpleNamespace:
+    """A trailing Chat Completions chunk with empty choices and optional usage."""
+    return SimpleNamespace(choices=[], usage=usage)
 
 
-def make_completion(*, content=None, tool_calls=None, finish_reason="stop") -> SimpleNamespace:
+def make_completion(*, content=None, tool_calls=None, finish_reason="stop", usage=None) -> SimpleNamespace:
     """A non-streaming ``ChatCompletion``-shaped object."""
     message = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice])
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def make_usage(
+    *,
+    prompt_tokens=None,
+    completion_tokens=None,
+    total_tokens=None,
+    cached_tokens=None,
+    cache_write_tokens=None,
+    cost=None,
+) -> SimpleNamespace:
+    """An OpenAI ``CompletionUsage`` shape, including compatible extras."""
+    details = SimpleNamespace(
+        cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        prompt_tokens_details=details,
+        cost=cost,
+    )
 
 
 def make_completion_tool_call(id: str, name: str, arguments: str) -> SimpleNamespace:

@@ -131,6 +131,40 @@ class ToolDefinition:
 
 
 @dataclass
+class ModelUsage:
+    """Provider-neutral, mutually-exclusive model usage and direct cost.
+
+    ``input_tokens`` excludes cache reads and cache writes.  Providers such as
+    OpenAI report an inclusive prompt-token count; their adapter must subtract
+    the cache detail buckets before constructing this object.  ``total_tokens``
+    retains the provider-reported total.  ``cost`` is populated only when the
+    upstream API returns a direct monetary cost; Aegis never estimates it.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cost: float | None = None
+
+    def usage_details(self) -> dict[str, int]:
+        """Return backend-neutral usage buckets understood by observability."""
+        values = {
+            "input": self.input_tokens,
+            "output": self.output_tokens,
+            "total": self.total_tokens,
+            "cache_read_input_tokens": self.cache_read_tokens,
+            "cache_creation_input_tokens": self.cache_write_tokens,
+        }
+        return {key: value for key, value in values.items() if value is not None}
+
+    def cost_details(self) -> dict[str, float]:
+        """Return direct upstream cost, without calculating or estimating it."""
+        return {"total": self.cost} if self.cost is not None else {}
+
+
+@dataclass
 class ChatResponse:
     """A fully-assembled model response (from streaming or one-shot).
 
@@ -139,12 +173,15 @@ class ChatResponse:
     the provider's stop reason ("stop", "tool_calls", "length", ...).
     ``reasoning_content`` is the concatenated chain-of-thought when the
     provider streams one (empty otherwise).
+    ``usage`` is the final provider-reported usage normalized by its adapter;
+    it remains ``None`` when the provider supplies no reliable usage data.
     """
 
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
     reasoning_content: str = ""
+    usage: ModelUsage | None = None
 
 
 @runtime_checkable
@@ -185,6 +222,7 @@ __all__ = [
     "ChatResponse",
     "Message",
     "ModelProvider",
+    "ModelUsage",
     "Role",
     "ToolCall",
     "ToolDefinition",

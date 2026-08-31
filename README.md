@@ -10,7 +10,7 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 
 **Core runtime**
 1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
-2. OpenAI-compatible provider & streaming tool calls
+2. OpenAI-compatible and native Anthropic providers & streaming tool calls
 3. Live terminal UI
 
 **Tools**
@@ -59,7 +59,7 @@ src/aegis_agent/
 ├── events.py       # model event stream
 ├── agents/         # subagents, teams, inter-agent messaging
 ├── observability/  # fail-open tracing API, sanitization, Langfuse adapter
-├── models/         # ModelProvider protocol, fake / OpenAI providers, Message / ToolCall
+├── models/         # provider-neutral protocol, fake / OpenAI / Anthropic adapters
 ├── tools/          # tool registry, executor, builtin tools
 ├── context/        # context builder + compression
 ├── sessions/       # session repository (in-memory / SQLite) + leases
@@ -96,6 +96,20 @@ export AEGIS_MODEL=gpt-4o-mini
 
 uv run aegis
 ```
+
+Or configure the native Anthropic Messages API provider:
+
+```bash
+export ANTHROPIC_API_KEY=...
+export ANTHROPIC_MODEL=claude-sonnet-4-6
+# export ANTHROPIC_BASE_URL=https://api.anthropic.com  # optional override
+
+uv run aegis --model-backend anthropic
+```
+
+`--model-backend auto` keeps OpenAI-compatible configuration precedence, then
+selects Anthropic when both `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` are set.
+Use `--model-backend fake` to force the deterministic provider.
 
 Without model configuration, Aegis can run with its deterministic fake provider.
 
@@ -307,8 +321,14 @@ result and error handling. Trace payloads are recursively redacted for common
 credential fields and secret patterns; long strings are capped at 20,000
 characters with their original length retained as metadata.
 
-The current Aegis model-event contract does not expose token usage, cache tokens,
-or cost, so those fields are intentionally left unset instead of being estimated.
+OpenAI-compatible and Anthropic responses propagate provider-reported input,
+output, cache-read, and cache-write token usage into each Langfuse Model Call.
+OpenAI streaming collects its final usage-only chunk. Anthropic streaming
+merges input/cache buckets from `message_start` with output tokens from the
+final `message_delta`, preserving separate cache reads and cache creations.
+Anthropic's API does not return total tokens or direct cost, so Aegis leaves
+those fields unset rather than estimating them. Compatible gateways that
+directly return a total or cost are passed through; Aegis has no price table.
 
 ---
 

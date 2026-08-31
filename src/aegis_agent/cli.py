@@ -88,7 +88,7 @@ def _main(
     model_flag: str | None = typer.Option(
         None,
         "--model-backend",
-        help="Which model backend to use: 'auto' (real if AEGIS_* is set, else fake), 'fake', or 'openai'.",
+        help="Which model backend to use: 'auto', 'fake', 'openai', or 'anthropic'.",
     ),
     allow_dangerous_shell: bool | None = typer.Option(
         None,
@@ -389,22 +389,39 @@ def _main(
 def _select_provider(model_flag: str):
     """Resolve the model backend from the flag + environment.
 
-    'openai' forces the OpenAI-compatible provider (errors if unconfigured);
-    'fake' forces the deterministic fake; 'auto' picks the real provider when
-    ``AEGIS_API_KEY`` and ``AEGIS_MODEL`` are set, otherwise the fake.  The
-    fake is built with ``chunk_text=True`` so the streaming path is visible in
-    the interactive demo (text arrives one character at a time).
+    Explicit backends fail with an actionable configuration error.  ``auto``
+    preserves the existing OpenAI-compatible precedence, then selects native
+    Anthropic when its key and model are configured, otherwise falling back to
+    the deterministic fake.
     """
     from aegis_agent.models.openai_compat import ENV_API_KEY, ENV_MODEL
 
-    want_real = model_flag == "openai" or (
+    want_openai = model_flag == "openai" or (
         model_flag == "auto" and os.environ.get(ENV_API_KEY) and os.environ.get(ENV_MODEL)
     )
-    if want_real:
+    if want_openai:
         from aegis_agent.models.openai_compat import OpenAICompatibleProvider
 
         provider = OpenAICompatibleProvider.from_env()
         return provider, f"openai-compatible model '{provider.model}'"
+
+    from aegis_agent.models.anthropic import (
+        ENV_API_KEY as ANTHROPIC_API_KEY,
+    )
+    from aegis_agent.models.anthropic import (
+        ENV_MODEL as ANTHROPIC_MODEL,
+    )
+
+    want_anthropic = model_flag == "anthropic" or (
+        model_flag == "auto"
+        and os.environ.get(ANTHROPIC_API_KEY)
+        and os.environ.get(ANTHROPIC_MODEL)
+    )
+    if want_anthropic:
+        from aegis_agent.models.anthropic import AnthropicProvider
+
+        provider = AnthropicProvider.from_env()
+        return provider, f"anthropic model '{provider.model}'"
     from aegis_agent.models.fake import FakeModelProvider
 
     return FakeModelProvider(chunk_text=True), "fake model"
@@ -413,25 +430,26 @@ def _select_provider(model_flag: str):
 def _build_summary_provider(provider):
     """Build the deterministic provider used for context-compression summaries.
 
-    Returns ``None`` (fall back to the main provider) unless the main provider
-    is OpenAI-compatible — in that case a sibling provider is built with
-    ``temperature=0`` and the summary token budget pinned, mirroring the Hermes
-    prototype's ``temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS`` summary call.
-    Construction failure (e.g. missing env) falls back to ``None`` so the CLI
-    never fails to start over a summariser.
+    Real backends receive a non-streaming sibling with ``temperature=0`` and
+    the summary token budget pinned.  Construction failure (e.g. missing env)
+    falls back to ``None`` so the CLI never fails to start over a summariser.
     """
+    from aegis_agent.context.compress_config import SUMMARY_MAX_TOKENS
+    from aegis_agent.models.anthropic import AnthropicProvider
     from aegis_agent.models.openai_compat import OpenAICompatibleProvider
 
-    if not isinstance(provider, OpenAICompatibleProvider):
-        return None
-    from aegis_agent.context.compress_config import SUMMARY_MAX_TOKENS
-
     try:
-        return OpenAICompatibleProvider.from_env(
-            stream=False, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS
-        )
+        if isinstance(provider, OpenAICompatibleProvider):
+            return OpenAICompatibleProvider.from_env(
+                stream=False, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS
+            )
+        if isinstance(provider, AnthropicProvider):
+            return AnthropicProvider.from_env(
+                stream=False, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS
+            )
     except AegisError:
         return None
+    return None
 
 
 def _new_session_id() -> str:

@@ -26,7 +26,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 
 from aegis_agent.events import ModelEvent
-from aegis_agent.models.base import Message, Role, ToolCall, ToolDefinition
+from aegis_agent.models.base import Message, ModelUsage, Role, ToolCall, ToolDefinition
 
 
 @dataclass
@@ -37,6 +37,7 @@ class FakeReply:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
     reasoning: str = ""  # optional chain-of-thought, emitted as REASONING_DELTA
+    usage: ModelUsage | None = None
 
     @classmethod
     def tool(cls, name: str, arguments: dict | str, *, call_id: str = "call_0") -> FakeReply:
@@ -85,6 +86,8 @@ class FakeModelProvider:
                 yield ModelEvent.text_delta(reply.text)
         for i, tool_call in enumerate(reply.tool_calls):
             yield ModelEvent.tool(self._ensure_id(tool_call, i))
+        if reply.usage is not None:
+            yield ModelEvent.usage_update(reply.usage)
         yield ModelEvent.done(reply.finish_reason)
 
     # -- response selection -------------------------------------------------

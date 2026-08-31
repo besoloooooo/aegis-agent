@@ -5,6 +5,7 @@ description = "Aegis Agent — a lightweight, recoverable, extensible Agent Runt
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.104.1,<1",
     "httpx>=0.28.0",
     "mcp>=2.0.0",
     "openai>=2.52.0",

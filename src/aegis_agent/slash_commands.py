@@ -150,6 +150,12 @@ class WireCaptureProvider:
     def name(self) -> str:
         return self._inner.name
 
+    @property
+    def model(self) -> str | None:
+        """Expose the wrapped model identifier to runtime observability."""
+        model = getattr(self._inner, "model", None)
+        return model if isinstance(model, str) else None
+
     def stream(
         self,
         messages: Sequence[Message],

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aegis_agent.agents.definitions import AGENT_TOOL_NAME
+from aegis_agent.models.base import ModelUsage
 from aegis_agent.models.fake import FakeModelProvider, FakeReply
 from aegis_agent.observability import NoopObservability, create_observability
 from aegis_agent.observability.sanitize import REDACTED, sanitize
@@ -175,6 +176,52 @@ def test_tool_failure_is_recorded_and_runtime_recovers():
     assert result.stop_reason is StopReason.FINAL_ANSWER
 
 
+def test_model_usage_reaches_observability():
+    tracing = RecordingObservability()
+    usage = ModelUsage(input_tokens=100, output_tokens=20, total_tokens=120)
+
+    result = _runtime(
+        FakeModelProvider(script=[FakeReply(text="answer", usage=usage)]),
+        tracing,
+    ).run_turn("usage-session", "hello")
+
+    assert result.final_text == "answer"
+    model = next(record for record in tracing.records if record.kind == "generation")
+    assert model.updates[-1]["usage_details"] == {
+        "input": 100,
+        "output": 20,
+        "total": 120,
+    }
+    assert model.updates[-1]["cost_details"] == {}
+
+
+def test_cache_usage_and_direct_cost_reach_observability_separately():
+    tracing = RecordingObservability()
+    usage = ModelUsage(
+        input_tokens=10,
+        output_tokens=20,
+        total_tokens=120,
+        cache_read_tokens=80,
+        cache_write_tokens=10,
+        cost=0.0123,
+    )
+
+    _runtime(
+        FakeModelProvider(script=[FakeReply(text="answer", usage=usage)]),
+        tracing,
+    ).run_turn("cache-session", "hello")
+
+    model = next(record for record in tracing.records if record.kind == "generation")
+    assert model.updates[-1]["usage_details"] == {
+        "input": 10,
+        "output": 20,
+        "total": 120,
+        "cache_read_input_tokens": 80,
+        "cache_creation_input_tokens": 10,
+    }
+    assert model.updates[-1]["cost_details"] == {"total": 0.0123}
+
+
 def test_subagent_model_and_tool_are_nested_under_subagent_run():
     tracing = RecordingObservability()
     provider = FakeModelProvider(
@@ -224,7 +271,17 @@ def test_unconfigured_and_failing_langfuse_are_noop(monkeypatch):
             raise ConnectionError("Langfuse unavailable")
 
     tracing = LangfuseObservability(FailingClient())
-    runtime = _runtime(FakeModelProvider(script=[FakeReply(text="still works")]), tracing)
+    runtime = _runtime(
+        FakeModelProvider(
+            script=[
+                FakeReply(
+                    text="still works",
+                    usage=ModelUsage(input_tokens=2, output_tokens=2, total_tokens=4),
+                )
+            ]
+        ),
+        tracing,
+    )
     result = runtime.run_turn("session-3", "hello")
     runtime.shutdown()
 
@@ -290,6 +347,19 @@ def test_langfuse_adapter_uses_v4_observation_types_and_sanitizes():
         arguments={"command": "echo ok", "api_key": "secret"},
     ) as observation:
         observation.update(output={"cookie": "secret", "result": "ok"}, success=True)
+    with tracing.model_call(provider="openai-compatible", model="gpt-test", messages=[]) as observation:
+        observation.update(
+            output="ok",
+            usage_details={
+                "input": 10,
+                "output": 2,
+                "cache_read_input_tokens": 8,
+                "cache_creation_input_tokens": 1,
+                "total": 21,
+            },
+            cost_details={"total": 0.5},
+            success=True,
+        )
 
     assert calls[0]["as_type"] == "agent"
     assert calls[1]["metadata"]["parent_agent"] == "main"
@@ -297,3 +367,12 @@ def test_langfuse_adapter_uses_v4_observation_types_and_sanitizes():
     assert calls[2]["name"] == "Tool Call: terminal"
     assert calls[2]["input"]["api_key"] == REDACTED
     assert updates[0]["output"]["cookie"] == REDACTED
+    assert calls[3]["as_type"] == "generation"
+    assert updates[1]["usage_details"] == {
+        "input": 10,
+        "output": 2,
+        "cache_read_input_tokens": 8,
+        "cache_creation_input_tokens": 1,
+        "total": 21,
+    }
+    assert updates[1]["cost_details"] == {"total": 0.5}
