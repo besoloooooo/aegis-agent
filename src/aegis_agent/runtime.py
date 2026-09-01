@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -670,18 +670,34 @@ class AgentRuntime:
         interrupt: threading.Event | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         on_event: Callable[[TurnEvent], None] | None = None,
+        execution_id: str | None = None,
+        trace_id: str | None = None,
+        trace_metadata: Mapping[str, object] | None = None,
     ) -> TurnResult:
         """Run one fully-observed user task without changing loop semantics."""
         from aegis_agent import __version__
 
         is_subagent = self._config.agent_name != MAIN_AGENT_NAME
-        with self._observability.agent_run(
-            task=user_message,
-            session_id=session_id,
-            agent_name=self._config.agent_name,
-            version=__version__,
-            is_subagent=is_subagent,
-        ) as observation:
+        if execution_id is None and trace_id is None and trace_metadata is None:
+            run_observation = self._observability.agent_run(
+                task=user_message,
+                session_id=session_id,
+                agent_name=self._config.agent_name,
+                version=__version__,
+                is_subagent=is_subagent,
+            )
+        else:
+            run_observation = self._observability.agent_run(
+                task=user_message,
+                session_id=session_id,
+                agent_name=self._config.agent_name,
+                version=__version__,
+                is_subagent=is_subagent,
+                execution_id=execution_id,
+                trace_id=trace_id,
+                metadata=trace_metadata,
+            )
+        with run_observation as observation:
             try:
                 result = self._run_turn_impl(
                     session_id,

@@ -453,3 +453,23 @@ Official SDK references used for wire compatibility:
 - <https://github.com/anthropics/anthropic-sdk-python/blob/main/tools.md>
 
 Neither the Hermes nor Claude Code reference repository was modified.
+
+## Agent Quality Phase 1 + Phase 2 — Harbor and ExecutionRecord
+
+This phase is original Aegis integration code based on Harbor 0.22's public
+extension interfaces and result schemas. Harbor source was read as an API and
+architecture reference; no Harbor implementation code was copied and the
+Harbor repository was not modified.
+
+| Aegis file | Relationship | External reference | Notes |
+|---|---|---|---|
+| `src/aegis_agent/integrations/harbor.py` | **original adapter code** | Harbor `BaseAgent`, `BaseInstalledAgent`, custom Python import-path loading, `AgentContext` | Builds and installs the current Aegis wheel in the task environment, runs non-interactive Aegis in `/app`, preserves stdout/stderr and process failure, forwards explicit model/endpoint/credential settings, and backfills Harbor's inclusive token context. |
+| `src/aegis_agent/quality/models.py`, `store.py` | **original** | Harbor `TrialResult`; ATIF step/tool/observation concepts | Defines Aegis's provider-neutral ExecutionRecord and atomic local JSON store. It is neither a TrialResult copy nor an ATIF implementation. |
+| `src/aegis_agent/quality/recorder.py`, `observability/composite.py` | **original additive code** | — | Reuses the existing Observability event boundary to capture the Runtime tree without duplicate instrumentation and fans out fail-open to Langfuse plus the local recorder. |
+| `src/aegis_agent/quality/adapters/harbor.py` | **original adapter code** | Harbor 0.22 `TrialResult`, `AgentContext`, job/trial log layout | Finalizes runtime records with exact job/trial/task identity, verifier rewards, combined Harbor usage, exceptions, and artifact paths while retaining detailed Aegis cache buckets. |
+| `src/aegis_agent/quality/run.py`, `src/aegis_agent/cli.py` | **original** | Harbor installed-agent process contract | Adds one-shot `aegis run` and post-verifier `aegis quality import-harbor`; the interactive REPL remains unchanged. |
+| `tests/test_execution_record.py`, `tests/test_harbor_execution_record.py` | **original** | — | Deterministic runtime/usage/error/no-Langfuse/identity/CLI tests and Harbor TrialResult/verifier/artifact/sparse-data mappings. |
+
+Harbor is not added as an Aegis runtime dependency: the optional adapter is
+imported by Harbor from the Aegis source path. Consequently no new third-party
+license entry is required for this phase.

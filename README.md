@@ -45,6 +45,8 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 **Agent quality foundation**
 - Quality Stage 0 — optional Langfuse end-to-end traces for Agent runs, model
   calls, tool calls, subagents, and final results
+- Quality Phase 1–2 — Harbor custom-agent integration plus a provider-neutral
+  `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts
 
 ---
 
@@ -59,6 +61,8 @@ src/aegis_agent/
 ├── events.py       # model event stream
 ├── agents/         # subagents, teams, inter-agent messaging
 ├── observability/  # fail-open tracing API, sanitization, Langfuse adapter
+├── quality/        # ExecutionRecord, local store, Harbor result adapter
+├── integrations/   # optional external orchestrator adapters (Harbor)
 ├── models/         # provider-neutral protocol, fake / OpenAI / Anthropic adapters
 ├── tools/          # tool registry, executor, builtin tools
 ├── context/        # context builder + compression
@@ -329,6 +333,55 @@ final `message_delta`, preserving separate cache reads and cache creations.
 Anthropic's API does not return total tokens or direct cost, so Aegis leaves
 those fields unset rather than estimating them. Compatible gateways that
 directly return a total or cost are passed through; Aegis has no price table.
+
+---
+
+## 🧪 Harbor Offline Evaluation (Quality Phase 1–2)
+
+Aegis exposes a non-interactive runner and a Harbor custom installed agent.
+Harbor remains responsible for tasks, environments, trials, retry/concurrency,
+verifiers, and rewards; the Harbor repository does not need to be modified.
+
+Run one Aegis task directly (this uses the selected real provider unless
+`--model-backend fake` is explicitly requested):
+
+```bash
+uv run aegis run \
+  --instruction "inspect the project and complete the task" \
+  --model-backend openai \
+  --cwd /path/to/worktree
+```
+
+Run Aegis from the sibling Harbor checkout (Docker must be available to Harbor):
+
+```bash
+cd ../harbor
+PYTHONPATH=../aegis-agent/src uv run harbor run \
+  -p /path/to/task-or-dataset \
+  --agent aegis_agent.integrations.harbor:Aegis \
+  --model openai/qwen-model \
+  --ae AEGIS_API_KEY="$AEGIS_API_KEY" \
+  --ae AEGIS_BASE_URL="$AEGIS_BASE_URL" \
+  --ae LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
+  --ae LANGFUSE_SECRET_KEY="$LANGFUSE_SECRET_KEY" \
+  --ae LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL"
+```
+
+The adapter installs the current Aegis wheel inside the Harbor task environment
+and runs tools in `/app`. The Harbor trial UUID becomes Aegis `execution_id`;
+the Langfuse trace id is deterministically derived from it, so no timestamp
+matching is needed. A runtime record is written under the trial's `agent/` logs.
+After Harbor finishes its verifier, finalize one trial or an entire job:
+
+```bash
+uv run aegis quality import-harbor ../harbor/jobs/<job-directory>
+```
+
+Final records are stored in `~/.aegis/quality/executions` (override with
+`AEGIS_EXECUTION_RECORDS_DIR`) and beside each Harbor `result.json` as
+`execution-record.json`. Runtime success and verifier pass/fail are separate;
+missing usage, cost, or verifier fields stay `null` rather than being guessed.
+Langfuse remains optional and fail-open.
 
 ---
 

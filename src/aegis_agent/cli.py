@@ -9,6 +9,7 @@ imported by the runtime (one-way dependency cli → runtime).
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -32,6 +33,8 @@ from aegis_agent.slash_commands import (
 from aegis_agent.tui import Tui
 
 app = typer.Typer(add_completion=False, help="Aegis Agent — minimal interactive agent runtime.")
+quality_app = typer.Typer(help="Offline execution records and quality tooling.")
+app.add_typer(quality_app, name="quality")
 
 _EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
@@ -386,6 +389,150 @@ def _main(
             )
 
 
+@app.command("run")
+def run_once(
+    instruction: str = typer.Option(
+        ...,
+        "--instruction",
+        "-i",
+        envvar="AEGIS_INSTRUCTION",
+        help="Run exactly one non-interactive user task.",
+    ),
+    model_backend: str = typer.Option(
+        "auto",
+        "--model-backend",
+        envvar="AEGIS_MODEL_BACKEND",
+        help="Model backend: auto, openai, anthropic, or fake.",
+    ),
+    session_id: str | None = typer.Option(None, "--session", envvar="AEGIS_SESSION_ID"),
+    execution_id: str | None = typer.Option(
+        None,
+        "--execution-id",
+        envvar="AEGIS_EXECUTION_ID",
+        help="Stable external execution id (Harbor uses its trial UUID).",
+    ),
+    task_id: str | None = typer.Option(None, "--task-id", envvar="AEGIS_TASK_ID"),
+    task_name: str | None = typer.Option(None, "--task-name", envvar="AEGIS_TASK_NAME"),
+    record_path: str | None = typer.Option(
+        None,
+        "--record-path",
+        envvar="AEGIS_EXECUTION_RECORD_PATH",
+        help="Also write the ExecutionRecord to this exact path.",
+    ),
+    records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+        help="Local ExecutionRecord store directory.",
+    ),
+    cwd: str = typer.Option(".", "--cwd", help="Working directory for Aegis tools."),
+    max_iterations: int = typer.Option(
+        DEFAULT_MAX_ITERATIONS,
+        "--max-iterations",
+        "-n",
+        min=1,
+    ),
+    allow_dangerous_shell: bool = typer.Option(
+        False,
+        "--allow-dangerous-shell/--no-allow-dangerous-shell",
+    ),
+    enable_skills: bool = typer.Option(False, "--skills/--no-skills"),
+    skills_dir: str | None = typer.Option(None, "--skills-dir"),
+    enable_mcp: bool = typer.Option(False, "--mcp/--no-mcp"),
+    mcp_config: str | None = typer.Option(None, "--mcp-config"),
+    enable_subagents: bool = typer.Option(True, "--subagents/--no-subagents"),
+    enable_memory: bool = typer.Option(False, "--memory/--no-memory"),
+) -> None:
+    """Run one task without the interactive TUI (for Harbor and automation)."""
+    load_dotenv()
+    load_dotenv(Path.home() / ".aegis" / ".env")
+    if model_backend not in {"auto", "fake", "openai", "anthropic"}:
+        typer.echo(
+            json.dumps(
+                {"success": False, "error": f"unsupported model backend: {model_backend}"},
+                ensure_ascii=False,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        provider, _ = _select_provider(model_backend)
+        from aegis_agent.quality.run import run_task
+
+        task_run = run_task(
+            instruction,
+            provider=provider,
+            session_id=session_id,
+            execution_id=execution_id,
+            task_id=task_id,
+            task_name=task_name,
+            record_path=record_path,
+            records_dir=records_dir,
+            cwd=str(Path(cwd).resolve()),
+            max_iterations=max_iterations,
+            allow_dangerous_shell=allow_dangerous_shell,
+            enable_skills=enable_skills,
+            skills_dir=skills_dir,
+            enable_mcp=enable_mcp,
+            mcp_config_path=mcp_config,
+            enable_subagents=enable_subagents,
+            enable_memory=enable_memory,
+            metadata={"source": "aegis-run"},
+        )
+    except Exception as exc:
+        typer.echo(
+            json.dumps(
+                {"success": False, "error": str(exc), "error_type": type(exc).__name__},
+                ensure_ascii=False,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(task_run.to_json_dict(), ensure_ascii=False))
+    if task_run.record.execution.success is not True:
+        raise typer.Exit(code=1)
+
+
+@quality_app.command("import-harbor")
+def import_harbor(
+    path: str = typer.Argument(..., help="Harbor trial result.json or job directory."),
+    records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+    ),
+) -> None:
+    """Merge Harbor verifier output into final local ExecutionRecords."""
+    from aegis_agent.quality.adapters.harbor import (
+        finalize_harbor_job,
+        finalize_harbor_trial,
+    )
+    from aegis_agent.quality.store import ExecutionRecordStore
+
+    source = Path(path).expanduser().resolve()
+    store = ExecutionRecordStore(records_dir)
+    try:
+        records = (
+            [finalize_harbor_trial(source, store=store)]
+            if source.is_file()
+            else finalize_harbor_job(source, store=store)
+        )
+    except Exception as exc:
+        typer.echo(f"[error] {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "count": len(records),
+                "execution_ids": [record.identity.execution_id for record in records],
+                "records_dir": str(store.directory),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def _select_provider(model_flag: str):
     """Resolve the model backend from the flag + environment.
 
@@ -457,7 +604,7 @@ def _new_session_id() -> str:
     import datetime
     import uuid
 
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+    return datetime.datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
 
 
 def _build_repository(db_path: str | None, ephemeral: bool):

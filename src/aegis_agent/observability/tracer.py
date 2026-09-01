@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -49,6 +50,9 @@ class Observability(Protocol):
         agent_name: str,
         version: str,
         is_subagent: bool,
+        execution_id: str | None = None,
+        trace_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> AbstractContextManager[Observation]: ...
 
     def model_call(
@@ -180,6 +184,9 @@ class LangfuseObservability:
         agent_name: str,
         version: str,
         is_subagent: bool,
+        execution_id: str | None = None,
+        trace_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> AbstractContextManager[Observation]:
         return self._agent_run(
             task=task,
@@ -187,6 +194,9 @@ class LangfuseObservability:
             agent_name=agent_name,
             version=version,
             is_subagent=is_subagent,
+            execution_id=execution_id,
+            trace_id=trace_id,
+            extra_metadata=metadata,
         )
 
     @contextmanager
@@ -198,6 +208,9 @@ class LangfuseObservability:
         agent_name: str,
         version: str,
         is_subagent: bool,
+        execution_id: str | None,
+        trace_id: str | None,
+        extra_metadata: Mapping[str, Any] | None,
     ) -> Iterator[Observation]:
         name = f"Subagent Run: {agent_name}" if is_subagent else "Aegis Run"
         stack = self._agent_stack.get()
@@ -215,6 +228,12 @@ class LangfuseObservability:
             "aegis_version": version,
             "is_subagent": is_subagent,
         }
+        if execution_id is not None:
+            metadata["execution_id"] = execution_id
+        if trace_id is not None:
+            metadata["trace_id"] = trace_id
+        if extra_metadata:
+            metadata.update(extra_metadata)
         if parent_agent is not None:
             metadata["parent_agent"] = parent_agent
         with self._start(
@@ -224,6 +243,11 @@ class LangfuseObservability:
             metadata=metadata,
             version=version,
             propagation=propagation,
+            trace_context=(
+                {"trace_id": trace_id}
+                if trace_id is not None and not is_subagent and not stack
+                else None
+            ),
         ) as observation:
             token = self._agent_stack.set((*stack, agent_name))
             try:
@@ -277,6 +301,7 @@ class LangfuseObservability:
         version: str | None = None,
         model: str | None = None,
         propagation: Mapping[str, Any] | None = None,
+        trace_context: Mapping[str, str] | None = None,
     ) -> Iterator[Observation]:
         kwargs: dict[str, Any] = {
             "name": name,
@@ -288,6 +313,8 @@ class LangfuseObservability:
             kwargs["version"] = version
         if model is not None:
             kwargs["model"] = model
+        if trace_context is not None:
+            kwargs["trace_context"] = dict(trace_context)
 
         try:
             manager = self._client.start_as_current_observation(**kwargs)
@@ -345,7 +372,6 @@ def create_observability() -> Observability:
     secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
     if not public_key or not secret_key:
         return NoopObservability()
-
     try:
         from langfuse import Langfuse, propagate_attributes
 
@@ -360,10 +386,16 @@ def create_observability() -> Observability:
         return NoopObservability()
 
 
+def deterministic_trace_id(execution_id: str) -> str:
+    """Return the Langfuse/OTel trace id associated with an external execution id."""
+    return hashlib.sha256(execution_id.encode("utf-8")).digest()[:16].hex()
+
+
 __all__ = [
     "LangfuseObservability",
     "NoopObservability",
     "Observability",
     "Observation",
     "create_observability",
+    "deterministic_trace_id",
 ]

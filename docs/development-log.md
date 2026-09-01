@@ -3486,3 +3486,134 @@ provider construction.
   Including all of `runtime.py` still exposes its two pre-existing dynamic
   manager attribute findings (`drain_lead_messages`, `drain_notifications`).
 - `git diff --check` passes.
+
+---
+
+## Agent Quality Phase 1 + Phase 2 — Harbor Offline Evaluation and ExecutionRecord
+
+### Scope and Harbor extension decision
+
+This phase adds only the Harbor execution bridge and the unified record needed
+by later quality work. It does not add process graders, failure attribution,
+regression, bad-case mining, quality gates, or a dashboard.
+
+Harbor 0.22 source and its local analysis documents were inspected directly.
+The selected extension is Harbor's supported Python custom-agent import path
+backed by `BaseInstalledAgent`:
+
+```text
+harbor run --agent aegis_agent.integrations.harbor:Aegis
+  -> Aegis.install(): build/upload/install the current Aegis wheel
+  -> Aegis.run(): execute `aegis run` inside the task environment
+  -> /app: Aegis ToolContext working directory
+  -> Harbor verifier
+  -> Harbor result.json
+  -> `aegis quality import-harbor`
+  -> final ExecutionRecord
+```
+
+The sibling Harbor repository is not modified or forked. `BaseInstalledAgent`
+is used instead of a host-side wrapper because the Aegis Runtime and its tools
+must execute inside Harbor's environment. Harbor continues to own Task/Dataset,
+Job/Trial, environment lifecycle, timeout, retry, concurrency, verifier,
+reward, and Pass@K behavior.
+
+### Non-interactive runtime and configuration
+
+`aegis run` executes exactly one task without starting the TUI. It uses the
+existing provider selection (`auto`, OpenAI-compatible, Anthropic, or an
+explicit test-only fake), creates an in-memory session, runs the unchanged
+`AgentRuntime`, emits one JSON result line, and writes an ExecutionRecord.
+Skills, MCP, and memory default off for isolated evaluation; subagents remain
+available. Interactive `aegis` behavior is unchanged.
+
+The Harbor adapter passes the instruction through `AEGIS_INSTRUCTION`, the
+trial UUID through `AEGIS_EXECUTION_ID`, and the Harbor agent session handle
+through `AEGIS_SESSION_ID`. A Harbor `provider/model` value maps to Anthropic
+or the existing OpenAI-compatible Aegis provider. API keys, endpoints,
+Langfuse credentials, and proxy/no-proxy variables are forwarded from Harbor's
+agent environment (`--ae`); none are hard-coded. Harbor's own trial timeout
+still surrounds the agent process. `set -o pipefail` plus `tee` preserves the
+real exit code while retaining stdout/stderr in `agent/aegis.txt`.
+
+### One event stream, two consumers
+
+No second set of Runtime hooks was added. `CompositeObservability` fans the
+existing Agent/Model/Tool/Subagent/Final observations out to:
+
+```text
+Aegis Runtime / Tool Executor / Subagent Runtime
+  -> existing Observability API
+     -> fail-open Langfuse backend
+     -> ExecutionRecorder backend
+```
+
+The local recorder sanitizes the same inputs/outputs, preserves parent step
+IDs, usage buckets, errors, and timings, and atomically persists JSON. Langfuse
+absence or reporting failure cannot prevent record generation or alter the
+turn result.
+
+### ExecutionRecord schema and ownership
+
+`ExecutionRecord` schema version `1.0` contains:
+
+- `identity`: execution/task/trial/job/session/trace IDs;
+- `agent`: name/version/model/provider plus config and metadata;
+- `execution`: runtime timing, success, final output, stop reason, and error;
+- `usage`: ordinary input/output/total, cache read/write, Harbor's combined
+  cache and inclusive input fields, and direct upstream cost;
+- `steps`: ordered Agent/Model/Tool/Final nodes with parent IDs, sanitized
+  payloads, timing, usage, errors, and metadata;
+- `evaluation`: raw verifier result, rewards, conventional pass/fail, metrics;
+- `artifacts`: Harbor agent/verifier logs and artifact paths.
+
+Runtime creates `execution-record.runtime.json` before the verifier exists.
+After a Harbor trial/job completes, the Harbor result adapter merges
+`result.json` into `execution-record.json` and the central local store. Runtime
+success and verifier pass/fail are intentionally separate: a valid agent run
+can still fail its verifier. Missing fields remain `None`; no cost, total token,
+cache split, or pass value is guessed.
+
+Harbor's `AgentContext.n_input_tokens` includes cache and exposes only one
+`n_cache_tokens` value. The adapter therefore retains Aegis's separate cache
+read/write buckets and also stores Harbor's inclusive/combined values in
+dedicated fields. ATIF's step/tool/observation concepts informed the domain
+shape, but no ATIF conversion is claimed in this phase.
+
+### Stable identity mapping
+
+Harbor's durable Trial UUID is the Aegis `execution_id` and `trial_id`.
+Langfuse receives a deterministic 128-bit trace ID equal to the first 16 bytes
+of `SHA-256(execution_id)`, matching Langfuse's seeded trace-ID contract.
+Harbor `job_id`, agent session handle, and task identity are added during
+finalization. A trial, local record, and trace can therefore be joined by exact
+IDs instead of timestamps.
+
+### Deterministic verification and environment limitation
+
+Focused tests cover normal runtime recording, Tool failure followed by model
+recovery, separate cache read/write and direct cost, missing usage, disabled
+Langfuse, deterministic trace IDs, non-interactive CLI output, Harbor mapping,
+verifier failure independent of runtime success, Harbor exception/timeout
+shape, sparse TrialResult, artifact collection, and ID mismatch rejection.
+
+The current WSL distro does not expose Docker (`docker: command not found` and
+Docker Desktop requests WSL integration), so an actual containerized Harbor
+trial cannot be run on this host yet. The adapter follows the checked-in Harbor
+0.22 interfaces and is import-path isolated; deterministic Runtime and
+TrialResult boundary tests run without Docker. Once Docker Desktop WSL
+integration is enabled, the README smoke command is the remaining external
+end-to-end check.
+
+Verification for the implemented boundary:
+
+- `uv run pytest -q tests/test_execution_record.py tests/test_harbor_execution_record.py tests/test_observability.py`
+  → `18 passed in 5.33s`;
+- Ruff over all changed Python modules/tests → `All checks passed!`;
+- targeted mypy with external imports skipped → `Success: no issues found in
+  11 source files`; including `runtime.py` reports only its two pre-existing
+  dynamic manager attribute findings;
+- `git diff --check` → passed;
+- a full-suite attempt passed beyond 74% without a failure, then was interrupted
+  after the known global process/MCP slow-test region stopped producing output;
+  the most recent completed pre-phase baseline remains `668 passed, 2 skipped`.
