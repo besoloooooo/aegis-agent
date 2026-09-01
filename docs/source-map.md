@@ -473,3 +473,14 @@ Harbor repository was not modified.
 Harbor is not added as an Aegis runtime dependency: the optional adapter is
 imported by Harbor from the Aegis source path. Consequently no new third-party
 license entry is required for this phase.
+
+## Agent Quality — local Trace Viewer
+
+| Aegis file | Relationship | External reference | Notes |
+|---|---|---|---|
+| `src/aegis_agent/quality/viewer.py` | **original** | Langfuse Python SDK v4 Observations API | Read-only local HTTP service over ExecutionRecord plus optional cursor-paginated Langfuse observations. Uses v4 observation fields and contains all remote failures. |
+| `src/aegis_agent/quality/viewer_ui.py` | **original** | — | Dependency-free three-pane execution/trace/detail UI. Local records render before asynchronous Langfuse supplements. |
+| `src/aegis_agent/cli.py` (`quality view`) | **original** | — | Loopback-by-default viewer command with configurable port/store and optional browser opening. |
+| `tests/test_trace_viewer.py` | **original** | — | Local/cloud source separation, v4 API request, failure containment, HTTP detail, invalid-ID, and security-header coverage. |
+
+No third-party frontend or web-server dependency was added.

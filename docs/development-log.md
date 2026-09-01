@@ -3617,3 +3617,56 @@ Verification for the implemented boundary:
 - a full-suite attempt passed beyond 74% without a failure, then was interrupted
   after the known global process/MCP slow-test region stopped producing output;
   the most recent completed pre-phase baseline remains `668 passed, 2 skipped`.
+
+---
+
+## Agent Quality — local Trace Viewer
+
+### Goal and data-source boundary
+
+The local viewer reduces the friction of inspecting Langfuse while avoiding a
+second trace database. It is a read-only presentation layer over:
+
+```text
+~/.aegis/quality/executions/*.json  (primary, immediate)
+             +
+Langfuse v4 Observations API       (optional, background supplement)
+             ->
+http://127.0.0.1:8765
+```
+
+`aegis quality view` starts a stdlib `ThreadingHTTPServer`; no web-framework or
+frontend dependency is added. Local records provide stable execution identity,
+runtime status, verifier result, usage, artifacts, and the sanitized step tree.
+When credentials and the optional SDK are present, the server queries
+`client.api.observations.get_many` for logical root observations and full
+per-trace observations. It does not use the Langfuse v3 Trace endpoint, which
+is deprecated on Langfuse Cloud in favor of the v4 Observations API.
+
+### UX, reliability, and security
+
+The three-pane UI contains a searchable execution list, hierarchical
+Agent/Model/Tool/Final trees, summary metrics, and an observation detail pane.
+Local data renders first; Langfuse roots and details load asynchronously, so a
+proxy, TLS, or Langfuse timeout produces a visible warning but never delays or
+hides the local record. Local and cloud entries are correlated by exact
+`trace_id`; cloud-only traces can also be inspected.
+
+The server binds to `127.0.0.1` by default, exposes only GET routes, sends
+`no-store`, `nosniff`, frame-denial and no-referrer headers, and has no CORS or
+write endpoints. Langfuse API calls occur only in Python; public/secret keys
+are never serialized into API responses or browser JavaScript. Binding to a
+non-loopback address prints an explicit no-authentication warning.
+
+### Verification
+
+- deterministic viewer/service tests cover immediate local listing, separate
+  Langfuse v4 supplemental reads, contained network errors, stable trace
+  association, record/observation details, invalid ID rejection, and security
+  headers;
+- viewer plus Phase 1/2 observability tests: `21 passed in 6.29s`;
+- Ruff over changed viewer/CLI/tests: `All checks passed!`;
+- in-app browser visual QA confirmed the three-column layout, nested trace
+  tree, scrollable detail data, search filtering, and node selection;
+- a simulated Langfuse TLS handshake timeout showed the local record and tree
+  within 500 ms, then degraded to a warning with no browser console errors.

@@ -533,6 +533,35 @@ def import_harbor(
     )
 
 
+@quality_app.command("view")
+def view_quality_traces(
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="Bind address. Loopback is recommended because the viewer has no authentication.",
+    ),
+    port: int = typer.Option(8765, "--port", min=0, max=65535),
+    records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+    ),
+    open_browser: bool = typer.Option(True, "--open/--no-open"),
+) -> None:
+    """Open the read-only local ExecutionRecord and Langfuse trace viewer."""
+    from aegis_agent.quality.viewer import serve_viewer
+
+    try:
+        serve_viewer(
+            host=host,
+            port=port,
+            records_dir=records_dir,
+            open_browser=open_browser,
+        )
+    except KeyboardInterrupt:
+        typer.echo("\nTrace Viewer stopped.")
+
+
 def _select_provider(model_flag: str):
     """Resolve the model backend from the flag + environment.
 

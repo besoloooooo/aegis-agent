@@ -47,6 +47,7 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
   calls, tool calls, subagents, and final results
 - Quality Phase 1–2 — Harbor custom-agent integration plus a provider-neutral
   `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts
+- Local read-only Trace Viewer for ExecutionRecords with optional Langfuse v4 detail
 
 ---
 
@@ -382,6 +383,21 @@ Final records are stored in `~/.aegis/quality/executions` (override with
 `execution-record.json`. Runtime success and verifier pass/fail are separate;
 missing usage, cost, or verifier fields stay `null` rather than being guessed.
 Langfuse remains optional and fail-open.
+
+Open the local Trace Viewer:
+
+```bash
+uv run aegis quality view
+```
+
+The viewer opens `http://127.0.0.1:8765`, shows local ExecutionRecords
+immediately, and loads recent Langfuse root observations and per-trace details
+in the background through the SDK's v4 Observations API. It presents execution
+status, verifier status, token/cost summaries, the Agent/Model/Tool/Final tree,
+and sanitized input/output metadata. Langfuse credentials remain in the Python
+process and are never sent to browser JavaScript. The HTTP surface is read-only,
+has no CORS or mutation endpoints, and binds to loopback by default; use
+`--no-open`, `--port`, or `--records-dir` when needed.
 
 ---
 
