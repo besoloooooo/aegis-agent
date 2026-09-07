@@ -117,6 +117,26 @@ def test_non_streaming_usage_and_direct_cost_are_normalized():
     assert response.usage.cost == 0.0123
 
 
+def test_non_streaming_bailian_implicit_cache_keeps_missing_write_unknown():
+    usage = make_usage(
+        prompt_tokens=3019,
+        completion_tokens=104,
+        total_tokens=3123,
+        cached_tokens=2048,
+    )
+    completion = make_completion(content="answer", usage=usage)
+
+    response = collect_response(
+        _provider(FakeOpenAIClient(results=[completion]), stream=False).stream(_user("q"))
+    )
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 971
+    assert response.usage.cache_read_tokens == 2048
+    assert response.usage.cache_write_tokens is None
+    assert response.usage.total_tokens == 3123
+
+
 def test_non_streaming_tool_call():
     completion = make_completion(
         tool_calls=[make_completion_tool_call("c1", "run_shell", '{"command":"ls"}')],

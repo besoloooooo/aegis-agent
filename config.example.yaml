@@ -23,7 +23,7 @@ context:
 
 # ---- loop ----------------------------------------------------------------
 iterations:
-  max: 10                # max model/tool iterations per turn; --max-iterations / -n
+  max: 50                # max model/tool iterations per turn; --max-iterations / -n
 
 # ---- session / persistence -----------------------------------------------
 session:

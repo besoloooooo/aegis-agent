@@ -141,6 +141,8 @@ class _LangfuseObservation:
     ) -> None:
         kwargs: dict[str, Any] = {"output": sanitize(output)}
         safe_metadata = dict(metadata or {})
+        if success is not None:
+            safe_metadata.setdefault("success", success)
         if error is not None:
             kwargs["level"] = "ERROR"
             safe_error = sanitize(str(error), max_string_length=1_000)

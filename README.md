@@ -10,6 +10,7 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 
 **Core runtime**
 1. Minimal Agent Runtime — fake provider, in-memory sessions, Agent Loop
+   with a configurable 50-iteration default per turn
 2. OpenAI-compatible and native Anthropic providers & streaming tool calls
 3. Live terminal UI
 
@@ -47,7 +48,7 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
   calls, tool calls, subagents, and final results
 - Quality Phase 1–2 — Harbor custom-agent integration plus a provider-neutral
   `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts
-- Local read-only Trace Viewer for ExecutionRecords with optional Langfuse v4 detail
+- Local read-only Trace Viewer with Global → Session → Turn → Observation summaries and optional Langfuse v4 detail
 
 ---
 
@@ -392,12 +393,105 @@ uv run aegis quality view
 
 The viewer opens `http://127.0.0.1:8765`, shows local ExecutionRecords
 immediately, and loads recent Langfuse root observations and per-trace details
-in the background through the SDK's v4 Observations API. It presents execution
-status, verifier status, token/cost summaries, the Agent/Model/Tool/Final tree,
-and sanitized input/output metadata. Langfuse credentials remain in the Python
-process and are never sent to browser JavaScript. The HTTP surface is read-only,
-has no CORS or mutation endpoints, and binds to loopback by default; use
-`--no-open`, `--port`, or `--records-dir` when needed.
+in the background through the SDK's v4 Observations API. Its hierarchy is
+Global (`ALL SESSIONS`) → Session → Turn → Model/Tool/Final. Each level shows
+the relevant call counts, duration, input/output tokens, cache read/write and
+cache hit rate, cost, and error state. Cache hit rate is Cache Read divided by
+the provider-reported total input. For Alibaba Cloud Model Studio's OpenAI-compatible
+implicit cache, that is `prompt_tokens_details.cached_tokens / prompt_tokens`;
+the viewer reads `prompt_tokens` directly when available, or uses
+`total_tokens - output_tokens` as the same exact denominator when cache-write usage
+is omitted. A real zero is displayed as zero (for example `$0.00`), while
+provider-omitted usage or cost stays unknown (`—`). Mixed aggregates with some
+unknown contributions are marked as lower bounds (`≥`). Consecutive Model Calls
+in one Turn also show adjacent input-token growth.
+
+Selecting a turn shows the complete message context sent to its last model call
+(`system`, `user`, `assistant`, and `tool`) plus the final model output, followed
+by the Agent/Model/Tool/Final tree. Model and Tool nodes surface their important
+fields directly; the detail pane presents status, usage, request, and response
+before a collapsed Raw Payload. Error observations are visually emphasized and
+roll up to their Turn and Session. The Python response boundary applies
+sanitization again so SDK-added metadata or historical local fields containing
+credentials do not reach the browser. Historical messages do not carry
+their own timestamps, so timing belongs to the executable observations rather
+than being invented. Turns sharing a `session_id` appear in a collapsible
+Session group; the group preserves chronological turn order and aggregates its
+status. Langfuse credentials remain in the Python process and are never sent to
+browser JavaScript. The HTTP surface is read-only, has no CORS or mutation
+endpoints, and binds to loopback by default; use `--no-open`, `--port`, or
+`--records-dir` when needed.
+
+### Trigger and record lifecycle
+
+The CLI loads the project `.env` first and then `~/.aegis/.env`. Langfuse is
+enabled only when both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are
+available; `LANGFUSE_BASE_URL` selects the Cloud region or a self-hosted
+backend. A missing SDK, incomplete credentials, initialization error, or upload
+failure automatically degrades to no-op tracing.
+
+| Action | What triggers | Result |
+|---|---|---|
+| `uv run aegis --session <id>` | Every submitted user turn enters `AgentRuntime.run_turn()` | Writes normal session history and, when Langfuse is enabled, one cloud trace per turn. It does not create an ExecutionRecord. Multiple turns may share the same `session_id` but have different `trace_id` values. |
+| `uv run aegis run ...` | One non-interactive task | Always writes a local ExecutionRecord and also sends a Langfuse trace when enabled. Missing `execution_id` is generated as a UUID; `session_id` defaults to it; `trace_id` is deterministically derived from it. |
+| `uv run harbor run ... --agent aegis_agent.integrations.harbor:Aegis` | One or more Harbor trials | Harbor starts each Docker task environment, installs Aegis, and uses the trial UUID as `execution_id`. Aegis writes the runtime record, then Harbor runs the verifier and writes `result.json`. |
+| `uv run aegis quality import-harbor <result-or-job>` | Explicit post-verifier import | Merges Harbor identity, verifier rewards, exceptions, aggregate usage, and artifacts into the final ExecutionRecord. The argument may be one `result.json` or an entire job directory. |
+| `uv run aegis quality view` | Starts the local read-only viewer | Reads local JSON first and optional Langfuse observations in the background. It does not create or modify trace data. |
+
+Langfuse upload is asynchronous. A normal CLI exit calls Runtime
+`shutdown()` so queued observations are flushed. Harbor finalization is a
+separate explicit step: without `import-harbor`, the trial still has Aegis's
+runtime record and Harbor's raw `result.json`, but the central record has not
+yet been enriched with verifier output.
+
+### Recorded data
+
+A Langfuse `Aegis Run` records the user task, session/agent/version metadata,
+final output, success or error, stop reason, iteration/tool counts, and latency.
+Its children record:
+
+- Model calls: provider, model, input messages, output, finish reason, tool
+  calls, errors, latency, reliable input/output/total tokens, separate cache
+  read/write tokens, and direct upstream cost when available.
+- Tool calls: tool name, sanitized arguments and result, success or error, and
+  latency.
+- Subagent runs: type, task, parent agent, result, error, latency, and their
+  nested model/tool/final tree.
+- Final result: output, success or error, and stop reason.
+
+The local `ExecutionRecord` schema adds stable execution/task/trial/job/session/
+trace identity, agent configuration, execution timing and status, the ordered
+parent-linked step tree, usage buckets, Harbor verifier result/rewards/pass
+state, and artifact/log paths. Runtime success and verifier pass/fail remain
+separate. Fields that the provider or Harbor does not supply remain `null`.
+
+All Langfuse payloads and local step payloads pass through the same sanitizer.
+Common credential fields and key patterns are replaced with `[REDACTED]`.
+Strings are bounded to 20,000 characters, collections to 100 items, and nesting
+to eight levels; truncation metadata retains the original size.
+
+### Storage locations
+
+| Data | Default location | Override / notes |
+|---|---|---|
+| Interactive session history | `~/.aegis/state.db` | `--db` overrides it; `--ephemeral` disables persistence. Project-scoped sessions use the project data directory. |
+| Langfuse traces | The project at `LANGFUSE_BASE_URL` | Aegis does not maintain a second local Langfuse database. |
+| One-shot central record | `~/.aegis/quality/executions/<execution_id>.json` | Override with `--records-dir` or `AEGIS_EXECUTION_RECORDS_DIR`. |
+| Explicit one-shot copy | `--record-path` / `AEGIS_EXECUTION_RECORD_PATH` | Written alongside the central record. |
+| Harbor runtime record | `<trial-dir>/agent/execution-record.runtime.json` | Written before verifier output exists. |
+| Harbor agent log | `<trial-dir>/agent/aegis.txt` | Preserves agent stdout/stderr. |
+| Harbor raw result | `<trial-dir>/result.json` | Written by Harbor after the verifier. |
+| Harbor final record | `<trial-dir>/execution-record.json` | Written by `quality import-harbor`. |
+| Imported central copy | `~/.aegis/quality/executions/<trial-uuid>.json` | Contains the merged runtime and verifier result. |
+| Trace Viewer | No storage | Reads the local records and Langfuse v4 Observations API only. |
+
+The viewer groups turns by `session_id`, but joins local and cloud copies of an
+individual turn by exact `trace_id`, not by timestamp. Cloud success comes from
+explicit Aegis success metadata; older traces fall back to their level,
+`stop_reason`, completion time, and output. `CLOUD` means a Langfuse-only trace,
+`LOCAL` means an ExecutionRecord, and `LF` on a local entry means a matching
+Langfuse trace was found. A search match in any turn keeps the complete Session
+visible so follow-up context is not hidden.
 
 ---
 
@@ -492,11 +586,17 @@ memory:
 context:
   max_tokens: 120000
 iterations:
-  max: 10
+  max: 50
 session:
   snapshot_every_n: 20
 mcp_servers: { ... }
 ```
+
+The built-in limit is **50 model/tool iterations per turn**, not 50 individual
+tool calls. Override it with `iterations.max` above or, for one launch,
+`uv run aegis --max-iterations 100` (`-n 100`). Restart Aegis and resume the
+session for a changed limit to take effect; an already-running session keeps
+its startup limit. Explicit subagent limits are unchanged.
 
 Configurable from the file: memory (`enabled` / `recall` / `extract` / `project`),
 context (`compress` / `max_tokens`), iterations (`max`), session (`db_path` /

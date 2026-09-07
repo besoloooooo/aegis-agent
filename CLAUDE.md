@@ -244,6 +244,7 @@ After every task:
 * report unresolved risks and TODOs;
 * update the development report described in Section 9;
 * update `README.md` including the milestone list and any affected feature sections, not just `docs/source-map.md` and `docs/development-log.md`;
+* whenever `README.md` changes, apply the same changes to the Chinese version `README.zh-CN.md` so both stay in sync;
 * verify that neither reference repository was modified.
 
 Use the smallest relevant test first, then run:
@@ -312,6 +313,7 @@ Do not update only:
 ```text
 docs/source-map.md
 docs/development-log.md
+README.zh-CN.md
 ```
 
 ## 10. Completion report format

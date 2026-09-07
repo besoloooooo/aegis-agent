@@ -28,7 +28,7 @@ Example::
       max_tokens: 120000          # --context-max-tokens
       compress: true             # --no-compress flips this off
     iterations:
-      max: 10                     # --max-iterations
+      max: 50                     # --max-iterations
     session:
       db_path: null              # --db
       snapshot_every_n: 20        # --snapshot-every-n

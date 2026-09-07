@@ -70,10 +70,12 @@ def test_resolve_enabled_no_flag_semantics():
 
 
 def test_resolve_value_precedence():
+    from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS
+
     cfg = {"iterations": {"max": 5}}
-    assert resolve_value(3, cfg, "iterations", "max", 10) == 3
-    assert resolve_value(None, cfg, "iterations", "max", 10) == 5
-    assert resolve_value(None, {}, "iterations", "max", 10) == 10
+    assert resolve_value(3, cfg, "iterations", "max", DEFAULT_MAX_ITERATIONS) == 3
+    assert resolve_value(None, cfg, "iterations", "max", DEFAULT_MAX_ITERATIONS) == 5
+    assert resolve_value(None, {}, "iterations", "max", DEFAULT_MAX_ITERATIONS) == 50
 
 
 def test_recall_extract_default_on():

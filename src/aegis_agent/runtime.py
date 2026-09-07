@@ -70,7 +70,7 @@ from aegis_agent.tools.builtin import build_default_registry
 from aegis_agent.tools.executor import ToolExecutor
 from aegis_agent.tools.registry import ToolContext, ToolRegistry
 
-DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_ITERATIONS = 50
 
 #: The identity of the primary, user-facing agent.  Every runtime built by the
 #: CLI carries this name; a future subagent would construct a runtime with a

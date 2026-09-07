@@ -2825,16 +2825,16 @@ Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类�
 
 ---
 
-## Aegis Agent Quality Stage 0 — Langfuse observability
+## Aegis Agent Quality 阶段 0——Langfuse 可观测性
 
-### Problem and goal
+### 问题与目标
 
 本阶段只为现有 Aegis Agent 增加一次完整任务执行的 Langfuse Trace。要求一个
 `AgentRuntime.run_turn` 对应一个顶层 Agent observation，内部模型、工具、子 Agent 和最终
 结果可见，同时保证观测后端任何故障都不改变 Runtime 行为。本阶段不包含
 Evaluation、Harbor、Process Evaluation、Failure Attribution、Regression 或 Quality Gate。
 
-### Relevant current Aegis source locations
+### 当前 Aegis 的相关源码位置
 
 - Agent Run / Final Result：`src/aegis_agent/cli.py::_repl` 调用
   `src/aegis_agent/runtime.py::AgentRuntime.run_turn`；内部 loop 返回 `TurnResult`。
@@ -2846,7 +2846,7 @@ Evaluation、Harbor、Process Evaluation、Failure Attribution、Regression 或 
   `SubagentRunner.run` → 子 `AgentRuntime.run_turn`。
 - 文档与源码存在差异时，以上当前源码调用链为准。
 
-### External reference and implementation decision
+### 外部参考与实现决策
 
 - 使用 Langfuse Python SDK v4 推荐的 `Langfuse` client、
   `start_as_current_observation(...)` 和 `propagate_attributes(...)`。
@@ -2857,7 +2857,7 @@ Evaluation、Harbor、Process Evaluation、Failure Attribution、Regression 或 
 - 本阶段没有使用 Hermes 或 Claude Code 作为观测行为参考，也没有修改两个
   reference repository。
 
-### Aegis design, data flow, and trace hierarchy
+### Aegis 设计、数据流与追踪层级
 
 ```text
 AgentRuntime.run_turn
@@ -2885,7 +2885,7 @@ AgentRuntime.run_turn
   credential key、Bearer/token 模式，限制递归深度/集合大小，并将长字符串截断为
   20,000 字符且保留原始长度。
 
-### Important files and interfaces
+### 重要文件与接口
 
 - `src/aegis_agent/observability/tracer.py`：`Observability` / `Observation` 协议、
   `NoopObservability`、`LangfuseObservability`、`create_observability`。
@@ -2895,7 +2895,7 @@ AgentRuntime.run_turn
 - `src/aegis_agent/agents/runner.py`, `agents/manager.py`：子 Runtime 传递与背景上下文传播。
 - `tests/test_observability.py`：本阶段的确定性 Trace/故障注入测试。
 
-### Reliability invariants and failure handling
+### 可靠性不变量与故障处理
 
 - Langfuse 创建、更新、关闭 observation，属性传播、flush/shutdown 任一步异常
   都在 adapter 内捕获，不进入 Agent 业务错误路径。
@@ -2906,7 +2906,7 @@ AgentRuntime.run_turn
 - 不将密钥硬编码或写入 Trace；配置只从 `LANGFUSE_PUBLIC_KEY`、
   `LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` 读取。
 
-### Tests, fault injection, and measured results
+### 测试、故障注入与实测结果
 
 - `uv run pytest -q tests/test_observability.py` → `6 passed`：普通 Model→Tool→Model→Final、
   Tool failure recovery、Subagent 父子层级、未配置 no-op、模拟 Langfuse 不可用、
@@ -2921,7 +2921,7 @@ AgentRuntime.run_turn
   本次 `runtime.py` import 格式；全仓 `mypy src` 的剩余 22 个错误位于既有
   session/MCP/web/skills/runtime/agents/CLI 代码，新增 observability 包单独检查通过。
 
-### Trade-offs, current gaps, and TODOs
+### 权衡、当前缺口与待办事项
 
 - 当前 `ChatResponse` / model event stream 没有 token usage、cache token 或 cost 字段，
   因此本阶段不伪造或估算这些值。
@@ -2930,7 +2930,7 @@ AgentRuntime.run_turn
 - 没有为实现 Trace 而重构 Agent Loop；新接口是后端中立的，下一阶段若需
   OpenTelemetry 可在 adapter 层扩展。
 
-### Concise interview-ready explanation
+### 面试式简明说明
 
 "这次接入选择了五个现成统一边界：`run_turn`、provider stream、`ToolExecutor.execute_one`、
 子 `run_turn` 和 `TurnResult`。Runtime 只依赖内部 Observability protocol，Langfuse v4 是一个
@@ -2941,16 +2941,16 @@ fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reaso
 
 ---
 
-## Stage 18 repair — fixed composer and usable scrollback
+## 阶段 18 修复——固定输入框与可用的历史滚动
 
-### Task goal and original problem
+### 任务目标与原始问题
 
 修复 `master` 上刚加入的 full-screen TTY：历史窗启动后是空白，提交消息仍看不到交互记录；
 工具调用、工具结果和错误直接写到底层 terminal，破坏 full-screen 重绘；底部同时出现 placeholder
 与整行反色提示，视觉噪声过多。目标收敛为上方独立可滚动的完整交互历史，以及底部始终可见的
 单行用户输入框，同时保留已有 Rich Markdown 和代码高亮。
 
-### Relevant reference behavior and migration decision
+### 相关参考行为与迁移决策
 
 - Claude Code `src/components/FullscreenLayout.tsx` 的行为参考：消息区与 bottom slot 分离；
   手动离开底部后 streaming 不强制拉回，重新提交时恢复 tail following。
@@ -2958,7 +2958,7 @@ fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reaso
 - 选择 **behavioural rewrite / repair**：未复制 React/Ink 或 Hermes CLI 代码，只修正 Aegis
   已有的 Python `ScrollablePane` 实现并保持依赖不变。
 
-### Aegis design and main data flow
+### Aegis 设计与主要数据流
 
 - `_FullscreenShell._formatted_output()` 根据历史实际物理行数和 terminal 高度计算
   `_last_max_scroll`，不再用 `10**9` 作为滚动位置。`_follow_output=True` 时贴住尾部；PageUp/
@@ -2971,14 +2971,14 @@ fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reaso
 - bottom slot 只保留一条分隔线和单行 `❯` composer；删除 full-screen placeholder 与反色 hint row。
   非 full-screen PromptSession fallback 仍保留 placeholder、slash hint、历史和 token lexer。
 
-### Important files and interfaces
+### 重要文件与接口
 
 - `src/aegis_agent/tui.py`：`_FullscreenShell.prompt`、`_formatted_output`、
   `_history_viewport_height`、`_history_overflows`、`Tui._emit`、`_render_to_ansi`。
 - `tests/test_tui.py`：tail clamp、manual-scroll stickiness、full-screen tool-output containment 回归测试。
 - `README.md`、`docs/source-map.md`：更新可观察行为与参考关系；未新增 milestone 编号。
 
-### Reliability invariants and edge cases
+### 可靠性不变量与边界情况
 
 - full-screen 模式下不存在绕过 history buffer 的 turn-event 输出。
 - 空/短历史从第 0 行显示；长历史的最大 scroll 位置等于 `line_count - viewport_height`，不会出现
@@ -2988,7 +2988,7 @@ fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reaso
 - non-TTY streaming 路径完全保留，因此管道、日志和 CliRunner 的文本契约不变。
 - full-screen 初始化失败仍自动回退到 PromptSession。
 
-### Tests and measured results
+### 测试与实测结果
 
 - `uv run pytest -q tests/test_tui.py` → `10 passed in 0.95s`（最终复跑）。
 - `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
@@ -3000,14 +3000,14 @@ fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reaso
 - 100×30 tmux PTY 手工验证：启动 banner 可见；`you❯` / `aegis❯` / tool call / tool result 同处
   history；PageUp 只滚动 history；底部 composer 保持固定。
 
-### Trade-offs, remaining limitations, and TODOs
+### 权衡、剩余限制与待办事项
 
 - 当前保留最多 4,000 个预渲染 history lines，没有 Claude Code 的 virtualized message list。
 - prompt_toolkit scrollbar 是轻量指示条；本阶段验证 mouse wheel 与 PageUp/PageDown，不实现
   unseen-message pill、turn jump 或复杂 selection-preserving scroll。
 - Rich streaming preview 仍在 segment 完成后转换为 Markdown，不是 stable-prefix 增量 Markdown。
 
-### Concise interview-ready explanation
+### 面试式简明说明
 
 "这个 bug 不是配色问题，而是滚动状态和输出通道错了：代码把 scroll 直接设为十亿，在 history
 window 不持有 focus 时 prompt_toolkit 不会替它 clamp，于是内容全被滚出屏幕；同时 tool/error 还在
@@ -3017,16 +3017,16 @@ bottom 只剩单行 composer。Rich Markdown 渲染保留，TTY 与非 TTY 的�
 
 ---
 
-## Stage 18 repair follow-up — live Markdown and working mouse wheel
+## 阶段 18 修复补充——实时 Markdown 与可用的鼠标滚轮
 
-### Task goal and original problem
+### 任务目标与原始问题
 
 第一次布局修复后，full-screen assistant 在 streaming 阶段仍以 plain `Text` 显示，只有收到
 tool boundary 或 `TURN_END` 才变成 Rich Markdown；同时 PageUp/PageDown 可滚动，但 Windows
 Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外层 `ScrollablePane` 的
 `vertical_scroll`。目标是在不改变固定 composer 和最终字体风格的前提下修复这两条交互路径。
 
-### Relevant reference behavior and migration decision
+### 相关参考行为与迁移决策
 
 - Claude Code `src/components/Markdown.tsx::StreamingMarkdown` 提供 streaming 阶段已有格式的
   可观察行为参考；Aegis 不迁移其 stable-prefix/Ink 实现，而是在现有 10 Hz full-screen refresh
@@ -3036,7 +3036,7 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
 - Hermes 当前 `cli.py` 明确使用 `mouse_support=False`，因此不适合作为本次 wheel 修复来源。
 - 决策为 **behavioural rewrite / targeted repair**，没有复制参考代码或增加依赖。
 
-### Aegis design and main data flow
+### Aegis 设计与主要数据流
 
 - `Tui._render_event(TEXT_DELTA)` 继续将 delta 累加到 `_TurnState`，但 live slot 现在接收
   `_assistant_markdown_renderable(state.peek_text())`，和最终 `_flush_assistant_text()` 使用完全相同的
@@ -3047,7 +3047,7 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
 - wheel 与 PageUp/PageDown 共用 clamp 和 sticky 状态：向上滚设置 `_follow_output=False`；向下
   到 `_last_max_scroll` 时恢复；所有目标都限制在 `[0, _last_max_scroll]`。
 
-### Important files and interfaces
+### 重要文件与接口
 
 - `src/aegis_agent/tui.py`：`_HistoryControl`、`_handle_history_mouse`、`_scroll_history`、
   `_assistant_markdown_renderable`、`Tui._render_event`。
@@ -3055,7 +3055,7 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
   `test_fullscreen_mouse_wheel_scrolls_history`。
 - `README.md`、`docs/source-map.md`：更新 streaming 与 wheel 的用户可见行为和参考关系。
 
-### Reliability invariants and edge cases
+### 可靠性不变量与边界情况
 
 - turn 未结束时 live preview 已是 Markdown，结束时只从 live slot 原样提交到 history，不出现
   plain-to-Markdown 的突然替换。
@@ -3064,7 +3064,7 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
 - 用户上滚后新 token 不抢走阅读位置；向下滚到底后 streaming 才继续贴尾。
 - non-TTY char-by-char output 路径未改变。
 
-### Tests and measured results
+### 测试与实测结果
 
 - `uv run pytest -q tests/test_tui.py` → `12 passed in 1.58s`（最终复跑）。
 - `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
@@ -3076,14 +3076,14 @@ Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外
 - 100×30 tmux VT100 实测：连续三轮工具输出后发送三次 SGR wheel-up 序列，history 从尾部移动到
   banner/第一轮消息，固定 composer 保持在底部。
 
-### Trade-offs, remaining limitations, and TODOs
+### 权衡、剩余限制与待办事项
 
 - 当前对累计文本做完整 Rich Markdown 重渲染；实现简单且刷新上限为 10 Hz，但超长单段回复的
   渲染成本高于 stable-prefix/unstable-suffix 增量方案。
 - incomplete fenced code/table 在 streaming 中可能短暂重排，这是 Markdown 流式渲染的预期行为。
 - scrollbar 仍是 prompt_toolkit 指示条，不实现抓住 thumb 拖拽或 selection-preserving scroll。
 
-### Concise interview-ready explanation
+### 面试式简明说明
 
 "两个现象来自两条不同的事件路由：delta live slot 用的是 plain Text，所以最终 flush 才出现
 Markdown；VT100 wheel 则交给内层 Window，而真正的 scroll offset 在外层 ScrollablePane。现在
@@ -3092,15 +3092,15 @@ clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了�
 
 ---
 
-## Stage 18 repair follow-up — stable streaming frames and precision wheel
+## 阶段 18 修复补充——稳定的流式帧与精细滚轮
 
-### Task goal and original problem
+### 任务目标与原始问题
 
 实时 Markdown 和滚轮路由修复后，用户仍观察到 streaming 中偶尔闪回开场 history 一帧，滚轮移动
 也显得偏猛、偏卡。目标是在不更换 prompt_toolkit 布局的前提下消除中间空帧，并把滚动步长调到
 更接近 Claude Code 的精细体验。
 
-### Relevant reference behavior and migration decision
+### 相关参考行为与迁移决策
 
 - Aegis 当前 `TEXT_DELTA` 路径的直接证据：每个 delta 都先调用 `state.stop_spinner()`，而
   full-screen 的实现会执行 `shell.set_live(None)`，随后才写入新的 Markdown renderable。
@@ -3109,21 +3109,21 @@ clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了�
 - 选择 **targeted repair / behavioural adaptation**：修正 Aegis 自身竞态，将 wheel 常量从 3 降到
   1；不迁移 Claude Code 的 pending-delta、bounce detection 或 acceleration 系统。
 
-### Aegis design and main data flow
+### Aegis 设计与主要数据流
 
 - `Tui._render_event(TEXT_DELTA)` 只在 `state.started_text` 为 false 时清除 thinking spinner。
   第一个 delta 之后，live slot 始终从一个 Markdown renderable 原子替换为下一个，不再经过 `None`。
 - `_WHEEL_SCROLL_LINES = 1`；已有 `_scroll_history()` 继续负责 clamp、离底关闭 follow、回底恢复
   follow，因此只改变手感，不改变边界语义。
 
-### Important files and interfaces
+### 重要文件与接口
 
 - `src/aegis_agent/tui.py`：`_WHEEL_SCROLL_LINES`、`Tui._render_event`。
 - `tests/test_tui.py`：扩展 streaming 测试以断言第二个 delta 之间没有 `None` live update；wheel
   测试断言单事件只移动一行。
 - `README.md`、`docs/source-map.md`：记录 precision wheel 和无中间空帧行为。
 
-### Reliability invariants and edge cases
+### 可靠性不变量与边界情况
 
 - thinking spinner 仍会在第一个 text delta 前正确清除。
 - 第二个及后续 delta 不清空 live slot；不再产生可被 UI thread 捕获的空历史帧。
@@ -3131,7 +3131,7 @@ clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了�
 - wheel 始终 clamp 在 `[0, _last_max_scroll]`，只是每事件移动量从 3 变为 1。
 - non-TTY streaming 路径不变。
 
-### Tests and measured results
+### 测试与实测结果
 
 - `uv run pytest -q tests/test_tui.py` → `12 passed in 0.88s`（实现后首轮）。
 - `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
@@ -3141,14 +3141,14 @@ clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了�
   `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
   `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
 
-### Trade-offs, remaining limitations, and TODOs
+### 权衡、剩余限制与待办事项
 
 - 单事件一行优先保证精细与稳定；没有 Claude Code 针对快速连续滚动的自适应加速，长距离回看应使用
   PageUp/PageDown。
 - prompt_toolkit `ScrollablePane` 仍会重绘其虚拟内容；非常长的 4,000 行历史可能需要后续做窗口化，
   本次没有以高风险重构换取尚未量化的性能收益。
 
-### Concise interview-ready explanation
+### 面试式简明说明
 
 "闪屏不是 Markdown 本身，而是每个 token 都把 live slot 先设成 None，再放回新 renderable；UI
 线程偶尔会画到这个中间态。现在只在首个 delta 清 spinner，后续 frame 直接 Markdown-to-Markdown
@@ -3156,7 +3156,7 @@ clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了�
 
 ---
 
-## Viewport Clipping Optimization for TUI Scrolling Performance
+## TUI 滚动性能的视口裁剪优化
 
 ### 问题
 
@@ -3197,224 +3197,192 @@ Claude Code 使用前端/后端帧缓冲和 Yoga 布局引擎，只渲染视口�
 - **优化后**：只渲染 98 行（视口高度 48 + 2×50 缓冲区）
 - **渲染时间**：0.0017s（10000 行中只渲染 1%）
 
-### Changed files
+### 修改文件
 
 - `src/aegis_agent/tui.py` — 添加视口裁剪优化
 
-### Tests executed
+### 执行的测试
 
 - `uv run pytest -q tests/test_tui.py` → 12 passed
 - `uv run pytest -q` → 649 passed, 2 skipped
 
-### Trade-offs
+### 权衡
 
 - 缓冲区大小（50 行）是经验值，需要在平滑滚动和内存使用之间平衡
 - 极端情况下（快速滚动大量内容），可能需要调整缓冲区大小
 
-### Remaining TODOs
+### 剩余待办事项
 
 - 监控实际使用中的性能表现
 - 考虑添加自适应缓冲区大小（基于滚动速度）
 
 ---
 
-## Stage 18 viewport clipping correctness follow-up
+## 阶段 18 视口裁剪正确性补充
 
-### Problem and root cause
+### 问题与根因
 
-The first viewport-clipping pass reduced the formatted history to a buffered
-slice, but continued to use `ScrollablePane.vertical_scroll` as if it were an
-absolute position in the complete history. Once the slice started beyond line
-zero, prompt_toolkit received a history-sized offset for a roughly
-viewport-sized document. During a long live response this could freeze or
-blank a manually scrolled view; the same mismatch could put the live thinking
-status outside the effective pane.
+第一版视口裁剪把格式化后的历史缩减为带缓冲区的切片，但仍然把
+`ScrollablePane.vertical_scroll` 当作完整历史中的绝对位置使用。切片起点超过第 0 行后，
+prompt_toolkit 收到的是面向完整历史的偏移量，而实际文档只有视口大小。这会导致长回复流式
+输出时，手动滚动的视图冻结或变为空白；同一坐标不一致还可能让实时思考状态落到有效窗格之外。
 
-### Implementation
+### 实现
 
-- `_FullscreenShell._history_scroll` now owns the absolute position in the
-  complete history.
-- `_formatted_output()` calculates clipping boundaries from that absolute
-  position, then assigns `scroll.vertical_scroll = _history_scroll - start` so
-  the pane receives a valid slice-local coordinate.
-- Mouse wheel, Home/End, clear, tail-following, and history truncation update
-  the logical coordinate consistently.
-- Manual scroll position stays fixed while live content grows; reaching the
-  tail restores follow mode.
+- `_FullscreenShell._history_scroll` 现在保存完整历史中的绝对位置。
+- `_formatted_output()` 根据绝对位置计算裁剪边界，再设置
+  `scroll.vertical_scroll = _history_scroll - start`，向窗格传入有效的切片内坐标。
+- 鼠标滚轮、Home/End、清屏、尾部跟随和历史截断统一更新该逻辑坐标。
+- 实时内容增长时保持手动滚动位置不变；到达尾部时恢复跟随模式。
 
-### Verification
+### 验证
 
-- `tests/test_tui.py` covers global-to-local translation beyond the 50-line
-  buffer, a visible live thinking status at the history tail, and 100 growing
-  live frames while the viewport is manually scrolled.
+- `tests/test_tui.py` 覆盖超过 50 行缓冲区时的全局到局部坐标转换、历史尾部可见的实时
+  思考状态，以及手动滚动视口期间连续增长的 100 帧实时内容。
 - `uv run pytest -q tests/test_tui.py` → `15 passed in 0.95s`.
 - `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
 - `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
 - `uv run pytest -q` → `652 passed, 2 skipped in 526.04s`.
-- Full-repository Ruff remains at the six pre-existing findings in
-  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
-  `tests/test_session_titles.py`; files touched for the TUI repair pass their
-  targeted checks.
+- 全仓 Ruff 仍保留 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
+  本次 TUI 修复涉及的文件均通过定向检查。
 
-### Trade-offs and remaining work
+### 权衡与剩余工作
 
-The scrollbar describes the buffered slice rather than the entire logical
-history because prompt_toolkit owns it. Wheel and paging behavior use the
-logical history position and remain correct; a full-history proportional thumb
-would require a custom scrollbar or a different virtualized container.
+由于滚动条由 prompt_toolkit 管理，它描述的是缓冲切片而不是完整逻辑历史。滚轮和翻页使用
+逻辑历史位置，因此行为仍然正确；要实现对应完整历史的比例滑块，需要自定义滚动条或改用其他
+虚拟化容器。
 
 ---
 
-## Stage 18 follow-up — remove misleading scrollbar and add jump-to-tail
+## 阶段 18 补充——移除误导性滚动条并增加跳转到尾部
 
-### Task goal and original problem
+### 任务目标与原始问题
 
-Viewport clipping made prompt_toolkit's built-in scrollbar describe only the
-buffered slice. Its thumb therefore changed size inconsistently, could not be
-used to drag through the complete history, and communicated a false position.
-The interface also needed a fast way to leave a manually scrolled position and
-return to live output.
+视口裁剪使 prompt_toolkit 的内置滚动条只能描述缓冲切片，因此滑块大小变化不一致，无法拖动
+浏览完整历史，而且会传达错误的位置。界面还需要一种快速方式，让用户离开手动滚动位置并返回
+实时输出尾部。
 
-### Relevant reference behavior and migration decision
+### 相关参考行为与迁移决策
 
-- Claude Code `src/keybindings/defaultBindings.ts` maps `ctrl+end` to
-  `scroll:bottom`; its ScrollBox then restores sticky tail-following.
-- Aegis adopts that observable binding and follow behavior as a small
-  behavioural adaptation. It does not port Claude Code's custom ScrollBox or
-  proportional scrollbar.
-- The slice-local prompt_toolkit scrollbar is removed rather than replaced,
-  because implementing a truthful draggable thumb would require a separate
-  full-history virtual-scroll control.
+- Claude Code 的 `src/keybindings/defaultBindings.ts` 将 `ctrl+end` 映射到
+  `scroll:bottom`，随后由 ScrollBox 恢复粘性尾部跟随。
+- Aegis 对该快捷键与跟随行为做小范围行为适配，不迁移 Claude Code 的自定义 ScrollBox 或
+  比例滚动条。
+- 直接移除仅描述切片的 prompt_toolkit 滚动条，不用另一个不准确实现替换它；真实可拖动滑块
+  需要独立的完整历史虚拟滚动控件。
 
-### Aegis design and main data flow
+### Aegis 设计与主要数据流
 
-- `ScrollablePane(show_scrollbar=False)` removes the inaccurate visual thumb.
-- A global `Keys.ControlEnd` binding calls `_jump_to_bottom()` even while the
-  composer has focus.
-- `_jump_to_bottom()` assigns `_last_max_scroll` to `_history_scroll`, enables
-  `_follow_output`, and invalidates the application. The next formatted frame
-  performs the existing absolute-to-slice-local coordinate translation.
-- Bare End keeps its normal input-cursor behavior when the composer is focused.
+- `ScrollablePane(show_scrollbar=False)` 移除不准确的可视滑块。
+- 即使输入框拥有焦点，全局 `Keys.ControlEnd` 绑定也会调用 `_jump_to_bottom()`。
+- `_jump_to_bottom()` 将 `_last_max_scroll` 赋给 `_history_scroll`，启用
+  `_follow_output` 并刷新应用。下一帧继续执行现有的绝对坐标到切片内坐标转换。
+- 输入框拥有焦点时，单独按 End 仍保持正常的光标移动行为。
 
-### Reliability invariants and edge cases
+### 可靠性不变量与边界情况
 
-- Wheel and PageUp/PageDown remain available after hiding the scrollbar.
-- `Ctrl+End` works from a long manually scrolled history and restores live
-  tail-following.
-- Short histories clamp normally because `_last_max_scroll` is zero.
-- No model, runtime, persistence, or non-TTY behavior changes.
+- 隐藏滚动条后，滚轮及 PageUp/PageDown 仍然可用。
+- `Ctrl+End` 能从很长历史中的手动滚动位置跳到底部，并恢复实时尾部跟随。
+- 短历史下 `_last_max_scroll` 为零，因此会正常限制位置。
+- 模型、Runtime、持久化及非 TTY 行为均未改变。
 
-### Tests and measured results
+### 测试与实测结果
 
-- `tests/test_tui.py` asserts the scrollbar is disabled, the global
-  `Keys.ControlEnd` binding exists, and jumping to the bottom restores both the
-  maximum logical position and follow mode.
+- `tests/test_tui.py` 验证滚动条被禁用、存在全局 `Keys.ControlEnd` 绑定，并确认跳到底部会同时
+  恢复最大逻辑位置与跟随模式。
 - `uv run pytest -q tests/test_tui.py` → `16 passed in 0.70s`.
 - `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
 - `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
 - `uv run pytest -q` → `653 passed, 2 skipped in 525.45s`.
-- `git diff --check` → passed.
-- Full-repository Ruff remains at the same six pre-existing findings in
-  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
-  `tests/test_session_titles.py`; this follow-up introduces no new finding.
+- `git diff --check` → 通过。
+- 全仓 Ruff 仍保留相同的 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
+  本次补充未引入新问题。
 
-### Trade-offs, remaining limitations, and TODOs
+### 权衡、剩余限制与待办事项
 
-There is intentionally no visible full-history position indicator. A truthful
-draggable scrollbar would require a custom control that maps the complete
-history to the clipped pane; this is deferred unless user testing shows it is
-worth the added complexity.
+当前有意不显示完整历史位置指示器。真实可拖动的滚动条需要自定义控件，把完整历史映射到裁剪
+窗格；除非用户测试证明增加的复杂度值得，否则暂不实现。
 
-### Concise interview-ready explanation
+### 面试式简明说明
 
-"The built-in thumb described a hundred-line render slice rather than the full
-conversation, so its size and position were misleading and it was not useful
-for dragging. Aegis now hides it and follows Claude Code's established
-Ctrl+End shortcut: one action jumps the logical history position to the tail
-and re-enables sticky live output, while the existing viewport translation
-keeps rendering bounded."
+“内置滑块描述的是约一百行的渲染切片，而不是完整对话，因此大小和位置具有误导性，也不能用于
+有效拖动。Aegis 现在隐藏该滑块，并采用 Claude Code 已有的 Ctrl+End 快捷键：一次操作跳到逻辑
+历史尾部并重新启用粘性实时跟随，同时由既有的视口坐标转换控制渲染规模。”
 
 ---
 
-## Quality Stage 0 follow-up — Token Usage / Cache Tokens / Cost data chain
+## Quality 阶段 0 补充——Token Usage、Cache Tokens 与 Cost 数据链
 
-### Root cause and targeted call chain
+### 根因与目标调用链
 
-The installed OpenAI SDK exposes `usage` on both `ChatCompletion` and
-`ChatCompletionChunk`. Standard usage contains `prompt_tokens`,
-`completion_tokens`, `total_tokens`, and optional
-`prompt_tokens_details.cached_tokens` / `cache_write_tokens`. Before this
-follow-up, Aegis lost those values at four boundaries:
+当前安装的 OpenAI SDK 在 `ChatCompletion` 和 `ChatCompletionChunk` 上都会暴露
+`usage`。标准 Usage 包含 `prompt_tokens`、`completion_tokens`、`total_tokens`，以及可选的
+`prompt_tokens_details.cached_tokens` / `cache_write_tokens`。本次补充前，Aegis 在四个边界
+丢失了这些值：
 
-1. streaming requests did not set `stream_options.include_usage`;
-2. `StreamAssembler` ignored the final `choices=[]` usage-only chunk, while
-   `_events_from_response` ignored non-streaming `response.usage`;
-3. `ModelEvent` and `ChatResponse` had no usage field;
-4. `AgentRuntime._call_model` updated only generation output.
+1. 流式请求没有设置 `stream_options.include_usage`；
+2. `StreamAssembler` 忽略最终 `choices=[]` 的纯 Usage chunk，
+   `_events_from_response` 也忽略非流式 `response.usage`；
+3. `ModelEvent` 和 `ChatResponse` 没有 Usage 字段；
+4. `AgentRuntime._call_model` 只更新生成输出。
 
-The existing Langfuse adapter already accepted `usage_details` and
-`cost_details`, so no concrete SDK dependency was added to Runtime.
+既有 Langfuse adapter 已能接收 `usage_details` 和 `cost_details`，因此没有给 Runtime 增加
+具体 SDK 依赖。
 
-### Data model and propagation
+### 数据模型与传递
 
-- `ModelUsage` is the provider-neutral structure: `input_tokens`,
-  `output_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`,
-  and optional direct `cost`.
-- `parse_openai_usage` is the OpenAI-compatible adapter. OpenAI
-  `prompt_tokens` is inclusive, so cache read/write detail is subtracted before
-  constructing ordinary `input_tokens`. This produces mutually-exclusive
-  Langfuse buckets and prevents double-counted inferred cost.
-- The provider emits a `ModelEventKind.USAGE`; `collect_response` keeps the
-  latest cumulative usage event in `ChatResponse.usage`. Usage appearing only
-  on the final streaming chunk therefore survives aggregation.
-- Runtime forwards `input`, `output`, `total`, `cache_read_input_tokens`, and
-  `cache_creation_input_tokens` through the existing Observation API.
-- If an OpenAI-compatible gateway directly returns `usage.cost` (or an
-  equivalent direct total cost field), Aegis sends `cost_details.total`.
-  Standard OpenAI Chat Completions does not return cost, so it remains unset.
-  Aegis does not contain a price table or estimate cost.
+- `ModelUsage` 是 Provider 中立的数据结构，包含 `input_tokens`、`output_tokens`、
+  `total_tokens`、`cache_read_tokens`、`cache_write_tokens` 和可选的上游直接 `cost`。
+- `parse_openai_usage` 是 OpenAI 兼容协议的适配器。OpenAI 的 `prompt_tokens` 包含缓存
+  Token，因此构造普通 `input_tokens` 前会减去缓存读写明细。这样得到互斥的 Langfuse
+  计数桶，避免推导成本时重复计数。
+- Provider 发出 `ModelEventKind.USAGE`；`collect_response` 将最新的累计 Usage 事件保存在
+  `ChatResponse.usage` 中。因此，即使 Usage 只出现在最后一个流式 chunk，也不会在聚合时丢失。
+- Runtime 通过现有 Observation API 传递 `input`、`output`、`total`、
+  `cache_read_input_tokens` 和 `cache_creation_input_tokens`。
+- 如果 OpenAI 兼容网关直接返回 `usage.cost` 或等价的总成本字段，Aegis 会发送
+  `cost_details.total`。标准 OpenAI Chat Completions 不返回成本，因此该字段保持未设置。
+  Aegis 不维护价格表，也不估算成本。
 
-### Provider compatibility and invariants
+### Provider 兼容性与不变量
 
-- `OpenAICompatibleProvider`: captures standard Chat Completions usage in both
-  streaming and one-shot modes, plus known compatible cache/direct-cost fields.
-- `FakeModelProvider`: accepts optional deterministic `ModelUsage` for tests;
-  normal replies still default to `usage=None`.
-- Providers that return no usage preserve the previous runtime result and
-  event behavior. `USAGE` is a non-UI event, so TUI semantics are unchanged.
-- Observability remains fail-open; No-op Langfuse receives no network traffic,
-  and adding usage cannot fail a model call or turn.
+- `OpenAICompatibleProvider`：在流式和单次响应模式下采集标准 Chat Completions Usage，
+  同时支持已知兼容协议中的缓存与直接成本字段。
+- `FakeModelProvider`：测试时可接收确定性的 `ModelUsage`；普通回复仍默认为 `usage=None`。
+- Provider 不返回 Usage 时，保持原有 Runtime 结果和事件行为。`USAGE` 是非 UI 事件，因此
+  TUI 语义不变。
+- Observability 继续保持故障开放；No-op Langfuse 不产生网络流量，新增 Usage 也不能导致
+  模型调用或整个 Turn 失败。
 
-### Tests and verification
+### 测试与验证
 
-- Focused provider/stream/observability/fake tests initially passed:
-  `45 passed, 1 skipped`.
-- Coverage includes normal input/output usage, separate cache read/write,
-  usage only in the final streaming chunk, missing usage, direct API cost,
-  Langfuse v4 update fields, and disabled/failing Langfuse.
+- 定向 Provider、Stream、Observability 和 Fake 测试首次运行结果为
+  `45 passed, 1 skipped`。
+- 覆盖普通输入/输出 Usage、独立缓存读写、只在最终流式 chunk 出现的 Usage、缺失 Usage、
+  API 直接成本、Langfuse v4 更新字段，以及 Langfuse 禁用或故障的情况。
 - `uv run pytest -q` → `659 passed, 2 skipped in 527.77s`.
-- Ruff over all files changed in this follow-up → `All checks passed!`.
+- 本次补充修改的全部文件通过 Ruff：`All checks passed!`。
 - `uv run mypy src/aegis_agent/models src/aegis_agent/events.py src/aegis_agent/observability`
   → `Success: no issues found in 11 source files`.
 
-### Out of scope and remaining gaps
+### 范围外事项与剩余缺口
 
-- No model price database, cost prediction, Evaluation, Harbor, Regression,
-  Quality Gate, or unrelated provider refactor was added.
-- Cost remains `None` whenever the upstream API does not return it. Langfuse
-  may independently infer cost from its configured model definitions, but
-  Aegis does not manufacture or ingest such an estimate.
+- 未增加模型价格数据库、成本预测、Evaluation、Harbor、Regression、Quality Gate 或无关的
+  Provider 重构。
+- 上游 API 不返回成本时，Cost 保持 `None`。Langfuse 可以根据自身配置的模型定义独立推算成本，
+  但 Aegis 不制造或接收这种估算值。
 
 ---
 
-## Quality Stage 0 follow-up — native Anthropic provider
+## Quality 阶段 0 补充——原生 Anthropic Provider
 
-### Goal and provider boundary
+### 目标与 Provider 边界
 
-This follow-up adds Anthropic as the second real Aegis model adapter without
-changing the Runtime, tool executor, or observability abstractions. The native
-Messages API is used instead of routing Anthropic through the OpenAI-compatible
-wire format:
+本次补充把 Anthropic 作为 Aegis 的第二个真实模型适配器，并且不改变 Runtime、Tool Executor
+或 Observability 抽象。实现直接使用原生 Messages API，而不是让 Anthropic 经过 OpenAI 兼容
+协议格式：
 
 ```text
 Anthropic Messages response/stream
@@ -3425,81 +3393,68 @@ Anthropic Messages response/stream
   -> existing Langfuse observation update
 ```
 
-`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, and optional `ANTHROPIC_BASE_URL`
-configure the provider. `--model-backend anthropic` forces it; `auto` preserves
-the existing OpenAI-compatible precedence and then chooses Anthropic when its
-key and model are present. Missing configuration still falls back to the fake
-provider in automatic mode.
+通过 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL` 和可选的 `ANTHROPIC_BASE_URL` 配置该
+Provider。`--model-backend anthropic` 会强制选择它；`auto` 保留现有 OpenAI 兼容 Provider
+的优先级，并在 Anthropic Key 与模型同时存在时选择 Anthropic。自动模式下缺少配置时，仍然回退到
+Fake Provider。
 
-### Message, tool, and streaming behavior
+### 消息、工具与流式行为
 
-- System messages are extracted into the Messages API `system` parameter.
-- Aegis assistant tool calls become Anthropic `tool_use` blocks; tool messages
-  become user-role `tool_result` blocks. Tool schemas use `input_schema`.
-- Streaming `text_delta`, `thinking_delta`, and `input_json_delta` events become
-  the existing Aegis text, reasoning, and completed tool-call events.
-- `end_turn`, `tool_use`, `max_tokens`, refusal, and context-window stop reasons
-  are normalized to the same finish-reason vocabulary used by the runtime.
-- SDK/transport errors are normalized to `ModelProviderError` or
-  `ModelTimeoutError`, retaining the existing Runtime error path.
+- System 消息被提取到 Messages API 的 `system` 参数中。
+- Aegis Assistant Tool Call 转换为 Anthropic `tool_use` block；Tool 消息转换为 User 角色的
+  `tool_result` block。工具 Schema 使用 `input_schema`。
+- 流式 `text_delta`、`thinking_delta` 和 `input_json_delta` 事件转换为 Aegis 现有的文本、
+  推理和已完成 Tool Call 事件。
+- `end_turn`、`tool_use`、`max_tokens`、拒绝和上下文窗口等停止原因，被统一映射到 Runtime
+  使用的 Finish Reason 词汇。
+- SDK 或传输错误统一转换为 `ModelProviderError` 或 `ModelTimeoutError`，保持现有 Runtime
+  错误路径。
 
-### Usage, cache, total, and cost
+### Usage、缓存、总量与成本
 
-Anthropic supplies input/cache usage on `message_start`, then final output
-usage on `message_delta`. `parse_anthropic_usage` cumulatively merges the two;
-zero input/cache values on the final delta do not overwrite previously observed
-non-zero counts. Anthropic `input_tokens` is kept as the ordinary, non-cache
-bucket, while `cache_read_input_tokens` and
-`cache_creation_input_tokens` remain distinct.
+Anthropic 在 `message_start` 提供输入与缓存 Usage，然后在 `message_delta` 提供最终输出
+Usage。`parse_anthropic_usage` 会累计合并两者；最终 delta 中为零的输入或缓存值不会覆盖此前
+观察到的非零计数。Anthropic 的 `input_tokens` 保留为普通非缓存计数桶，
+`cache_read_input_tokens` 与 `cache_creation_input_tokens` 则继续分开保存。
 
-The Messages API does not directly return `total_tokens` or monetary cost.
-Both remain `None`; Aegis does not sum a synthetic total, apply a price table,
-or estimate cost. The existing observability adapter receives the reliable
-input/output/cache buckets unchanged.
+Messages API 不直接返回 `total_tokens` 或金额成本，因此两者保持 `None`；Aegis 不合成总数、
+不套用价格表，也不估算成本。现有 Observability Adapter 会原样接收可靠的输入、输出和缓存计数桶。
 
-### Source relationship and scope
+### 来源关系与范围
 
-- Hermes `agent/transports/anthropic.py` informed the native tool-block and
-  stop-reason normalization shape.
-- Claude Code `src/services/api/claude.ts` informed the cumulative streaming
-  usage rule that protects non-zero start fields from final zero values.
-- The implementation is a compact rewrite for Aegis's synchronous
-  `ModelProvider` protocol. Hermes/Claude Code authentication stacks,
-  Bedrock/Vertex variants, retry systems, and product telemetry are omitted.
-- No Evaluation, pricing database, fallback router, or unrelated provider
-  refactor was added.
+- Hermes 的 `agent/transports/anthropic.py` 为原生 Tool Block 和停止原因归一化提供参考。
+- Claude Code 的 `src/services/api/claude.ts` 为累计流式 Usage 规则提供参考，避免起始事件中的
+  非零字段被最终事件中的零值覆盖。
+- 实现是针对 Aegis 同步 `ModelProvider` 协议的紧凑重写。未迁移 Hermes/Claude Code 的认证栈、
+  Bedrock/Vertex 变体、重试系统和产品遥测。
+- 未增加 Evaluation、价格数据库、Fallback Router 或无关 Provider 重构。
 
-### Verification
+### 验证
 
-Deterministic tests cover native message/tool conversion, streaming text and
-tool JSON assembly, separate cache read/write usage, final-only usage, missing
-usage, one-shot responses, normalized failures, CLI selection, and summary
-provider construction.
+确定性测试覆盖原生消息/工具转换、流式文本与工具 JSON 组装、独立缓存读写 Usage、仅最终事件
+含 Usage、缺失 Usage、单次响应、错误归一化、CLI 选择和摘要 Provider 构建。
 
-- Focused provider/stream/observability/compression tests:
+- 定向 Provider、Stream、Observability 和 Compression 测试：
   `88 passed, 1 skipped in 0.39s`.
 - `uv run pytest -q` → `668 passed, 2 skipped in 525.13s`.
-- Ruff over the repository reports only the same six pre-existing findings in
-  `cli.py`, `mcp/client.py`, `sessions/__init__.py`, `sessions/titles.py`, and
-  `tests/test_session_titles.py`; no new Anthropic finding was introduced.
-- Targeted mypy over the model/event/observability/wrapper boundary passes.
-  Including all of `runtime.py` still exposes its two pre-existing dynamic
-  manager attribute findings (`drain_lead_messages`, `drain_notifications`).
-- `git diff --check` passes.
+- 全仓 Ruff 仅报告原有的 6 个问题，位于 `cli.py`、`mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
+  Anthropic 实现没有引入新问题。
+- Model、Event、Observability 和 Wrapper 边界的定向 mypy 检查通过。加入整个 `runtime.py` 后，
+  仍只暴露两个既有的动态 Manager 属性问题：`drain_lead_messages` 和 `drain_notifications`。
+- `git diff --check` 通过。
 
 ---
 
-## Agent Quality Phase 1 + Phase 2 — Harbor Offline Evaluation and ExecutionRecord
+## Agent Quality 阶段 1 + 阶段 2——Harbor 离线评测与 ExecutionRecord
 
-### Scope and Harbor extension decision
+### 范围与 Harbor 扩展决策
 
-This phase adds only the Harbor execution bridge and the unified record needed
-by later quality work. It does not add process graders, failure attribution,
-regression, bad-case mining, quality gates, or a dashboard.
+本阶段只增加 Harbor 执行桥接，以及后续质量工作所需的统一记录；不增加过程评分器、失败归因、
+回归、坏例挖掘、质量门禁或 Dashboard。
 
-Harbor 0.22 source and its local analysis documents were inspected directly.
-The selected extension is Harbor's supported Python custom-agent import path
-backed by `BaseInstalledAgent`:
+实现前直接检查了 Harbor 0.22 源码及其本地分析文档。最终选择 Harbor 官方支持的 Python
+自定义 Agent 导入路径，并以 `BaseInstalledAgent` 为基础：
 
 ```text
 harbor run --agent aegis_agent.integrations.harbor:Aegis
@@ -3512,34 +3467,28 @@ harbor run --agent aegis_agent.integrations.harbor:Aegis
   -> final ExecutionRecord
 ```
 
-The sibling Harbor repository is not modified or forked. `BaseInstalledAgent`
-is used instead of a host-side wrapper because the Aegis Runtime and its tools
-must execute inside Harbor's environment. Harbor continues to own Task/Dataset,
-Job/Trial, environment lifecycle, timeout, retry, concurrency, verifier,
-reward, and Pass@K behavior.
+同目录 Harbor 仓库没有被修改或 Fork。选择 `BaseInstalledAgent` 而不是宿主机侧 Wrapper，是因为
+Aegis Runtime 及其工具必须在 Harbor 环境内部执行。Task/Dataset、Job/Trial、环境生命周期、
+超时、重试、并发、Verifier、Reward 和 Pass@K 行为仍由 Harbor 负责。
 
-### Non-interactive runtime and configuration
+### 非交互式 Runtime 与配置
 
-`aegis run` executes exactly one task without starting the TUI. It uses the
-existing provider selection (`auto`, OpenAI-compatible, Anthropic, or an
-explicit test-only fake), creates an in-memory session, runs the unchanged
-`AgentRuntime`, emits one JSON result line, and writes an ExecutionRecord.
-Skills, MCP, and memory default off for isolated evaluation; subagents remain
-available. Interactive `aegis` behavior is unchanged.
+`aegis run` 在不启动 TUI 的情况下只执行一个任务。它沿用现有 Provider 选择逻辑：`auto`、
+OpenAI 兼容、Anthropic 或显式的测试专用 Fake；创建内存 Session，运行未改变的
+`AgentRuntime`，输出一行 JSON 结果并写入 ExecutionRecord。为隔离评测，Skills、MCP 和 Memory
+默认关闭，Subagent 仍然可用。交互式 `aegis` 行为不变。
 
-The Harbor adapter passes the instruction through `AEGIS_INSTRUCTION`, the
-trial UUID through `AEGIS_EXECUTION_ID`, and the Harbor agent session handle
-through `AEGIS_SESSION_ID`. A Harbor `provider/model` value maps to Anthropic
-or the existing OpenAI-compatible Aegis provider. API keys, endpoints,
-Langfuse credentials, and proxy/no-proxy variables are forwarded from Harbor's
-agent environment (`--ae`); none are hard-coded. Harbor's own trial timeout
-still surrounds the agent process. `set -o pipefail` plus `tee` preserves the
-real exit code while retaining stdout/stderr in `agent/aegis.txt`.
+Harbor Adapter 通过 `AEGIS_INSTRUCTION` 传递任务指令，通过 `AEGIS_EXECUTION_ID` 传递
+Trial UUID，通过 `AEGIS_SESSION_ID` 传递 Harbor Agent Session Handle。Harbor 的
+`provider/model` 值会映射到 Anthropic 或现有 OpenAI 兼容 Aegis Provider。API Key、Endpoint、
+Langfuse 凭证以及 Proxy/No-Proxy 变量都从 Harbor Agent 环境（`--ae`）转发，没有任何硬编码。
+Harbor 自身的 Trial Timeout 继续包围 Agent 进程。`set -o pipefail` 与 `tee` 在把
+stdout/stderr 保留到 `agent/aegis.txt` 的同时，保留真实退出码。
 
-### One event stream, two consumers
+### 一条事件流，两个消费者
 
-No second set of Runtime hooks was added. `CompositeObservability` fans the
-existing Agent/Model/Tool/Subagent/Final observations out to:
+实现没有增加第二套 Runtime Hook。`CompositeObservability` 将现有的
+Agent/Model/Tool/Subagent/Final Observation 分发给：
 
 ```text
 Aegis Runtime / Tool Executor / Subagent Runtime
@@ -3548,125 +3497,330 @@ Aegis Runtime / Tool Executor / Subagent Runtime
      -> ExecutionRecorder backend
 ```
 
-The local recorder sanitizes the same inputs/outputs, preserves parent step
-IDs, usage buckets, errors, and timings, and atomically persists JSON. Langfuse
-absence or reporting failure cannot prevent record generation or alter the
-turn result.
+本地 Recorder 对相同输入/输出做脱敏，保留父 Step ID、Usage 计数桶、错误和耗时，并以原子方式
+持久化 JSON。Langfuse 缺失或上报失败不能阻止记录生成，也不能改变 Turn 结果。
 
-### ExecutionRecord schema and ownership
+### ExecutionRecord Schema 与数据归属
 
-`ExecutionRecord` schema version `1.0` contains:
+`ExecutionRecord` Schema 版本 `1.0` 包含：
 
-- `identity`: execution/task/trial/job/session/trace IDs;
-- `agent`: name/version/model/provider plus config and metadata;
-- `execution`: runtime timing, success, final output, stop reason, and error;
-- `usage`: ordinary input/output/total, cache read/write, Harbor's combined
-  cache and inclusive input fields, and direct upstream cost;
-- `steps`: ordered Agent/Model/Tool/Final nodes with parent IDs, sanitized
-  payloads, timing, usage, errors, and metadata;
-- `evaluation`: raw verifier result, rewards, conventional pass/fail, metrics;
-- `artifacts`: Harbor agent/verifier logs and artifact paths.
+- `identity`：Execution、Task、Trial、Job、Session 和 Trace ID；
+- `agent`：名称、版本、模型、Provider、配置和 Metadata；
+- `execution`：Runtime 时间、成功状态、最终输出、停止原因和错误；
+- `usage`：普通输入/输出/总量、缓存读写、Harbor 合并缓存和包含缓存的输入字段，以及上游直接成本；
+- `steps`：按顺序排列的 Agent/Model/Tool/Final 节点，包含 Parent ID、脱敏 Payload、时间、
+  Usage、错误和 Metadata；
+- `evaluation`：原始 Verifier 结果、Reward、约定的通过/失败状态和 Metrics；
+- `artifacts`：Harbor Agent/Verifier 日志及 Artifact 路径。
 
-Runtime creates `execution-record.runtime.json` before the verifier exists.
-After a Harbor trial/job completes, the Harbor result adapter merges
-`result.json` into `execution-record.json` and the central local store. Runtime
-success and verifier pass/fail are intentionally separate: a valid agent run
-can still fail its verifier. Missing fields remain `None`; no cost, total token,
-cache split, or pass value is guessed.
+Runtime 在 Verifier 结果产生前创建 `execution-record.runtime.json`。Harbor Trial/Job 完成后，
+Harbor Result Adapter 把 `result.json` 合并到 `execution-record.json` 和中央本地 Store 中。
+Runtime 成功与 Verifier 通过/失败有意分开：有效的 Agent 执行仍可能无法通过 Verifier。缺失字段
+保持 `None`，不猜测 Cost、Total Token、缓存拆分或 Pass 值。
 
-Harbor's `AgentContext.n_input_tokens` includes cache and exposes only one
-`n_cache_tokens` value. The adapter therefore retains Aegis's separate cache
-read/write buckets and also stores Harbor's inclusive/combined values in
-dedicated fields. ATIF's step/tool/observation concepts informed the domain
-shape, but no ATIF conversion is claimed in this phase.
+Harbor 的 `AgentContext.n_input_tokens` 包含缓存，并且只暴露一个 `n_cache_tokens` 值。因此
+Adapter 既保留 Aegis 独立的缓存读写计数桶，也把 Harbor 包含缓存/合并后的值保存在专用字段中。
+ATIF 的 Step/Tool/Observation 概念为领域结构提供参考，但本阶段不声称实现了 ATIF 转换。
 
-### Stable identity mapping
+### 稳定 ID 映射
 
-Harbor's durable Trial UUID is the Aegis `execution_id` and `trial_id`.
-Langfuse receives a deterministic 128-bit trace ID equal to the first 16 bytes
-of `SHA-256(execution_id)`, matching Langfuse's seeded trace-ID contract.
-Harbor `job_id`, agent session handle, and task identity are added during
-finalization. A trial, local record, and trace can therefore be joined by exact
-IDs instead of timestamps.
+Harbor 持久的 Trial UUID 同时作为 Aegis 的 `execution_id` 和 `trial_id`。Langfuse 接收一个
+确定性的 128 位 Trace ID，其值为 `SHA-256(execution_id)` 的前 16 字节，与 Langfuse 的 Seeded
+Trace ID 契约一致。Harbor `job_id`、Agent Session Handle 和 Task Identity 在最终合并时补入。
+因此，Trial、本地 Record 和 Trace 可以通过精确 ID 关联，不需要依赖时间戳。
 
-### Deterministic verification and environment limitation
+### 确定性验证与环境限制
 
-Focused tests cover normal runtime recording, Tool failure followed by model
-recovery, separate cache read/write and direct cost, missing usage, disabled
-Langfuse, deterministic trace IDs, non-interactive CLI output, Harbor mapping,
-verifier failure independent of runtime success, Harbor exception/timeout
-shape, sparse TrialResult, artifact collection, and ID mismatch rejection.
+定向测试覆盖普通 Runtime 记录、Tool 失败后的模型恢复、独立缓存读写与直接成本、缺失 Usage、
+禁用 Langfuse、确定性 Trace ID、非交互 CLI 输出、Harbor 映射、Verifier 失败独立于 Runtime
+成功、Harbor 异常/超时结构、稀疏 TrialResult、Artifact 收集和 ID 不匹配拒绝。
 
-The current WSL distro does not expose Docker (`docker: command not found` and
-Docker Desktop requests WSL integration), so an actual containerized Harbor
-trial cannot be run on this host yet. The adapter follows the checked-in Harbor
-0.22 interfaces and is import-path isolated; deterministic Runtime and
-TrialResult boundary tests run without Docker. Once Docker Desktop WSL
-integration is enabled, the README smoke command is the remaining external
-end-to-end check.
+本阶段完成时，当前 WSL 尚未暴露 Docker（`docker: command not found`，Docker Desktop 提示开启
+WSL Integration），因此当时未能运行真实容器化 Harbor Trial。Adapter 遵循仓库内 Harbor 0.22
+接口并隔离 Import Path；确定性的 Runtime 与 TrialResult 边界测试不依赖 Docker。Docker Desktop
+WSL Integration 开启后，README 中的冒烟命令就是剩余的外部端到端验证。
 
-Verification for the implemented boundary:
+2026-09-01 后续环境验证：Docker Desktop 的 Ubuntu WSL Integration 已开启；WSL 内
+`docker version` 可同时访问 29.2.1 客户端与服务端，`docker info` 返回 Docker Desktop 4.63.0，
+并且 `docker run --rm hello-world` 已成功拉取镜像、创建容器并正常退出。Docker 执行条件已经满足，
+尚待运行的只是真实 Harbor Task/Verifier 端到端 Trial。
+
+实现边界的验证结果：
 
 - `uv run pytest -q tests/test_execution_record.py tests/test_harbor_execution_record.py tests/test_observability.py`
   → `18 passed in 5.33s`;
-- Ruff over all changed Python modules/tests → `All checks passed!`;
-- targeted mypy with external imports skipped → `Success: no issues found in
-  11 source files`; including `runtime.py` reports only its two pre-existing
-  dynamic manager attribute findings;
-- `git diff --check` → passed;
-- a full-suite attempt passed beyond 74% without a failure, then was interrupted
-  after the known global process/MCP slow-test region stopped producing output;
-  the most recent completed pre-phase baseline remains `668 passed, 2 skipped`.
+- 所有修改的 Python 模块与测试通过 Ruff：`All checks passed!`；
+- 跳过外部 Import 的定向 mypy 检查结果为 `Success: no issues found in 11 source files`；
+  加入 `runtime.py` 后仍只报告两个既有动态 Manager 属性问题；
+- `git diff --check` 通过；
+- 全量测试在无失败情况下运行超过 74%，随后在已知的全局 Process/MCP 慢测试区域长时间无输出后
+  被中断；阶段开始前最近一次完整基线仍为 `668 passed, 2 skipped`。
 
 ---
 
-## Agent Quality — local Trace Viewer
+## Agent Quality——本地 Trace 查看页
 
-### Goal and data-source boundary
+### 目标与数据源边界
 
-The local viewer reduces the friction of inspecting Langfuse while avoiding a
-second trace database. It is a read-only presentation layer over:
+本地查看页用于降低检查 Langfuse Trace 的操作成本，同时避免再建设一套 Trace 数据库。它是以下
+数据源之上的只读展示层：
 
 ```text
-~/.aegis/quality/executions/*.json  (primary, immediate)
+~/.aegis/quality/executions/*.json  （主要数据源，立即可用）
              +
-Langfuse v4 Observations API       (optional, background supplement)
+Langfuse v4 Observations API       （可选的后台补充数据源）
              ->
 http://127.0.0.1:8765
 ```
 
-`aegis quality view` starts a stdlib `ThreadingHTTPServer`; no web-framework or
-frontend dependency is added. Local records provide stable execution identity,
-runtime status, verifier result, usage, artifacts, and the sanitized step tree.
-When credentials and the optional SDK are present, the server queries
-`client.api.observations.get_many` for logical root observations and full
-per-trace observations. It does not use the Langfuse v3 Trace endpoint, which
-is deprecated on Langfuse Cloud in favor of the v4 Observations API.
+`aegis quality view` 使用标准库 `ThreadingHTTPServer` 启动服务，不增加 Web Framework 或前端
+依赖。本地 Record 提供稳定的 Execution Identity、Runtime 状态、Verifier 结果、Usage、Artifact
+和脱敏后的 Step Tree。凭证与可选 SDK 均存在时，服务端通过
+`client.api.observations.get_many` 查询逻辑根 Observation 和每个 Trace 的完整 Observation。
+实现不使用 Langfuse v3 Trace Endpoint；Langfuse Cloud 已弃用该接口，推荐改用 v4
+Observations API。
 
-### UX, reliability, and security
+### 交互体验、可靠性与安全
 
-The three-pane UI contains a searchable execution list, hierarchical
-Agent/Model/Tool/Final trees, summary metrics, and an observation detail pane.
-Local data renders first; Langfuse roots and details load asynchronously, so a
-proxy, TLS, or Langfuse timeout produces a visible warning but never delays or
-hides the local record. Local and cloud entries are correlated by exact
-`trace_id`; cloud-only traces can also be inspected.
+三栏 UI 包含可搜索的 Execution 列表、分层 Agent/Model/Tool/Final Tree、汇总指标和
+Observation 详情。页面先渲染本地数据，再异步加载 Langfuse 根节点和详情。因此 Proxy、TLS 或
+Langfuse Timeout 只会产生可见警告，不会延迟或隐藏本地 Record。本地和云端条目通过精确
+`trace_id` 关联；只有云端 Trace 时也可以独立查看。
 
-The server binds to `127.0.0.1` by default, exposes only GET routes, sends
-`no-store`, `nosniff`, frame-denial and no-referrer headers, and has no CORS or
-write endpoints. Langfuse API calls occur only in Python; public/secret keys
-are never serialized into API responses or browser JavaScript. Binding to a
-non-loopback address prints an explicit no-authentication warning.
+服务默认绑定 `127.0.0.1`，只提供 GET 路由，发送 `no-store`、`nosniff`、禁止 Frame 和
+No-Referrer Header，并且没有 CORS 或写入 Endpoint。Langfuse API 调用只发生在 Python 侧，
+Public/Secret Key 永远不会序列化进 API 响应或浏览器 JavaScript。绑定非 Loopback 地址时，程序会
+明确提示当前没有身份认证。
 
-### Verification
+### 验证
 
-- deterministic viewer/service tests cover immediate local listing, separate
-  Langfuse v4 supplemental reads, contained network errors, stable trace
-  association, record/observation details, invalid ID rejection, and security
-  headers;
-- viewer plus Phase 1/2 observability tests: `21 passed in 6.29s`;
-- Ruff over changed viewer/CLI/tests: `All checks passed!`;
-- in-app browser visual QA confirmed the three-column layout, nested trace
-  tree, scrollable detail data, search filtering, and node selection;
-- a simulated Langfuse TLS handshake timeout showed the local record and tree
-  within 500 ms, then degraded to a warning with no browser console errors.
+- 确定性的 Viewer/Service 测试覆盖立即列出本地记录、独立的 Langfuse v4 补充读取、网络错误
+  隔离、稳定 Trace 关联、Record/Observation 详情、非法 ID 拒绝和安全 Header；
+- Viewer 加阶段 1/2 Observability 测试：`21 passed in 6.29s`；
+- 修改的 Viewer、CLI 和测试通过 Ruff：`All checks passed!`；
+- 应用内浏览器视觉检查确认三栏布局、嵌套 Trace Tree、可滚动详情数据、搜索过滤和节点选择；
+- 模拟 Langfuse TLS Handshake Timeout 时，页面在 500 ms 内显示本地 Record 和 Tree，随后
+  降级为警告，浏览器控制台没有错误。
+
+---
+
+## Agent Quality 补充——按 Session 聚合 Turn 与可靠的云端状态
+
+### 问题与目标
+
+交互式 Aegis 把每次用户提交作为独立 `run_turn()` 和独立 Langfuse Trace，这是正确的执行与成本
+边界；但 Trace Viewer 之前把所有根 Trace 平铺展示，导致同一对话中的追问看起来像互不相关的任务。
+同时，Langfuse 成功 Observation 的 Level 默认为 `DEFAULT`，旧查看页只把 `ERROR` 映射为失败，
+所以正常结束的云端 Trace 被显示为 `UNKNOWN`。
+
+### 参考行为与实现决策
+
+本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库。实现依据当前 Aegis 的
+`session_id`/`trace_id` 语义和 Langfuse v4 Observation 字段，是对既有 Viewer 的小范围原创增强：
+保留“一 Turn 一 Trace”，使用 Session 作为展示分组，不把多个 Trace 强行合并为长期 Trace。
+
+### 数据流与主要实现
+
+- `_LangfuseObservation.update()` 在调用方提供 `success` 时，把布尔值写入经过脱敏的
+  `metadata.success`。Error/Fatal Level 仍具有更高失败优先级。
+- `_cloud_summary()` 同时返回 `session_id` 并按兼容顺序推导状态：Error/Fatal Level、显式
+  Success Metadata、Aegis `stop_reason`、Warning Level，最后才用已结束且存在 Output 作为旧数据
+  的成功回退。仍在运行或证据不足的 Trace 保持 `UNKNOWN`。
+- Viewer 左栏从平铺 Execution 改为可折叠 Session 卡片。同一 `session_id` 的 Turn 按时间正序
+  展示为 Turn 1、Turn 2；Session 状态由内部 Turn 聚合。搜索命中任一 Turn 或 Session ID 时会
+  展示整个 Session，而不是把未命中的上下文 Turn 临时隐藏。
+- Session 只负责分组。ExecutionRecord 与 Langfuse 副本仍使用精确 `trace_id` 去重和关联，避免
+  把同一 Turn 展示两次。无 Session ID 的旧记录各自形成独立兜底组。
+- 顶部指标改为 `Sessions / turns`，同时保留成功 Turn、Token 和 Cost 汇总。
+
+### 可靠性、兼容性与验证
+
+- 已有云端数据不需要重传：包含 `stop_reason=final_answer` 的旧 Trace 会立即显示为 `OK`。
+- 新数据使用显式 Success Metadata，避免根据是否存在 Output 猜测正常与失败。
+- `ERROR`、`WARNING`、`error`、`interrupted`、`max_iterations` 均不会误显示为成功；尚未结束的
+  Observation 继续显示 `UNKNOWN`。
+- Viewer、Observability、ExecutionRecord 与 Harbor 定向测试：`22 passed in 3.70s`。
+- 修改文件的 Ruff：`All checks passed!`。
+- Observability 与 Viewer 的定向 mypy：`Success: no issues found in 5 source files`。
+- 全仓 `uv run ruff check .` 仍有 5 个既有问题，位于 `mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；本次修改文件没有新增
+  Ruff 问题。
+- 使用真实 Langfuse 数据做浏览器验证：博物馆 Session 显示 2 个按时间排序的 Turn，Session 和
+  两个 Turn 都为 `OK`；折叠/展开从 2 个 Turn 正确切换为 0/2；搜索“多少钱呢”仍保留完整两轮；
+  浏览器 Console 无 Warning 或 Error。
+- 全量 `uv run pytest -q` 在无失败情况下运行到 73%，随后在仓库开发日志已记录的全局
+  Process/MCP 慢测试区连续数分钟没有产生新测试点，因而中断；本次所有相关定向测试已完整通过。
+
+### 权衡与面试式说明
+
+Session 可能承载多个真正不同的任务，因此本次只做 UI 分组，不改变 Trace、Usage 或 Harbor Trial
+的执行边界，也不把 Session 当成新的 Evaluation 单元。这样既保留每轮调用的独立耗时、错误和
+成本，又让多轮追问在界面中恢复对话上下文。实现完全位于 Observability Metadata 与只读 Viewer，
+不改变 Agent Runtime 语义。
+
+---
+
+## Agent Quality 补充——可读消息历程、步骤状态与 Usage 汇总
+
+### 真实数据诊断
+
+针对中文以 `\uXXXX` 形式显示、顶部 Token 为零、Session 历程不直观三个问题，直接读取了同一
+博物馆 Session 的两条真实 Langfuse Trace。结论如下：
+
+- 中文没有在采集或传输阶段损坏；Langfuse v4 把 Model Call Input 作为 JSON 字符串返回，旧 UI
+  直接展示字符串，因而保留了 JSON 的 Unicode 转义。
+- Token 与 Cache Usage 没有丢失，位于子级 `Model Call.usageDetails`，而根级 `Aegis Run` 的
+  Usage 为空。旧 UI 只汇总根级列表，所以显示为零。
+- 第二个 Turn 的最后一次 Model Call Input 已包含完整上下文角色序列：System、第一轮 User、
+  Assistant Tool Call、Tool Result、第一轮 Assistant、第二轮 User、第二轮 Assistant Tool Call、
+  Tool Result；最后一次 Model Call Output 则是本轮最终 Assistant Answer。
+
+真实汇总结果为：第一轮 Input 12,019、Output 470、Cache Read 6,528；第二轮 Input 18,079、
+Output 377、Cache Read 10,880。Provider 没有返回直接 Cost，因此 Cost 保持零，不引入价格表。
+
+### 实现
+
+- Langfuse Reader 在读取最近根 Observation 后，再用一次过滤后的 `Model Call` Observation 查询，
+  按 `traceId` 汇总 Input、Output、Total、Cache Read/Creation 和直接 Cost。失败时只返回 Usage
+  警告，不影响根 Trace 与本地 Record 展示。
+- Trace Detail API 同时返回当前 Trace 的 Model Call Usage 汇总；根 `Aegis Run` 详情显示
+  “Trace usage (model calls)”，子 Model Call 仍保留自己的原始 Usage。
+- 顶部指标拆分为 Input/Output、Cache Read/Write 和 Cost，避免 Cache 命中藏在右侧原始 JSON 中。
+- UI 对看起来像 JSON 的字符串做最多三层安全解析，再通过 `textContent` 展示，因此中文直接可读，
+  同时不引入 HTML 注入。
+- Viewer 在 Python 响应边界再次调用统一 Sanitizer，覆盖 Langfuse SDK 查询结果中后加的 Public
+  Key Metadata；Secret/Public Key 都不会进入浏览器响应。
+- 从选中 Turn 的最后一次 Model Call Input 构造 Session Conversation，并追加该调用的 Output。
+  角色节点按原始顺序展示 System/User/Assistant/Tool，点击后可在右栏检查完整结构。
+- Agent、Model、Tool、Final Observation 节点显示 OK/Warning/Error/Running、开始时钟和真实耗时。
+  Provider Message 没有独立时间戳，因此不为历史消息伪造时间。
+
+### 兼容性与验证
+
+- 没有修改 Runtime、Provider、Tool 或 Trace 上报语义；变更只在只读 Viewer 和其 Langfuse 查询层。
+- `tests/test_trace_viewer.py` 新增 Model Call 多节点 Token/Cache 汇总覆盖，全部 `5 passed`。
+- 修改文件 Ruff 通过；真实 Langfuse API 汇总返回值与上述 Token 数一致。
+- 应用内浏览器打开真实第二轮 Trace 后显示 9 条 Session Message，中文无 `\uXXXX` 转义；执行树
+  显示 Aegis Run、两次 Model Call、Web Search Tool 和 Final Result 的 OK、开始时间与耗时；顶部
+  显示 Input/Output `30.1K / 847`、Cache Read/Write `17.4K / 0`、Cost `$0`。
+
+---
+
+## Observability——Trace Viewer 分层统计与结构化详情
+
+### 任务目标与原问题
+
+旧查看页把顶部 Token、Cache 和 Cost 作为所有 Execution 的总和，却没有明确标出全局范围；
+Session、Turn 与单次 Model/Tool Call 又缺少自己的统计，因此很难定位成本、缓存命中、上下文增长和
+错误来源。本次只调整 Observability 查看层与 Langfuse 只读查询，不引入 Harbor/Eval，也不改变
+Runtime 的 Agent Loop。
+
+### 参考关系与实现决策
+
+本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库。实现基于 Aegis 已有的
+`ExecutionRecord`、`ExecutionStep`、Observability Observation 和 Langfuse v4 Observations API，
+属于既有 Viewer 的原创增量增强。保留“一 Turn 一 Trace”和浏览器端按精确 `trace_id` 合并本地/云端
+副本，不新建 Trace 数据库，也不把多个 Turn 改造成一个长期 Trace。
+
+### 数据流与主要设计
+
+- `TraceViewerService` 的本地摘要从 Step Tree 计算 Model Call、Tool Call 和错误 Observation 数；
+  一个 `ExecutionRecord` 继续对应一个 Turn。纯汇总函数再按 `session_id` 生成 Session 与 Global
+  统计，便于确定性测试。
+- Langfuse 列表先读 Root Observation，再分页读取最近的子 Observation，按 `traceId` 聚合 Model、
+  Tool、Error、Usage 和直接 Cost。只对 Model Observation 求和，避免 Root 与 Child 都带 Usage 时
+  重复计算；查询失败返回已获得的部分数据和警告，Local-only 路径不受影响。
+- 浏览器按 `trace_id` 去重 Local + Cloud 条目，使用本地 Runtime Record 为主、云端缺失字段为补充；
+  Cloud-only 仍能独立展示。Session Header、Turn 卡片、Session Summary 和顶部 `ALL SESSIONS`
+  使用统一统计语义。
+- `null`/缺字段始终显示 `—`，真实 `0` 保持为 `0`；Cost `0` 显示 `$0.00`。Global/Session/Turn
+  聚合只累计 Provider 确实提供的数值；若组成项部分未知，已知和使用 `≥` 标成下界，不自行估价或
+  猜测缓存拆分。
+- Global、Session、Turn、Model 和 Usage 详情同时展示缓存命中率，统一采用
+  `Cache Read / Provider 总输入`。优先使用显式 `input_tokens_including_cache`，其次用
+  `total_tokens - output_tokens` 恢复总输入，最后才在三个互斥桶齐全时使用
+  `Input + Cache Read + Cache Write`。这兼容百炼 OpenAI 接口的隐式缓存：响应只提供
+  `prompt_tokens_details.cached_tokens` 而不提供 Cache Write 时，仍能按
+  `cached_tokens / prompt_tokens` 得到精确命中率，同时 Cache Write 本身继续显示 `—`，不会把未知
+  伪装成零。Cache Read 为零但总输入大于零时显示 `0.0%`，分母无法可靠取得或为零时显示 `—`。
+- 每个 Model 节点直接显示 Model、Latency、Input/Output、Cache Read/Write、Cost 和 Status；同一
+  Turn 内只比较严格相邻的 Model Call，第二次及以后显示 Input Token 差值。若相邻一次 Usage
+  未知，就不跨过它与更早调用比较；负差值也会保留，以反映压缩或上下文重建。
+- Tool 节点优先递归提取脱敏后的核心字段：`web_search` 的 Query，以及 `terminal` 的 Command、
+  Exit Code 和 Duration。Model/Tool/Final 详情先展示结构化字段、Usage、Request、Response 和 Error，
+  完整 Raw Payload 放在最后的折叠区。
+- Error/Fatal Level、显式 `metadata.success=false`、本地 Step Error 都被视为错误 Observation；错误节点
+  使用红色样式，并向 Agent/Turn、Session 和 Global Errors 上卷。Turn 的 Runtime 最终成功与
+  “内部出现过错误”仍分别保留，避免掩盖恢复成功前发生的 Tool/Model 错误。
+
+### 安全、兼容与边界
+
+- Sanitizer 的字符串、集合、深度限制和 Secret Redaction 没有放宽。Viewer 只是在 Raw Payload
+  之前优先读取浅层或递归可达的 Query、Command、Model、Usage、Finish Reason 与 Error。
+- Langfuse SDK 返回值和本地历史 Record 在 Python HTTP 响应边界都会再次脱敏；API Key 仍只存在于
+  Python 进程，不进入浏览器。HTTP 服务仍只有 GET、无 CORS/写接口、默认绑定 Loopback。
+- 缺少 Session ID 的旧 Record 独立成组；缺少 Steps、Usage、Cache 或 Cost 的旧 Trace 显示未知而
+  不崩溃。Langfuse 缺失、超时或部分分页失败继续 fail-open。
+- Provider 数据限制保持透明：Anthropic 原生 Usage 通常不提供直接 Cost；OpenAI-compatible 网关
+  是否返回 Cache Write、直接 Cost、Finish Reason 或 Provider 名称并不统一。未提供的字段只能显示
+  `—`，Aegis 不使用内置价格表补算。
+
+### 验证结果
+
+- `uv run pytest -q tests/test_trace_viewer.py tests/test_observability.py tests/test_execution_record.py`
+  → `21 passed in 2.86s`。
+- 定向测试覆盖 Global/Session/Turn 汇总、Model Usage、Cost 0/null、Cache 0/null、Error 上卷、
+  Local/Cloud 关联、旧稀疏 Trace、Langfuse fail-open、安全响应头和本地详情二次脱敏。
+- 修改范围的 Ruff 检查通过，Viewer 内嵌 JavaScript 通过 Node `--check`。
+- `uv run ruff check .` 仍报告 5 个既有问题，位于 `mcp/client.py`、`sessions/__init__.py`、
+  `sessions/titles.py` 和 `tests/test_session_titles.py`，均不在本次 Observability 改动中。
+- 全量 `uv run pytest -q` 在早期 CLI 测试区域超过 6 分钟无失败摘要、无继续进度后停止；本次没有把
+  中断运行记作通过。上述 21 个相关测试已完整结束并通过。
+- 应用内浏览器同时加载合成本地 Record 与真实 Langfuse 数据，确认 `ALL SESSIONS`、Session
+  Summary、Turn 两行摘要、`$0.00`/`—`、红色 Error 节点、Terminal Command/Exit Code、相邻
+  Model Input `3.2K → 6.7K (+3.5K)`、折叠 Raw Payload，以及点击 Session 后自动切到该 Session
+  最新 Turn。浏览器控制台没有错误。
+
+### 面试式总结
+
+这次工作的核心不是增加新的采集链路，而是把已有 Observation 数据按使用者分析问题的顺序重新组织为
+Global → Session → Turn → Model/Tool/Final。后端提供 Provider-neutral、可测试且保留 unknown 的
+摘要，前端负责 Local-first 合并和结构化呈现；错误与上下文增长由子 Observation 向上解释。这样既不
+扰动 Runtime，也保住了 Local-only、Cloud-only、Langfuse fail-open、历史数据兼容和只读安全边界。
+
+---
+
+## Observability——修正阿里云百炼缓存命中率
+
+### 原问题与定义核对
+
+百炼 OpenAI 兼容接口的隐式缓存通过
+`usage.prompt_tokens_details.cached_tokens` 返回命中 Token，且该数值包含在
+`usage.prompt_tokens` 中；隐式缓存响应不要求提供 Cache Write。原 Viewer 只有在 Input、Cache Read
+和 Cache Write 三个桶都存在时才计算命中率，因此当前百炼 Trace 虽然已经采集 Cache Read，仍显示
+`—`。
+
+### 实现决策与数据语义
+
+- 命中率统一定义为 `Cache Read / Provider 总输入 Token`。Viewer 优先使用
+  `input_tokens_including_cache` 或百炼原始 `prompt_tokens`；否则使用
+  `total_tokens - output_tokens` 恢复总输入；只有前两者都不可用时，才要求 Input、Cache Read、
+  Cache Write 三个互斥桶齐全后求和。
+- 这没有把缺失的 Cache Write 当成零：百炼隐式缓存的 Cache Write 仍显示 `—`；只是利用 Provider
+  已返回的 Total 和 Output 得到独立、精确的分母。若分母也无法可靠获得，命中率继续显示 `—`。
+- Python 汇总与浏览器端 Global、Session、Turn、Model/Usage 详情采用相同优先级，Local-only、
+  Cloud-only 和 Local + Langfuse 合并路径保持一致。Runtime、Sanitizer、只读 HTTP 边界和凭据处理
+  均未改变。
+
+### 参考关系与验证
+
+本次依据阿里云百炼官方 Context Cache 返回字段定义独立修正 Aegis Viewer，没有迁移 Hermes 或
+Claude Code，也没有修改参考仓库。新增百炼示例回归：`prompt_tokens=3019`、
+`cached_tokens=2048`、`output_tokens=104` 时，Aegis 保留普通 Input `971`、Cache Write `null`，
+Viewer 计算命中率约 `67.8%`。
+
+- `uv run pytest -q tests/test_trace_viewer.py tests/test_observability.py tests/test_execution_record.py tests/test_openai_provider.py`
+  → `40 passed, 1 skipped in 7.03s`。
+- 相关 Python 文件 Ruff、差异空白检查和 Viewer 内嵌 JavaScript 的 Node 语法检查通过。
+- 本轮尝试读取真实 Langfuse usage 形态时 TLS 握手超时；Reader 按既有设计 fail-open，未影响本地
+  验证。仍无法显示的数据只有 Provider 没有上报、且不能由其他明确 Usage 字段精确恢复的字段。

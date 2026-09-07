@@ -30,7 +30,45 @@ from aegis_agent.tools.registry import ToolRegistry
 def test_agentconfig_defaults_to_main_identity():
     cfg = AgentConfig()
     assert cfg.agent_name == MAIN_AGENT_NAME == "main"
-    assert cfg.max_iterations == DEFAULT_MAX_ITERATIONS
+    assert cfg.max_iterations == DEFAULT_MAX_ITERATIONS == 50
+
+
+def test_default_runtime_can_finish_after_ten_tool_rounds():
+    registry = ToolRegistry()
+    provider = FakeModelProvider(
+        script=[FakeReply.tool("nope", {}, call_id=f"c{i}") for i in range(11)]
+        + [FakeReply(text="recovered")]
+    )
+    runtime = AgentRuntime(
+        provider=provider,
+        registry=registry,
+        executor=ToolExecutor(registry),
+        repository=InMemorySessionRepository(),
+    )
+
+    result = runtime.run_turn("s1", "keep working after recoverable tool errors")
+
+    assert result.stop_reason is StopReason.FINAL_ANSWER
+    assert result.iterations == 12
+    assert result.final_text == "recovered"
+
+
+def test_default_runtime_still_stops_at_fifty_iterations():
+    registry = ToolRegistry()
+    provider = FakeModelProvider(
+        script=[FakeReply.tool("nope", {}, call_id=f"c{i}") for i in range(51)]
+    )
+    runtime = AgentRuntime(
+        provider=provider,
+        registry=registry,
+        executor=ToolExecutor(registry),
+        repository=InMemorySessionRepository(),
+    )
+
+    result = runtime.run_turn("s1", "loop")
+
+    assert result.stop_reason is StopReason.MAX_ITERATIONS
+    assert result.iterations == provider.calls == 50
 
 
 def test_agentconfig_is_immutable():

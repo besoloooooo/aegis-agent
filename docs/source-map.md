@@ -406,7 +406,7 @@ behaviour from the Hermes or Claude Code reference repositories.
 
 | Aegis file | Relationship | External reference | Notes |
 |---|---|---|---|
-| `src/aegis_agent/observability/tracer.py` | **original** | Langfuse Python SDK v4 `start_as_current_observation` / `propagate_attributes` | Defines the backend-neutral Aegis observability protocols, a no-op backend, and a fail-open Langfuse adapter. |
+| `src/aegis_agent/observability/tracer.py` | **original** | Langfuse Python SDK v4 `start_as_current_observation` / `propagate_attributes` | Defines the backend-neutral Aegis observability protocols, a no-op backend, and a fail-open Langfuse adapter. Completed observations include explicit sanitized success metadata for reliable downstream summaries. |
 | `src/aegis_agent/observability/sanitize.py` | **original** | — | Recursive secret redaction and bounded payload conversion before data reaches a backend. |
 | `src/aegis_agent/runtime.py` | **original additive change** | — | Wraps each turn, unified model seam, and final result without changing the agent loop's decisions. |
 | `src/aegis_agent/tools/executor.py` | **original additive change** | — | Instruments the existing centralized tool executor; concrete tools remain untouched. |
@@ -478,9 +478,9 @@ license entry is required for this phase.
 
 | Aegis file | Relationship | External reference | Notes |
 |---|---|---|---|
-| `src/aegis_agent/quality/viewer.py` | **original** | Langfuse Python SDK v4 Observations API | Read-only local HTTP service over ExecutionRecord plus optional cursor-paginated Langfuse observations. Uses v4 observation fields and contains all remote failures. |
-| `src/aegis_agent/quality/viewer_ui.py` | **original** | — | Dependency-free three-pane execution/trace/detail UI. Local records render before asynchronous Langfuse supplements. |
+| `src/aegis_agent/quality/viewer.py` | **original** | Langfuse Python SDK v4 Observations API | Read-only local HTTP service over ExecutionRecord plus optional cursor-paginated Langfuse observations. Uses v4 observation fields, exposes session identity, aggregates Model/Tool/error/usage statistics by trace, preserves zero versus unknown, sanitizes local and SDK-returned payloads, infers legacy status, and contains all remote failures. |
+| `src/aegis_agent/quality/viewer_ui.py` | **original** | — | Dependency-free three-pane Global → Session → Turn → Model/Tool/Final UI. It shows per-level usage, exact cache hit rate when all required buckets are known, errors, adjacent Model Call context growth, concise tool summaries, structured details, and collapsed raw payloads without inventing absent provider data. |
 | `src/aegis_agent/cli.py` (`quality view`) | **original** | — | Loopback-by-default viewer command with configurable port/store and optional browser opening. |
-| `tests/test_trace_viewer.py` | **original** | — | Local/cloud source separation, v4 API request, failure containment, HTTP detail, invalid-ID, and security-header coverage. |
+| `tests/test_trace_viewer.py` | **original** | — | Local/cloud source separation, Global/Session/Turn summaries, zero/null usage semantics, error roll-up, old sparse records, current/legacy status inference, Model Call usage/cache aggregation, v4 API request, failure containment, HTTP detail, invalid-ID, and security-header coverage. |
 
 No third-party frontend or web-server dependency was added.

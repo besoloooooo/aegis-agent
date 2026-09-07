@@ -367,6 +367,7 @@ def test_langfuse_adapter_uses_v4_observation_types_and_sanitizes():
     assert calls[2]["name"] == "Tool Call: terminal"
     assert calls[2]["input"]["api_key"] == REDACTED
     assert updates[0]["output"]["cookie"] == REDACTED
+    assert updates[0]["metadata"]["success"] is True
     assert calls[3]["as_type"] == "generation"
     assert updates[1]["usage_details"] == {
         "input": 10,
@@ -376,3 +377,4 @@ def test_langfuse_adapter_uses_v4_observation_types_and_sanitizes():
         "total": 21,
     }
     assert updates[1]["cost_details"] == {"total": 0.5}
+    assert updates[1]["metadata"]["success"] is True
