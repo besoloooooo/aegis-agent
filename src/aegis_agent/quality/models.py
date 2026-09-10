@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
+
+RunKind: TypeAlias = Literal["conversation", "task", "evaluation"]
+ProcessStatus: TypeAlias = Literal["pass", "warning", "fail", "insufficient_data"]
+ProcessSeverity: TypeAlias = Literal["info", "low", "medium", "high", "critical"]
 
 
 class ExecutionIdentity(BaseModel):
@@ -82,16 +86,50 @@ class ArtifactSummary(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProcessGrade(BaseModel):
+    """One explainable, trace-addressable rule or optional judge result."""
+
+    grader_name: str
+    grader_version: str
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    status: ProcessStatus
+    severity: ProcessSeverity
+    category: str
+    message: str
+    evidence: list[str] = Field(default_factory=list)
+    affected_steps: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessEvaluationResult(BaseModel):
+    """Stable aggregate written independently from Harbor outcome evaluation."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    evaluated_at: datetime
+    evaluator_version: str
+    overall_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    status: ProcessStatus
+    summary: str
+    grades: list[ProcessGrade] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class QualitySummary(BaseModel):
+    process_evaluation: ProcessEvaluationResult | None = None
+
+
 class ExecutionRecord(BaseModel):
     """Stable Aegis Quality input assembled from Runtime and Harbor data."""
 
     schema_version: Literal["1.0"] = "1.0"
+    run_kind: RunKind = "task"
     identity: ExecutionIdentity
     agent: AgentIdentity = Field(default_factory=AgentIdentity)
     execution: ExecutionSummary = Field(default_factory=ExecutionSummary)
     usage: UsageSummary = Field(default_factory=UsageSummary)
     steps: list[ExecutionStep] = Field(default_factory=list)
     evaluation: EvaluationSummary = Field(default_factory=EvaluationSummary)
+    quality: QualitySummary = Field(default_factory=QualitySummary)
     artifacts: ArtifactSummary = Field(default_factory=ArtifactSummary)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -104,5 +142,11 @@ __all__ = [
     "ExecutionRecord",
     "ExecutionStep",
     "ExecutionSummary",
+    "ProcessEvaluationResult",
+    "ProcessGrade",
+    "ProcessSeverity",
+    "ProcessStatus",
+    "QualitySummary",
+    "RunKind",
     "UsageSummary",
 ]

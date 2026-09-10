@@ -5,21 +5,24 @@ import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import pytest
 
 from aegis_agent.quality.models import (
+    EvaluationSummary,
     ExecutionIdentity,
     ExecutionRecord,
     ExecutionStep,
     ExecutionSummary,
     UsageSummary,
 )
+from aegis_agent.quality.process import ProcessEvaluator
 from aegis_agent.quality.store import ExecutionRecordStore
 from aegis_agent.quality.viewer import (
     LangfuseReader,
     TraceViewerService,
+    _stats_by_root,
     _stats_by_trace,
     _summarize_executions,
     build_server,
@@ -75,9 +78,27 @@ def _record() -> ExecutionRecord:
     )
 
 
+def _evaluation_record() -> ExecutionRecord:
+    record = _record()
+    record.run_kind = "evaluation"
+    record.identity.execution_id = "eval-trial-1"
+    record.identity.trace_id = "eval-trace-1"
+    record.identity.session_id = "eval-session-1"
+    record.identity.job_id = "harbor-job-1"
+    record.identity.trial_id = "eval-trial-1"
+    record.identity.task_id = '{"path":"examples/tasks/hello-world"}'
+    record.identity.task_name = "harbor/hello-world"
+    record.evaluation = EvaluationSummary(
+        verifier_result={"rewards": {"reward": 1.0}},
+        rewards={"reward": 1.0},
+        passed=True,
+    )
+    return record
+
+
 def _observation(
     trace_id: str,
-    observation_id: str = "root",
+    observation_id: str | None = None,
     *,
     session_id: str = "session-1",
     stop_reason: str | None = "final_answer",
@@ -94,7 +115,7 @@ def _observation(
     if success is not None:
         metadata["success"] = success
     return {
-        "id": observation_id,
+        "id": observation_id or f"root-{trace_id}",
         "traceId": trace_id,
         "startTime": "2026-09-01T00:00:00Z",
         "endTime": "2026-09-01T00:00:01Z" if completed else None,
@@ -142,6 +163,135 @@ def test_service_exposes_local_records_immediately_and_cloud_as_supplement(tmp_p
     assert detail["langfuse"]["observations"] == []
     cloud_detail = service.get_langfuse_trace("trace-1")
     assert cloud_detail["observations"][0]["traceId"] == "trace-1"
+
+
+def test_cloud_roots_with_a_reused_trace_id_remain_independently_addressable(
+    tmp_path,
+):
+    roots = [
+        _observation("shared-trace", "root-one"),
+        _observation("shared-trace", "root-two"),
+    ]
+
+    listing = TraceViewerService(
+        ExecutionRecordStore(tmp_path),
+        _FakeLangfuse(roots=roots),
+    ).list_langfuse_executions()
+
+    assert [item["id"] for item in listing["executions"]] == [
+        "langfuse:root-one",
+        "langfuse:root-two",
+    ]
+    assert {item["trace_id"] for item in listing["executions"]} == {"shared-trace"}
+
+
+def test_shared_trace_stats_are_scoped_to_each_root_observation():
+    first_root = _observation("shared-trace", "root-one")
+    second_root = _observation("shared-trace", "root-two", level="ERROR")
+    first_model = {
+        "id": "model-one",
+        "traceId": "shared-trace",
+        "parentObservationId": "root-one",
+        "name": "Model Call",
+        "type": "GENERATION",
+        "usageDetails": {"input": 10},
+    }
+    second_tool = {
+        "id": "tool-two",
+        "traceId": "shared-trace",
+        "parentObservationId": "root-two",
+        "name": "Tool Call: terminal",
+        "type": "TOOL",
+    }
+
+    stats = _stats_by_root(
+        [first_root, first_model, second_root, second_tool],
+        {"root-one", "root-two"},
+    )
+
+    assert stats["root-one"] == {
+        "model_calls": 1,
+        "tool_calls": 0,
+        "errors": 0,
+        "usage": {"input": 10.0},
+    }
+    assert stats["root-two"] == {
+        "model_calls": 0,
+        "tool_calls": 1,
+        "errors": 1,
+        "usage": {},
+    }
+
+
+def test_service_classifies_harbor_evaluation_identity_and_reward(tmp_path):
+    store = ExecutionRecordStore(tmp_path)
+    store.save(_evaluation_record())
+
+    listing = TraceViewerService(store, _FakeLangfuse()).list_executions()
+
+    evaluation = listing["executions"][0]
+    assert evaluation["run_kind"] == "evaluation"
+    assert evaluation["job_id"] == "harbor-job-1"
+    assert evaluation["trial_id"] == "eval-trial-1"
+    assert evaluation["task_id"] == '{"path":"examples/tasks/hello-world"}'
+    assert evaluation["reward"] == 1.0
+    assert evaluation["rewards"] == {"reward": 1.0}
+    assert evaluation["passed"] is True
+
+
+def test_service_exposes_process_evaluation_separately_from_harbor_outcome(tmp_path):
+    store = ExecutionRecordStore(tmp_path)
+    record = _evaluation_record()
+    record.evaluation.passed = True
+    ProcessEvaluator().evaluate(record)
+    assert record.quality.process_evaluation is not None
+    record.quality.process_evaluation.status = "fail"
+    record.quality.process_evaluation.overall_score = 0.74
+    record.quality.process_evaluation.grades[0].status = "warning"
+    store.save(record)
+
+    service = TraceViewerService(store, _FakeLangfuse())
+    summary = service.list_executions()["executions"][0]
+    detail = service.get_execution(record.identity.execution_id)
+
+    assert summary["passed"] is True
+    assert summary["process_status"] == "fail"
+    assert summary["process_score"] == 0.74
+    assert summary["process_issue_count"] == 1
+    assert detail is not None
+    assert detail["record"]["evaluation"]["passed"] is True
+    assert detail["record"]["quality"]["process_evaluation"]["status"] == "fail"
+
+
+def test_service_classifies_legacy_harbor_record_without_run_kind(tmp_path):
+    store = ExecutionRecordStore(tmp_path)
+    record = _evaluation_record()
+    record.run_kind = (
+        "task"  # Default when loading records written before this field existed.
+    )
+    store.save(record)
+
+    listing = TraceViewerService(store, _FakeLangfuse()).list_executions()
+
+    assert listing["executions"][0]["run_kind"] == "evaluation"
+
+
+def test_cloud_run_kind_prefers_metadata_and_defaults_to_conversation(tmp_path):
+    conversation = _observation("conversation")
+    task = _observation("task")
+    task["metadata"]["run_kind"] = "task"
+    evaluation = _observation("evaluation")
+    evaluation["metadata"]["source"] = "harbor"
+
+    listing = TraceViewerService(
+        ExecutionRecordStore(tmp_path),
+        _FakeLangfuse(roots=[conversation, task, evaluation]),
+    ).list_langfuse_executions()["executions"]
+
+    by_trace = {item["trace_id"]: item for item in listing}
+    assert by_trace["conversation"]["run_kind"] == "conversation"
+    assert by_trace["task"]["run_kind"] == "task"
+    assert by_trace["evaluation"]["run_kind"] == "evaluation"
 
 
 def test_cloud_status_supports_explicit_current_and_legacy_completion_signals(tmp_path):
@@ -259,6 +409,45 @@ def test_langfuse_reader_uses_v4_observations_api_and_contains_failures():
     assert "timed out" in error
 
 
+def test_langfuse_root_listing_follows_cursors_and_reports_safety_truncation():
+    calls = []
+
+    def get_many(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("cursor") is None:
+            return SimpleNamespace(
+                data=[_observation("trace-1"), _observation("trace-2")],
+                meta=SimpleNamespace(cursor="next-page"),
+            )
+        return SimpleNamespace(
+            data=[_observation("trace-3")],
+            meta=SimpleNamespace(cursor=None),
+        )
+
+    client = SimpleNamespace(
+        api=SimpleNamespace(observations=SimpleNamespace(get_many=get_many)),
+        shutdown=lambda: None,
+    )
+    reader = LangfuseReader(client)
+
+    roots, error = reader.list_roots(limit=3)
+
+    assert error is None
+    assert [item["traceId"] for item in roots] == [
+        "trace-1",
+        "trace-2",
+        "trace-3",
+    ]
+    assert [call.get("cursor") for call in calls] == [None, "next-page"]
+    assert reader.roots_has_more is False
+
+    calls.clear()
+    roots, error = reader.list_roots(limit=2)
+    assert error is None
+    assert len(roots) == 2
+    assert reader.roots_has_more is True
+
+
 def test_http_viewer_is_read_only_and_serves_record_detail(tmp_path):
     store = ExecutionRecordStore(tmp_path)
     store.save(_record())
@@ -271,10 +460,18 @@ def test_http_viewer_is_read_only_and_serves_record_detail(tmp_path):
         with urlopen(f"{base}/", timeout=2) as response:
             html = response.read().decode()
             assert "Aegis Trace Viewer" in html
-            assert "ALL SESSIONS" in html
+            assert "Conversations" in html
+            assert "Evaluations" in html
+            assert "All Runs" in html
+            assert "Sync Harbor" in html
+            assert "HARBOR EVALUATIONS" in html
+            assert "EVALUATION JOB SUMMARY" in html
+            assert 'state.view === "evaluation"' in html
             assert "Sessions / Turns" in html
             assert "Model / Tool Calls" in html
-            assert "Errors" in html
+            assert "Failed Runs / Error Obs" in html
+            assert "matchedLocalTraces" in html
+            assert "matchingSummaries.length === 1" in html
             assert "expandedSessions" in html
             assert "Session conversation" in html
             assert "Cache read / write" in html
@@ -287,6 +484,7 @@ def test_http_viewer_is_read_only_and_serves_record_detail(tmp_path):
             assert "growth >= 0" in html
             assert response.headers["Cache-Control"] == "no-store"
             assert response.headers["X-Frame-Options"] == "DENY"
+            assert "connect-src 'self'" in response.headers["Content-Security-Policy"]
 
         with urlopen(f"{base}/api/executions", timeout=2) as response:
             listing = json.load(response)
@@ -303,6 +501,71 @@ def test_http_viewer_is_read_only_and_serves_record_detail(tmp_path):
         with pytest.raises(HTTPError) as error:
             urlopen(f"{base}/api/executions/not%2Fsafe", timeout=2)
         assert error.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_viewer_syncs_harbor_with_same_origin_token(tmp_path):
+    store = ExecutionRecordStore(tmp_path / "records")
+    jobs_dir = tmp_path / "harbor" / "jobs"
+    result_path = jobs_dir / "job-1" / "trial-1" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "id": "sync-trial-1",
+                "trial_name": "hello-world__sync",
+                "task_name": "harbor/hello-world",
+                "task_id": {"path": "examples/tasks/hello-world"},
+                "config": {"job_id": "sync-job-1"},
+                "verifier_result": {"rewards": {"reward": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    server = build_server(
+        "127.0.0.1",
+        0,
+        store=store,
+        langfuse=_FakeLangfuse(),
+        harbor_jobs_dir=jobs_dir,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urlopen(f"{base}/api/executions", timeout=2) as response:
+            status = json.load(response)["status"]
+        assert status["harbor_jobs_exists"] is True
+        assert status["harbor_jobs_dir"] == str(jobs_dir.resolve())
+
+        denied = Request(
+            f"{base}/api/harbor/sync",
+            data=b"",
+            method="POST",
+            headers={"X-Aegis-Sync-Token": "wrong"},
+        )
+        with pytest.raises(HTTPError) as error:
+            urlopen(denied, timeout=2)
+        assert error.value.code == 403
+
+        allowed = Request(
+            f"{base}/api/harbor/sync",
+            data=b"",
+            method="POST",
+            headers={"X-Aegis-Sync-Token": status["sync_token"]},
+        )
+        with urlopen(allowed, timeout=2) as response:
+            report = json.load(response)
+        assert report["imported"] == 1
+        assert report["failed"] == 0
+
+        with urlopen(f"{base}/api/executions", timeout=2) as response:
+            listing = json.load(response)
+        assert listing["executions"][0]["execution_id"] == "sync-trial-1"
+        assert listing["executions"][0]["run_kind"] == "evaluation"
     finally:
         server.shutdown()
         server.server_close()
@@ -395,9 +658,7 @@ def test_global_session_and_turn_summaries_preserve_zero_and_unknown():
             }
         ]
     )
-    assert raw_bailian_summary["cache_hit_rate_pct"] == pytest.approx(
-        2048 / 3019 * 100
-    )
+    assert raw_bailian_summary["cache_hit_rate_pct"] == pytest.approx(2048 / 3019 * 100)
     assert (
         _summarize_executions(
             [

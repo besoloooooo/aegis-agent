@@ -42,6 +42,18 @@ Example::
       allow_dangerous: false      # --allow-dangerous-shell
     model:
       backend: auto               # --model-backend
+    quality:
+      conversations:
+        record: false             # --record-conversations
+        evaluate: false           # --process-evaluate-conversations
+      failure_recovery_judge:
+        enabled: false
+        provider: auto            # auto / openai / anthropic
+        model: null               # provider model override
+        base_url: null            # optional provider endpoint override
+
+Judge API keys intentionally stay in ``.env`` or the process environment,
+instead of this ordinary preferences file.
 """
 
 from __future__ import annotations

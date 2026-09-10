@@ -47,8 +47,13 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 - Quality Stage 0 — optional Langfuse end-to-end traces for Agent runs, model
   calls, tool calls, subagents, and final results
 - Quality Phase 1–2 — Harbor custom-agent integration plus a provider-neutral
-  `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts
-- Local read-only Trace Viewer with Global → Session → Turn → Observation summaries and optional Langfuse v4 detail
+  `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts,
+  with container-safe opt-in proxy forwarding
+- Quality Phase 3 — rule-first, explainable Process Evaluation with an optional
+  failure-recovery LLM Judge, opt-in live/historical conversation records, CLI
+  batch evaluation, and trace-addressable Viewer issues
+- Local Trace Viewer with one-click Harbor sync, cursor-paginated Langfuse roots,
+  separate Conversation/Evaluation/All Runs views, and explicit failed-run/error-observation metrics
 
 ---
 
@@ -63,7 +68,7 @@ src/aegis_agent/
 ├── events.py       # model event stream
 ├── agents/         # subagents, teams, inter-agent messaging
 ├── observability/  # fail-open tracing API, sanitization, Langfuse adapter
-├── quality/        # ExecutionRecord, local store, Harbor result adapter
+├── quality/        # ExecutionRecord, Process Evaluation, local store, Harbor adapter
 ├── integrations/   # optional external orchestrator adapters (Harbor)
 ├── models/         # provider-neutral protocol, fake / OpenAI / Anthropic adapters
 ├── tools/          # tool registry, executor, builtin tools
@@ -369,6 +374,12 @@ PYTHONPATH=../aegis-agent/src uv run harbor run \
   --ae LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL"
 ```
 
+Host proxy variables are not copied into the task container implicitly. A
+loopback proxy such as `127.0.0.1:10808` would refer to the container itself and
+cause model `APIConnectionError`s. If a provider really requires a proxy, pass
+`HTTP_PROXY` / `HTTPS_PROXY` with `--ae` only after using an address that the
+container can reach.
+
 The adapter installs the current Aegis wheel inside the Harbor task environment
 and runs tools in `/app`. The Harbor trial UUID becomes Aegis `execution_id`;
 the Langfuse trace id is deterministically derived from it, so no timestamp
@@ -391,11 +402,27 @@ Open the local Trace Viewer:
 uv run aegis quality view
 ```
 
+Click **Sync Harbor** to import every new or changed completed trial from
+`~/harbor/jobs`; records already synchronized are left untouched. Set another
+location with `--harbor-jobs-dir PATH` or `AEGIS_HARBOR_JOBS_DIR`. The manual
+`quality import-harbor` command remains available for one specific result or
+job directory.
+
 The viewer opens `http://127.0.0.1:8765`, shows local ExecutionRecords
-immediately, and loads recent Langfuse root observations and per-trace details
-in the background through the SDK's v4 Observations API. Its hierarchy is
-Global (`ALL SESSIONS`) → Session → Turn → Model/Tool/Final. Each level shows
-the relevant call counts, duration, input/output tokens, cache read/write and
+immediately, and cursor-paginates Langfuse root observations in the background
+through the SDK's v4 Observations API (up to a 1,000-root safety limit, which is
+shown explicitly if reached). Root observation IDs remain distinct even when an
+external execution ID was reused and several roots share one trace. The run-type
+tabs keep normal chat analysis separate from benchmark results:
+
+- **Conversations** groups interactive traces as Session → Turn.
+- **Evaluations** groups imported Harbor records as Job → Trial and surfaces
+  task identity, reward, verifier pass/fail, runtime errors, and usage.
+- **All Runs** provides a combined operational view and also includes ordinary
+  non-interactive `aegis run` tasks.
+
+Selecting any run continues into Model/Tool/Final detail. Each level shows the
+relevant call counts, duration, input/output tokens, cache read/write and
 cache hit rate, cost, and error state. Cache hit rate is Cache Read divided by
 the provider-reported total input. For Alibaba Cloud Model Studio's OpenAI-compatible
 implicit cache, that is `prompt_tokens_details.cached_tokens / prompt_tokens`;
@@ -411,16 +438,124 @@ Selecting a turn shows the complete message context sent to its last model call
 by the Agent/Model/Tool/Final tree. Model and Tool nodes surface their important
 fields directly; the detail pane presents status, usage, request, and response
 before a collapsed Raw Payload. Error observations are visually emphasized and
-roll up to their Turn and Session. The Python response boundary applies
+roll up to their Turn and Session. Summary cards report failed runs separately
+from error observations, so one multi-node failure is not presented as several
+failed runs. The Python response boundary applies
 sanitization again so SDK-added metadata or historical local fields containing
 credentials do not reach the browser. Historical messages do not carry
 their own timestamps, so timing belongs to the executable observations rather
 than being invented. Turns sharing a `session_id` appear in a collapsible
 Session group; the group preserves chronological turn order and aggregates its
 status. Langfuse credentials remain in the Python process and are never sent to
-browser JavaScript. The HTTP surface is read-only, has no CORS or mutation
-endpoints, and binds to loopback by default; use `--no-open`, `--port`, or
-`--records-dir` when needed.
+browser JavaScript. Trace GET endpoints remain read-only; the only mutation is
+the explicit Harbor sync POST, scoped to the configured jobs directory and
+protected by a per-server same-origin token. There is no CORS, and the server
+binds to loopback by default; use `--no-open`, `--port`, `--records-dir`, or
+`--harbor-jobs-dir` when needed.
+
+## 🔎 Process Evaluation (Quality Phase 3)
+
+Process Evaluation consumes an existing `ExecutionRecord`; it does not require
+Langfuse or Harbor and does not alter the Agent Loop. By default it runs only
+deterministic rules and makes no model call. Run it for one JSON record/path or
+every record in the local store:
+
+```bash
+uv run aegis quality evaluate <execution-id-or-record.json>
+uv run aegis quality evaluate --all
+uv run aegis quality evaluate --all --json
+uv run aegis quality evaluate <record> --failure-recovery-judge openai
+```
+
+Interactive conversations remain opt-in. `--record-conversations` writes one
+independent `run_kind=conversation` record per Turn, while
+`--process-evaluate-conversations` also evaluates each completed Turn. Turns
+share the conversation `session_id` but have distinct execution/trace IDs:
+
+```bash
+uv run aegis --record-conversations
+uv run aegis --process-evaluate-conversations
+```
+
+An existing SQLite conversation can be reconstructed later. The command uses a
+deterministic ID per user Turn, so rerunning it replaces the same records rather
+than creating duplicates:
+
+```bash
+uv run aegis quality record-session <session-id>
+uv run aegis quality record-session <session-id> --evaluate
+```
+
+Reconstructed records preserve persisted messages, tool names/arguments/results,
+correlation IDs, and available timestamps. They are marked
+`reconstructed_from_session`; historical provider/model, usage, cost, exact
+request context, and call latency remain unknown instead of being invented.
+
+The command safely replaces the derived result at
+`quality.process_evaluation` while preserving `schema_version: "1.0"`, original
+steps, runtime outcome, and Harbor verifier data. Each result records its
+evaluation time, evaluator version, actual weights, overall score/status, and
+six versioned, explainable grades:
+
+- repeated tool calls: same/highly similar arguments and identical results,
+  without an intervening successful mutation;
+- repeated failures: an unchanged tool operation reaches the configurable
+  consecutive-failure threshold;
+- failure recovery: extracts a complete episode for each failed tool/model/runtime
+  step (diagnosis, tool/argument/path changes, mutations, related retries, and
+  results); successful reads/searches/status checks and unrelated successes are
+  never treated as recovery by themselves;
+- final verification: after a detected material modification, looks for a
+  successful task-appropriate verification tool or command;
+- loop detection: finds contiguous `A×N` and periodic `(A,B)×N` tool patterns;
+- execution efficiency: reports step/model/tool/failure/repeat/token/cost/
+  latency metrics and only applies absolute or relative limits when configured.
+
+Every non-pass grade includes severity, evidence, and affected `step_id` values.
+The optional `FailureRecoveryLLMGrader` refines only the existing
+`failure_recovery` grade. It makes one side query only when at least one failure
+episode exists and judges effective diagnosis, targeted adjustment, and actual
+recovery of the original failed target. Select `auto`, `openai`, or `anthropic`
+with `--failure-recovery-judge` (or `AEGIS_FAILURE_RECOVERY_JUDGE`). Missing model
+configuration, provider errors, malformed JSON, mismatched episode IDs, and
+ungrounded recovery steps all preserve the rule score/status. The other five
+graders remain deterministic.
+
+Persistent Quality preferences live in `~/.aegis/config.yaml` (or the file
+passed with `--config` / `--mcp-config`):
+
+```yaml
+quality:
+  conversations:
+    record: false
+    evaluate: false
+  failure_recovery_judge:
+    enabled: true
+    provider: openai       # auto, openai, or anthropic
+    model: <judge-model>
+    base_url: null         # optional compatible endpoint
+```
+
+Keep API keys out of YAML. OpenAI-compatible Judges read `AEGIS_API_KEY` and,
+when not overridden above, `AEGIS_MODEL` / `AEGIS_BASE_URL`; Anthropic Judges
+read `ANTHROPIC_API_KEY` and optionally `ANTHROPIC_MODEL` /
+`ANTHROPIC_BASE_URL`. Explicit CLI options temporarily override the configured
+provider. `enabled: false` keeps all Process Evaluation rule-only.
+
+Missing fields produce `insufficient_data` where a reliable judgment cannot be
+made. Per-task overrides can be supplied in
+`record.metadata.process_evaluation_config` (verification patterns/requirement,
+similarity and loop thresholds, efficiency thresholds or baselines, and grader
+weights). `failure_recovery_llm_enabled=false` disables the optional judge for a
+record. A process FAIL is analysis output, not a Quality Gate, so the command only
+exits non-zero for evaluation/load/save errors.
+
+The Viewer keeps Harbor **Outcome** and **Process** status separate, allowing
+`Outcome PASS` with `Process FAIL`. Run cards show the process score/status; the
+ExecutionRecord detail lists issues with grader, severity, message, and affected
+steps. Selecting an issue focuses its first affected local Step when available.
+Harbor re-import preserves an existing process result and never modifies the
+original `result.json`.
 
 ### Trigger and record lifecycle
 
@@ -432,17 +567,19 @@ failure automatically degrades to no-op tracing.
 
 | Action | What triggers | Result |
 |---|---|---|
-| `uv run aegis --session <id>` | Every submitted user turn enters `AgentRuntime.run_turn()` | Writes normal session history and, when Langfuse is enabled, one cloud trace per turn. It does not create an ExecutionRecord. Multiple turns may share the same `session_id` but have different `trace_id` values. |
-| `uv run aegis run ...` | One non-interactive task | Always writes a local ExecutionRecord and also sends a Langfuse trace when enabled. Missing `execution_id` is generated as a UUID; `session_id` defaults to it; `trace_id` is deterministically derived from it. |
-| `uv run harbor run ... --agent aegis_agent.integrations.harbor:Aegis` | One or more Harbor trials | Harbor starts each Docker task environment, installs Aegis, and uses the trial UUID as `execution_id`. Aegis writes the runtime record, then Harbor runs the verifier and writes `result.json`. |
+| `uv run aegis --session <id>` | Every submitted user turn enters `AgentRuntime.run_turn()` | Writes normal session history and, when Langfuse is enabled, one cloud trace per turn marked `conversation`. ExecutionRecord capture remains off unless `--record-conversations`, `--process-evaluate-conversations`, or its persistent config is enabled. |
+| `uv run aegis quality record-session <session-id>` | Explicit reconstruction of an existing SQLite session | Writes one deterministic, idempotent `conversation` ExecutionRecord per persisted user Turn; `--evaluate` also runs Process Evaluation. Unavailable historical telemetry stays unknown and is disclosed in record metadata. |
+| `uv run aegis run ...` | One non-interactive task | Always writes a local ExecutionRecord marked `task` and also sends a Langfuse trace when enabled. Missing `execution_id` is generated as a UUID; `session_id` defaults to it; `trace_id` is deterministically derived from it. `--run-kind evaluation` is reserved for evaluation adapters. |
+| `uv run harbor run ... --agent aegis_agent.integrations.harbor:Aegis` | One or more Harbor trials | Harbor starts each Docker task environment, installs Aegis, uses the trial UUID as `execution_id`, and marks the run `evaluation`. Aegis writes the runtime record, then Harbor runs the verifier and writes `result.json`. |
 | `uv run aegis quality import-harbor <result-or-job>` | Explicit post-verifier import | Merges Harbor identity, verifier rewards, exceptions, aggregate usage, and artifacts into the final ExecutionRecord. The argument may be one `result.json` or an entire job directory. |
-| `uv run aegis quality view` | Starts the local read-only viewer | Reads local JSON first and optional Langfuse observations in the background. It does not create or modify trace data. |
+| `uv run aegis quality evaluate <record>` / `--all` | Explicit offline process evaluation | Runs five deterministic graders plus rule-first failure recovery. An explicitly configured Judge refines only failure episodes; safe fallback preserves the rule result. The command atomically updates `quality.process_evaluation`; outcome/verifier fields and source steps remain unchanged. |
+| `uv run aegis quality view` | Starts the local viewer | Reads local JSON first, then cursor-paginates optional Langfuse roots up to an explicit safety limit. **Sync Harbor** incrementally imports new or changed completed TrialResults from the configured jobs directory; it never changes Langfuse trace data. Unit tests force Langfuse credentials empty so a developer `.env` cannot upload pytest traces. This isolation prevents future uploads but does not automatically mutate existing Langfuse history. |
 
 Langfuse upload is asynchronous. A normal CLI exit calls Runtime
 `shutdown()` so queued observations are flushed. Harbor finalization is a
-separate explicit step: without `import-harbor`, the trial still has Aegis's
-runtime record and Harbor's raw `result.json`, but the central record has not
-yet been enriched with verifier output.
+separate explicit step: without `import-harbor` or **Sync Harbor**, the trial
+still has Aegis's runtime record and Harbor's raw `result.json`, but the central
+record has not yet been enriched with verifier output.
 
 ### Recorded data
 
@@ -459,8 +596,9 @@ Its children record:
   nested model/tool/final tree.
 - Final result: output, success or error, and stop reason.
 
-The local `ExecutionRecord` schema adds stable execution/task/trial/job/session/
-trace identity, agent configuration, execution timing and status, the ordered
+The local `ExecutionRecord` schema adds a stable `run_kind` (`conversation`,
+`task`, or `evaluation`), execution/task/trial/job/session/trace identity,
+agent configuration, execution timing and status, the ordered
 parent-linked step tree, usage buckets, Harbor verifier result/rewards/pass
 state, and artifact/log paths. Runtime success and verifier pass/fail remain
 separate. Fields that the provider or Harbor does not supply remain `null`.
@@ -483,10 +621,11 @@ to eight levels; truncation metadata retains the original size.
 | Harbor raw result | `<trial-dir>/result.json` | Written by Harbor after the verifier. |
 | Harbor final record | `<trial-dir>/execution-record.json` | Written by `quality import-harbor`. |
 | Imported central copy | `~/.aegis/quality/executions/<trial-uuid>.json` | Contains the merged runtime and verifier result. |
-| Trace Viewer | No storage | Reads the local records and Langfuse v4 Observations API only. |
+| Trace Viewer | No separate storage | Reads local records and Langfuse v4 observations; explicit Harbor sync writes finalized records to the existing central store and beside each TrialResult. |
 
-The viewer groups turns by `session_id`, but joins local and cloud copies of an
-individual turn by exact `trace_id`, not by timestamp. Cloud success comes from
+The viewer groups conversations by `session_id` and Harbor evaluations by
+`job_id`, but joins local and cloud copies of an individual run by exact
+`trace_id`, not by timestamp. Cloud success comes from
 explicit Aegis success metadata; older traces fall back to their level,
 `stop_reason`, completion time, and output. `CLOUD` means a Langfuse-only trace,
 `LOCAL` means an ExecutionRecord, and `LF` on a local entry means a matching

@@ -17,3 +17,8 @@ wheels/
 
 # /chatlog debug dumps (generated)
 aegis-chat-logs/
+
+# Local benchmark/source artifacts and generated binary reports
+/benchmarks/terminal-bench-sample/sqlite-with-gcov/environment/vendor/sqlite-fossil-release.tar.gz
+/docs/process-evaluation-report.pdf
+/downloads/*.pdf

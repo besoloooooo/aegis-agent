@@ -685,6 +685,7 @@ class AgentRuntime:
                 agent_name=self._config.agent_name,
                 version=__version__,
                 is_subagent=is_subagent,
+                metadata={"run_kind": "conversation"},
             )
         else:
             run_observation = self._observability.agent_run(

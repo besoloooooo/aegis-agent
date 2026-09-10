@@ -27,7 +27,7 @@ from aegis_agent.quality.adapters.harbor import RUNTIME_RECORD_NAME
 from aegis_agent.quality.models import ExecutionRecord
 
 _REMOTE_VENV = PurePosixPath("/opt/aegis-venv")
-_FORWARDED_ENV = (
+_INHERITED_ENV = (
     "AEGIS_API_KEY",
     "AEGIS_BASE_URL",
     "AEGIS_MODEL",
@@ -37,6 +37,8 @@ _FORWARDED_ENV = (
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+)
+_EXPLICIT_PROXY_ENV = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -165,10 +167,19 @@ class Aegis(BaseInstalledAgent):
         record_path: PurePosixPath,
     ) -> dict[str, str]:
         env: dict[str, str] = {}
-        for key in _FORWARDED_ENV:
+        for key in _INHERITED_ENV:
             value = self._get_env(key)
             if value is not None:
                 env[key] = value
+
+        # A host loopback proxy (for example 127.0.0.1:10808 in WSL) points
+        # back to the task container after Harbor forwards it. Proxy settings
+        # therefore require an explicit --ae value that is reachable from the
+        # container instead of silently inheriting the Harbor process environment.
+        explicit_env = self.extra_env
+        for key in _EXPLICIT_PROXY_ENV:
+            if key in explicit_env:
+                env[key] = explicit_env[key]
 
         if self.model_name:
             provider, separator, model = self.model_name.partition("/")
@@ -197,6 +208,7 @@ class Aegis(BaseInstalledAgent):
                 "AEGIS_SESSION_ID": self.session_id or execution_id,
                 "AEGIS_EXECUTION_RECORD_PATH": str(record_path),
                 "AEGIS_EXECUTION_RECORDS_DIR": str(self.environment_logs_dir / "executions"),
+                "AEGIS_RUN_KIND": "evaluation",
             }
         )
         return env

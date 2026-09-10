@@ -1,9 +1,10 @@
-"""Read-only local web viewer for ExecutionRecords and Langfuse traces."""
+"""Local viewer for ExecutionRecords, Langfuse traces, and explicit Harbor sync."""
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import webbrowser
 from collections.abc import Mapping
@@ -21,6 +22,16 @@ from aegis_agent.quality.viewer_ui import VIEWER_HTML
 
 _OBSERVATION_FIELDS = "basic,time,io,metadata,model,usage,metrics,trace_context"
 _REQUEST_OPTIONS = {"timeout_in_seconds": 5, "max_retries": 0}
+_DEFAULT_ROOT_LIMIT = 1_000
+_LANGFUSE_PAGE_SIZE = 1_000
+ENV_HARBOR_JOBS_DIR = "AEGIS_HARBOR_JOBS_DIR"
+
+
+def default_harbor_jobs_dir() -> Path:
+    configured = os.environ.get(ENV_HARBOR_JOBS_DIR)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / "harbor" / "jobs").resolve()
 
 
 class LangfuseReader:
@@ -29,6 +40,7 @@ class LangfuseReader:
     def __init__(self, client: Any | None = None) -> None:
         self._client = client
         self._error: str | None = None
+        self._roots_has_more = False
         if client is not None:
             return
         load_dotenv()
@@ -56,23 +68,43 @@ class LangfuseReader:
     def error(self) -> str | None:
         return self._error
 
+    @property
+    def roots_has_more(self) -> bool:
+        """Whether the most recent root listing stopped at its safety limit."""
+        return self._roots_has_more
+
     def list_roots(
         self, *, limit: int = 100
     ) -> tuple[list[dict[str, Any]], str | None]:
         if self._client is None:
+            self._roots_has_more = False
             return [], self._error
+        observations: list[dict[str, Any]] = []
+        cursor: str | None = None
+        self._roots_has_more = False
         try:
-            response = self._client.api.observations.get_many(
-                fields=_OBSERVATION_FIELDS,
-                limit=min(max(limit, 1), 1000),
-                is_root_observation=True,
-                request_options=_REQUEST_OPTIONS,
-            )
+            requested = max(limit, 1)
+            while len(observations) < requested:
+                response = self._client.api.observations.get_many(
+                    fields=_OBSERVATION_FIELDS,
+                    limit=min(_LANGFUSE_PAGE_SIZE, requested - len(observations)),
+                    cursor=cursor,
+                    is_root_observation=True,
+                    request_options=_REQUEST_OPTIONS,
+                )
+                observations.extend(_json_value(item) for item in response.data)
+                next_cursor = response.meta.cursor
+                if not next_cursor or next_cursor == cursor:
+                    break
+                if len(observations) >= requested:
+                    self._roots_has_more = True
+                    break
+                cursor = next_cursor
             self._error = None
-            return [_json_value(item) for item in response.data], None
+            return observations[:requested], None
         except Exception as exc:  # noqa: BLE001 - remote API errors are contained
             self._error = _safe_error(exc)
-            return [], self._error
+            return observations, self._error
 
     def get_trace(
         self,
@@ -140,6 +172,39 @@ class LangfuseReader:
             self._error = _safe_error(exc)
             return _stats_by_trace(observations), self._error
 
+    def list_root_stats(
+        self,
+        root_ids: set[str],
+        *,
+        max_observations: int = 5_000,
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        """Aggregate observations below each requested root observation."""
+        if self._client is None or not root_ids:
+            return {}, self._error
+        observations: list[dict[str, Any]] = []
+        cursor: str | None = None
+        fetched = 0
+        try:
+            while fetched < max_observations:
+                response = self._client.api.observations.get_many(
+                    fields="basic,time,metadata,usage,metrics,trace_context",
+                    limit=min(_LANGFUSE_PAGE_SIZE, max_observations - fetched),
+                    cursor=cursor,
+                    request_options=_REQUEST_OPTIONS,
+                )
+                values = [_json_value(item) for item in response.data]
+                fetched += len(values)
+                observations.extend(values)
+                next_cursor = response.meta.cursor
+                if not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+            self._error = None
+            return _stats_by_root(observations, root_ids), None
+        except Exception as exc:  # noqa: BLE001 - summary enrichment must fail open
+            self._error = _safe_error(exc)
+            return _stats_by_root(observations, root_ids), self._error
+
     def list_model_usage(
         self,
         trace_ids: set[str],
@@ -170,9 +235,17 @@ class TraceViewerService:
         self,
         store: ExecutionRecordStore,
         langfuse: LangfuseReader,
+        harbor_jobs_dir: str | Path | None = None,
     ) -> None:
         self.store = store
         self.langfuse = langfuse
+        self.harbor_jobs_dir = (
+            Path(harbor_jobs_dir).expanduser().resolve()
+            if harbor_jobs_dir is not None
+            else default_harbor_jobs_dir()
+        )
+        self.sync_token = secrets.token_urlsafe(32)
+        self._sync_lock = threading.Lock()
 
     def list_executions(self, *, limit: int = 100) -> dict[str, Any]:
         local = self.store.list(limit=limit)
@@ -189,22 +262,50 @@ class TraceViewerService:
                 "local_count": len(local),
                 "langfuse_enabled": self.langfuse.enabled,
                 "langfuse_error": self.langfuse.error,
+                "harbor_jobs_dir": str(self.harbor_jobs_dir),
+                "harbor_jobs_exists": self.harbor_jobs_dir.is_dir(),
+                "sync_token": self.sync_token,
             },
         }
 
-    def list_langfuse_executions(self, *, limit: int = 100) -> dict[str, Any]:
+    def sync_harbor(self) -> dict[str, Any]:
+        if not self._sync_lock.acquire(blocking=False):
+            raise RuntimeError("Harbor sync is already running")
+        try:
+            from aegis_agent.quality.adapters.harbor import sync_harbor_jobs
+
+            return sync_harbor_jobs(self.harbor_jobs_dir, store=self.store)
+        finally:
+            self._sync_lock.release()
+
+    def list_langfuse_executions(
+        self, *, limit: int = _DEFAULT_ROOT_LIMIT
+    ) -> dict[str, Any]:
         roots, error = self.langfuse.list_roots(limit=limit)
         trace_ids = {
             trace_id
             for item in roots
             if (trace_id := _string(item.get("traceId") or item.get("id")))
         }
-        stats_by_trace, stats_error = self.langfuse.list_trace_stats(trace_ids)
+        root_ids = {
+            root_id for item in roots if (root_id := _string(item.get("id")))
+        }
+        list_root_stats = getattr(self.langfuse, "list_root_stats", None)
+        if callable(list_root_stats):
+            stats_by_root, stats_error = list_root_stats(root_ids)
+            stats_by_trace: dict[str, dict[str, Any]] = {}
+        else:
+            stats_by_root = {}
+            stats_by_trace, stats_error = self.langfuse.list_trace_stats(trace_ids)
         executions = [
             _cloud_summary(
                 observation,
-                stats=stats_by_trace.get(
-                    _string(observation.get("traceId") or observation.get("id")) or ""
+                stats=(
+                    stats_by_root.get(_string(observation.get("id")) or "")
+                    or stats_by_trace.get(
+                        _string(observation.get("traceId") or observation.get("id"))
+                        or ""
+                    )
                 ),
             )
             for observation in roots
@@ -215,6 +316,9 @@ class TraceViewerService:
             "sessions": _summarize_sessions(executions),
             "error": error,
             "stats_error": stats_error,
+            "loaded_root_count": len(roots),
+            "root_limit": limit,
+            "has_more": bool(getattr(self.langfuse, "roots_has_more", False)),
             # Kept for the older UI/API contract.
             "usage_error": stats_error,
         }
@@ -275,12 +379,14 @@ def build_server(
     port: int,
     *,
     records_dir: str | Path | None = None,
+    harbor_jobs_dir: str | Path | None = None,
     store: ExecutionRecordStore | None = None,
     langfuse: LangfuseReader | None = None,
 ) -> _ViewerServer:
     service = TraceViewerService(
         store or ExecutionRecordStore(records_dir),
         langfuse or LangfuseReader(),
+        harbor_jobs_dir,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -321,6 +427,30 @@ def build_server(
                 return
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/harbor/sync":
+                self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                return
+            token = self.headers.get("X-Aegis-Sync-Token", "")
+            if not secrets.compare_digest(token, service.sync_token):
+                self._json({"error": "invalid sync token"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                report = service.sync_harbor()
+            except FileNotFoundError as exc:
+                self._json({"error": _safe_error(exc)}, HTTPStatus.NOT_FOUND)
+                return
+            except RuntimeError as exc:
+                self._json({"error": _safe_error(exc)}, HTTPStatus.CONFLICT)
+                return
+            except Exception as exc:  # noqa: BLE001 - keep the local server alive
+                self._json(
+                    {"error": _safe_error(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                return
+            self._json(sanitize(report))
+
         def log_message(self, format: str, *args: Any) -> None:
             return
 
@@ -332,6 +462,13 @@ def build_server(
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; frame-ancestors 'none'; "
+                "base-uri 'none'; form-action 'none'",
+            )
             self.end_headers()
 
         def _html(self, value: str) -> None:
@@ -355,13 +492,20 @@ def serve_viewer(
     host: str = "127.0.0.1",
     port: int = 8765,
     records_dir: str | Path | None = None,
+    harbor_jobs_dir: str | Path | None = None,
     open_browser: bool = True,
 ) -> None:
-    server = build_server(host, port, records_dir=records_dir)
+    server = build_server(
+        host,
+        port,
+        records_dir=records_dir,
+        harbor_jobs_dir=harbor_jobs_dir,
+    )
     actual_port = server.server_address[1]
     url = f"http://{host}:{actual_port}/"
     print(f"Aegis Trace Viewer: {url}")
     print(f"ExecutionRecords: {ExecutionRecordStore(records_dir).directory}")
+    print(f"Harbor jobs: {server.aegis_viewer_service.harbor_jobs_dir}")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         print(
             "Warning: viewer has no authentication; use a loopback host unless access is trusted."
@@ -381,17 +525,31 @@ def _local_summary(record: ExecutionRecord) -> dict[str, Any]:
     model_calls = sum(step.type == "model" for step in record.steps)
     tool_calls = sum(step.type == "tool" for step in record.steps)
     errors = sum(_local_step_is_error(step) for step in record.steps)
+    process = record.quality.process_evaluation
     return {
         "id": record.identity.execution_id,
         "execution_id": record.identity.execution_id,
         "trace_id": record.identity.trace_id,
         "session_id": record.identity.session_id,
+        "run_kind": _local_run_kind(record),
+        "job_id": record.identity.job_id,
+        "trial_id": record.identity.trial_id,
+        "task_id": record.identity.task_id,
         "source": "local",
         "task": sanitize(record.identity.task_name),
         "started_at": _iso(record.execution.started_at),
         "success": record.execution.success,
         "has_error": errors > 0,
         "passed": record.evaluation.passed,
+        "process_score": process.overall_score if process is not None else None,
+        "process_status": process.status if process is not None else None,
+        "process_issue_count": (
+            sum(grade.status in {"warning", "fail"} for grade in process.grades)
+            if process is not None
+            else None
+        ),
+        "reward": _primary_reward(record.evaluation.rewards),
+        "rewards": sanitize(record.evaluation.rewards),
         "model": record.agent.model,
         "provider": record.agent.provider,
         "latency_ms": record.execution.latency_ms,
@@ -403,6 +561,21 @@ def _local_summary(record: ExecutionRecord) -> dict[str, Any]:
         },
         "langfuse_available": False,
     }
+
+
+def _local_run_kind(record: ExecutionRecord) -> str:
+    """Classify Harbor records written before ``run_kind`` was added."""
+    if record.run_kind != "task":
+        return record.run_kind
+    if (
+        record.identity.job_id
+        or record.identity.trial_id
+        or record.evaluation.verifier_result is not None
+        or record.evaluation.rewards
+        or record.evaluation.passed is not None
+    ):
+        return "evaluation"
+    return "task"
 
 
 def _summarize_sessions(executions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -573,11 +746,7 @@ def _cache_input_total(
     if total_tokens is not None and output_tokens is not None:
         candidate = total_tokens - output_tokens
         return candidate if candidate >= 0 else None
-    if (
-        input_tokens is None
-        or cache_read_tokens is None
-        or cache_write_tokens is None
-    ):
+    if input_tokens is None or cache_read_tokens is None or cache_write_tokens is None:
         return None
     return input_tokens + cache_read_tokens + cache_write_tokens
 
@@ -587,21 +756,35 @@ def _cloud_summary(
     *,
     stats: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    observation_id = _string(observation.get("id"))
     trace_id = _string(observation.get("traceId")) or _string(observation.get("id"))
     metadata = observation.get("metadata")
     execution_id = (
         metadata.get("execution_id") if isinstance(metadata, Mapping) else None
     )
     session_id = metadata.get("session_id") if isinstance(metadata, Mapping) else None
+    run_kind = _cloud_run_kind(metadata)
     trace_stats = dict(stats or {})
     success = _cloud_success(observation)
     if int(trace_stats.get("errors") or 0) > 0:
         success = False
     return {
-        "id": execution_id or trace_id,
+        # Reused external execution ids can create multiple root observations
+        # in one trace.  Keep each root addressable instead of dropping all but
+        # one when the browser merges local and cloud data.
+        "id": (
+            f"langfuse:{observation_id}"
+            if observation_id
+            else execution_id or trace_id
+        ),
+        "root_observation_id": observation_id,
         "execution_id": execution_id,
         "trace_id": trace_id,
         "session_id": session_id,
+        "run_kind": run_kind,
+        "job_id": None,
+        "trial_id": None,
+        "task_id": None,
         "source": "langfuse",
         "task": _task_from_input(observation.get("input")),
         "name": observation.get("name"),
@@ -609,6 +792,8 @@ def _cloud_summary(
         "success": success,
         "has_error": int(trace_stats.get("errors") or 0) > 0,
         "passed": None,
+        "reward": None,
+        "rewards": None,
         "model": observation.get("providedModelName"),
         "latency_ms": _seconds_to_ms(observation.get("latency")),
         "usage": dict(
@@ -623,6 +808,31 @@ def _cloud_summary(
     }
 
 
+def _cloud_run_kind(metadata: Any) -> str:
+    if isinstance(metadata, Mapping):
+        explicit = metadata.get("run_kind")
+        if explicit in {"conversation", "task", "evaluation"}:
+            return str(explicit)
+        if metadata.get("source") == "harbor":
+            return "evaluation"
+        if metadata.get("source") == "aegis-run":
+            return "task"
+    return "conversation"
+
+
+def _primary_reward(rewards: Any) -> float | int | None:
+    if not isinstance(rewards, Mapping):
+        return None
+    for key in ("reward", "pass"):
+        value = rewards.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    for value in rewards.values():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
 def _stats_by_trace(observations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for observation in observations:
@@ -631,14 +841,60 @@ def _stats_by_trace(observations: list[dict[str, Any]]) -> dict[str, dict[str, A
             grouped.setdefault(trace_id, []).append(observation)
     result: dict[str, dict[str, Any]] = {}
     for trace_id, items in grouped.items():
-        models = [item for item in items if _observation_kind(item) == "model"]
-        result[trace_id] = {
-            "model_calls": len(models),
-            "tool_calls": sum(_observation_kind(item) == "tool" for item in items),
-            "errors": sum(_cloud_observation_is_error(item) for item in items),
-            "usage": _aggregate_usage(models)["usage"],
-        }
+        result[trace_id] = _stats_for_observations(items)
     return result
+
+
+def _stats_by_root(
+    observations: list[dict[str, Any]], root_ids: set[str]
+) -> dict[str, dict[str, Any]]:
+    """Group a shared trace's descendants under their nearest requested root."""
+    by_id = {
+        observation_id: item
+        for item in observations
+        if (observation_id := _string(item.get("id")))
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in observations:
+        observation_id = _string(item.get("id"))
+        if observation_id in root_ids:
+            root_id = observation_id
+        else:
+            root_id = _ancestor_root_id(item, by_id, root_ids)
+        if root_id is not None:
+            grouped.setdefault(root_id, []).append(item)
+    return {
+        root_id: _stats_for_observations(items)
+        for root_id, items in grouped.items()
+    }
+
+
+def _ancestor_root_id(
+    observation: Mapping[str, Any],
+    by_id: Mapping[str, Mapping[str, Any]],
+    root_ids: set[str],
+) -> str | None:
+    parent_id = _string(observation.get("parentObservationId"))
+    visited: set[str] = set()
+    while parent_id is not None and parent_id not in visited:
+        if parent_id in root_ids:
+            return parent_id
+        visited.add(parent_id)
+        parent = by_id.get(parent_id)
+        if parent is None:
+            return None
+        parent_id = _string(parent.get("parentObservationId"))
+    return None
+
+
+def _stats_for_observations(items: list[dict[str, Any]]) -> dict[str, Any]:
+    models = [item for item in items if _observation_kind(item) == "model"]
+    return {
+        "model_calls": len(models),
+        "tool_calls": sum(_observation_kind(item) == "tool" for item in items),
+        "errors": sum(_cloud_observation_is_error(item) for item in items),
+        "usage": _aggregate_usage(models)["usage"],
+    }
 
 
 def _observation_kind(observation: Mapping[str, Any]) -> str:

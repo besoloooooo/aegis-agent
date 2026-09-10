@@ -78,13 +78,17 @@ class RecordingObservability:
         agent_name: str,
         version: str,
         is_subagent: bool,
+        execution_id: str | None = None,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> AbstractContextManager:
+        del execution_id, trace_id
         name = f"Subagent Run: {agent_name}" if is_subagent else "Aegis Run"
         return self._record(
             name=name,
             kind="agent",
             input={"task": task},
-            metadata={"session_id": session_id, "version": version},
+            metadata={"session_id": session_id, "version": version, **(metadata or {})},
         )
 
     def model_call(
@@ -152,6 +156,7 @@ def test_normal_run_records_agent_model_tool_model_final_hierarchy():
     root = tracing.records[0]
     assert all(record.parent is root for record in tracing.records[1:])
     assert root.metadata["session_id"] == "session-1"
+    assert root.metadata["run_kind"] == "conversation"
     assert root.updates[-1]["output"] == "final answer"
     assert root.updates[-1]["success"] is True
 

@@ -14,7 +14,12 @@ from aegis_agent.observability import (
     create_observability,
     deterministic_trace_id,
 )
-from aegis_agent.quality.models import AgentIdentity, ExecutionIdentity, ExecutionRecord
+from aegis_agent.quality.models import (
+    AgentIdentity,
+    ExecutionIdentity,
+    ExecutionRecord,
+    RunKind,
+)
 from aegis_agent.quality.recorder import ExecutionRecorder
 from aegis_agent.quality.store import ExecutionRecordStore
 from aegis_agent.runtime import AgentRuntime, TurnResult
@@ -63,6 +68,7 @@ def run_task(
     mcp_config_path: str | None = None,
     enable_subagents: bool = True,
     enable_memory: bool = False,
+    run_kind: RunKind = "task",
     metadata: dict[str, Any] | None = None,
 ) -> TaskRun:
     """Execute exactly one user task and persist its provider-neutral record.
@@ -76,6 +82,7 @@ def run_task(
     store = ExecutionRecordStore(records_dir)
     explicit_path = Path(record_path).expanduser() if record_path else None
     record = ExecutionRecord(
+        run_kind=run_kind,
         identity=ExecutionIdentity(
             execution_id=execution_id,
             task_id=task_id,
@@ -119,7 +126,11 @@ def run_task(
             instruction,
             execution_id=execution_id,
             trace_id=trace_id,
-            trace_metadata={"execution_id": execution_id, **dict(metadata or {})},
+            trace_metadata={
+                "execution_id": execution_id,
+                **dict(metadata or {}),
+                "run_kind": run_kind,
+            },
         )
     finally:
         runtime.shutdown()

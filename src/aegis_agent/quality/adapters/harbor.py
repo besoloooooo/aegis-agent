@@ -34,9 +34,13 @@ def finalize_harbor_trial(
 
     trial_dir = result_path.parent
     runtime_path = trial_dir / "agent" / RUNTIME_RECORD_NAME
+    final_path = trial_dir / FINAL_RECORD_NAME
     trial_id = str(raw.get("id") or "")
+    local_store = store or ExecutionRecordStore()
     if runtime_path.is_file():
-        record = ExecutionRecord.model_validate_json(runtime_path.read_text(encoding="utf-8"))
+        record = ExecutionRecord.model_validate_json(
+            runtime_path.read_text(encoding="utf-8")
+        )
         if trial_id and record.identity.execution_id != trial_id:
             raise ValueError(
                 "Aegis execution_id does not match Harbor trial id: "
@@ -47,7 +51,24 @@ def finalize_harbor_trial(
             raise ValueError("Harbor TrialResult does not contain an id")
         record = ExecutionRecord(identity=ExecutionIdentity(execution_id=trial_id))
 
+    if record.quality.process_evaluation is None and trial_id:
+        for existing_path in (final_path, local_store.path_for(trial_id)):
+            if not existing_path.is_file():
+                continue
+            try:
+                existing = ExecutionRecord.model_validate_json(
+                    existing_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                continue
+            if existing.identity.execution_id != trial_id:
+                continue
+            record.quality.process_evaluation = existing.quality.process_evaluation
+            if record.quality.process_evaluation is not None:
+                break
+
     config = raw.get("config") or {}
+    record.run_kind = "evaluation"
     record.identity.trial_id = trial_id or record.identity.trial_id
     record.identity.job_id = _string_or_none(config.get("job_id"))
     record.identity.task_id = _stable_string(raw.get("task_id"))
@@ -75,7 +96,9 @@ def finalize_harbor_trial(
     if exception:
         record.execution.success = False
         record.execution.error = _string_or_none(exception.get("exception_message"))
-        record.execution.exception_type = _string_or_none(exception.get("exception_type"))
+        record.execution.exception_type = _string_or_none(
+            exception.get("exception_type")
+        )
     record.execution.started_at = started_at
     record.execution.finished_at = finished_at
     if started_at is not None and finished_at is not None:
@@ -93,7 +116,9 @@ def finalize_harbor_trial(
     if record.usage == UsageSummary():
         record.usage = harbor_usage
     else:
-        record.usage.input_tokens_including_cache = harbor_usage.input_tokens_including_cache
+        record.usage.input_tokens_including_cache = (
+            harbor_usage.input_tokens_including_cache
+        )
         record.usage.cache_tokens = harbor_usage.cache_tokens
         if record.usage.output_tokens is None:
             record.usage.output_tokens = harbor_usage.output_tokens
@@ -110,8 +135,6 @@ def finalize_harbor_trial(
     )
     record.artifacts = _artifacts(trial_dir, record.artifacts)
 
-    final_path = trial_dir / FINAL_RECORD_NAME
-    local_store = store or ExecutionRecordStore()
     local_store.save(record, final_path)
     local_store.save(record)
     return record
@@ -135,6 +158,102 @@ def finalize_harbor_job(
     return records
 
 
+def sync_harbor_jobs(
+    jobs_dir: str | Path,
+    *,
+    store: ExecutionRecordStore | None = None,
+) -> dict[str, Any]:
+    """Import new or changed Harbor TrialResults below one jobs directory."""
+    root = Path(jobs_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Harbor jobs directory not found: {root}")
+
+    local_store = store or ExecutionRecordStore()
+    report: dict[str, Any] = {
+        "jobs_dir": str(root),
+        "scanned": 0,
+        "imported": 0,
+        "unchanged": 0,
+        "ignored": 0,
+        "failed": 0,
+        "execution_ids": [],
+        "errors": [],
+    }
+    for result_path in sorted(root.rglob("result.json")):
+        report["scanned"] += 1
+        if result_path.is_symlink():
+            report["ignored"] += 1
+            continue
+        try:
+            raw = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            _record_sync_error(report, root, result_path, exc)
+            continue
+        if (
+            not isinstance(raw, dict)
+            or "trial_name" not in raw
+            or "task_name" not in raw
+        ):
+            report["ignored"] += 1
+            continue
+        trial_id = _string_or_none(raw.get("id"))
+        if not trial_id:
+            _record_sync_error(
+                report,
+                root,
+                result_path,
+                ValueError("Harbor TrialResult does not contain an id"),
+            )
+            continue
+
+        try:
+            runtime_path = result_path.parent / "agent" / RUNTIME_RECORD_NAME
+            source_mtime = max(
+                result_path.stat().st_mtime_ns,
+                runtime_path.stat().st_mtime_ns if runtime_path.is_file() else 0,
+            )
+            final_path = result_path.parent / FINAL_RECORD_NAME
+            central_path = local_store.path_for(trial_id)
+            if _current_harbor_record(
+                final_path, trial_id, source_mtime
+            ) and _current_harbor_record(central_path, trial_id, source_mtime):
+                report["unchanged"] += 1
+                continue
+            record = finalize_harbor_trial(result_path, store=local_store)
+        except (OSError, ValueError) as exc:
+            _record_sync_error(report, root, result_path, exc)
+            continue
+        report["imported"] += 1
+        report["execution_ids"].append(record.identity.execution_id)
+    return report
+
+
+def _current_harbor_record(path: Path, trial_id: str, source_mtime: int) -> bool:
+    if not path.is_file() or path.stat().st_mtime_ns < source_mtime:
+        return False
+    try:
+        record = ExecutionRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return record.identity.execution_id == trial_id and record.run_kind == "evaluation"
+
+
+def _record_sync_error(
+    report: dict[str, Any],
+    root: Path,
+    result_path: Path,
+    exc: Exception,
+) -> None:
+    report["failed"] += 1
+    if len(report["errors"]) < 20:
+        report["errors"].append(
+            {
+                "path": str(result_path.relative_to(root)),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+
+
 def _agent_contexts(raw: dict[str, Any]) -> list[dict[str, Any]]:
     agent_result = raw.get("agent_result")
     if isinstance(agent_result, dict):
@@ -148,7 +267,11 @@ def _agent_contexts(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _aggregate_harbor_usage(contexts: list[dict[str, Any]]) -> UsageSummary:
     def total(field: str) -> int | None:
-        values = [value for context in contexts if isinstance((value := context.get(field)), int)]
+        values = [
+            value
+            for context in contexts
+            if isinstance((value := context.get(field)), int)
+        ]
         return sum(values) if values else None
 
     costs = [
@@ -180,10 +303,16 @@ def _artifacts(trial_dir: Path, existing: ArtifactSummary) -> ArtifactSummary:
         root = trial_dir / directory
         if not root.is_dir():
             return []
-        return [str(path.relative_to(trial_dir)) for path in sorted(root.rglob("*")) if path.is_file()]
+        return [
+            str(path.relative_to(trial_dir))
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        ]
 
     return ArtifactSummary(
-        logs=sorted({*existing.logs, *relative_files("agent"), *relative_files("verifier")}),
+        logs=sorted(
+            {*existing.logs, *relative_files("agent"), *relative_files("verifier")}
+        ),
         files=sorted({*existing.files, *relative_files("artifacts")}),
         metadata=existing.metadata,
     )
@@ -215,4 +344,5 @@ __all__ = [
     "RUNTIME_RECORD_NAME",
     "finalize_harbor_job",
     "finalize_harbor_trial",
+    "sync_harbor_jobs",
 ]

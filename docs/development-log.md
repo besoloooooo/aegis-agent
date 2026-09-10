@@ -3824,3 +3824,564 @@ Viewer 计算命中率约 `67.8%`。
 - 相关 Python 文件 Ruff、差异空白检查和 Viewer 内嵌 JavaScript 的 Node 语法检查通过。
 - 本轮尝试读取真实 Langfuse usage 形态时 TLS 握手超时；Reader 按既有设计 fail-open，未影响本地
   验证。仍无法显示的数据只有 Provider 没有上报、且不能由其他明确 Usage 字段精确恢复的字段。
+
+---
+
+## Agent Quality——Harbor 评测与日常对话分栏
+
+### 任务目标与产品边界
+
+`aegis quality view` 原来只有 Session/Turn 这一种组织方式。Harbor Trial 虽然已经能通过
+`quality import-harbor` 合并成 `ExecutionRecord`，但进入同一个列表后会被当成普通 Turn，用户无法
+一眼区分聊天、一次性任务和基准评测，也看不到 Job、Trial、Reward 与 Verifier Pass/Fail 的评测
+语义。本次继续使用同一套 Trace/Step 详情层，只在记录分类和查看层建立清晰边界：
+
+- `Conversations`：交互式日常聊天，按 Session → Turn 分组；
+- `Evaluations`：Harbor 评测，按 Job → Trial 分组；
+- `All Runs`：排障和运维使用的合并视图，包含普通一次性 Task。
+
+### 数据模型与兼容策略
+
+- `ExecutionRecord` 新增稳定的 `run_kind`：`conversation`、`task` 或 `evaluation`。普通
+  `aegis run` 默认为 `task`；Harbor Adapter 通过 `AEGIS_RUN_KIND=evaluation` 在 Runtime Record
+  产生时即标记，Verifier 完成后的 Result Adapter 再强制确认该类型。
+- 交互式 Runtime 向 Langfuse 根 Observation 写入 `run_kind=conversation`；一次性运行同时把类型
+  写入本地 Record 和 Trace Metadata。Viewer 对旧云端 Trace 使用已有 `source` Metadata 兼容推导。
+- 旧版已导入的 Harbor JSON 没有 `run_kind`。Viewer 会根据 Job/Trial Identity 或 Evaluation
+  Result/Reward/Pass 字段把它们识别为 `evaluation`，无需用户重新跑评测；缺少这些信号的旧本地
+  Record 仍按普通 `task` 处理。
+- `source=local/langfuse` 继续只表示存储来源，`run_kind` 才表示业务运行类型，避免把数据位置与
+  聊天/评测语义混在一起。Local + Cloud 副本仍以精确 `trace_id` 合并。
+
+### Viewer 呈现
+
+评测视图顶部显示 Jobs/Trials 与 Passed/Failed，Job Header 汇总 Trial 数、平均 Reward、耗时和
+Token；Trial 卡片显示 Task、Trial ID、Reward、PASS/FAIL、模型/工具调用、Cache 与 Runtime Error。
+右侧详情把 Run Type、Job、Trial、可读的结构化 Task ID、Runtime Result、Verifier 和 Reward 分开
+列出，因此“Agent 正常退出但 Verifier 未通过”不会被误报成 Runtime Error。搜索命中一个 Trial 时
+仍保留整个 Job，交互方式与 Conversation 中保留完整 Session 一致。
+
+### 一键增量同步与安全边界
+
+Viewer Header 新增 **Sync Harbor**。默认扫描 `~/harbor/jobs`，可通过
+`--harbor-jobs-dir` 或 `AEGIS_HARBOR_JOBS_DIR` 覆盖。同步器只处理具备 Harbor TrialResult
+特征的 `result.json`：若 Trial 旁的 Final Record 和中央 Store 副本都有效、类型为 Evaluation，且
+修改时间不早于 Result/Runtime Record，则记为 `unchanged`；否则重新 Finalize。一个损坏、稀疏或
+暂时未写完的 Result 只计入该文件的 `failed`，不会中断其他 Trial，错误详情最多返回 20 条。
+
+已有 Trace GET API 继续只读。新增的 `/api/harbor/sync` 是唯一写接口，仅接受 POST，不允许前端
+提交任意路径，并由服务启动时随机生成的 Token 配合自定义 Header 校验；浏览器同源策略、无 CORS
+响应和 CSP 的 `connect-src 'self'` 共同阻止普通跨站页面伪造同步。同步使用非阻塞互斥锁，重复点击或
+并发请求不会同时写同一批 Record。完成后页面刷新数据并自动切到 `Evaluations`。
+
+本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库；实现基于 Aegis 已有的
+`ExecutionRecord`、Harbor Result Adapter 和 Trace Viewer，是现有质量查看层的原创增量设计。
+
+### 验证结果
+
+- `uv run pytest -q tests/test_trace_viewer.py tests/test_harbor_execution_record.py tests/test_execution_record.py tests/test_observability.py`
+  → `35 passed in 3.76s`；覆盖三类 Run Kind、旧 Harbor Record 兼容、Job/Trial/Reward 摘要、CLI
+  校验、Harbor Finalize、同步幂等性、变更重导入、坏文件隔离、同源 Token 拒绝和交互 Trace
+  Metadata。
+- 修改范围 Ruff 检查与 `git diff --check` 通过；Harbor Adapter、Quality Model 和 One-shot Runner
+  的定向 mypy 为 `Success: no issues found in 3 source files`。
+- 将真实成功任务 `/home/nacha/harbor/jobs/2026-09-07__15-54-50` 导入本地 Store 后进行浏览器
+  验收：页面显示 1 Job / 1 Trial、1 Passed / 0 Failed、Reward 1、2 次 Model Call、1 次 Tool Call、
+  Cache Hit 49.4%；Task ID 正确显示为 `examples/tasks/hello-world`，Execution 详情状态为 `PASS`，
+  Runtime Result 为 `SUCCESS`。`Conversations`、`Evaluations`、`All Runs` 切换均正常。
+- 使用真实 `/home/nacha/harbor/jobs` 点击 **Sync Harbor**：第一次显示
+  `5 imported · 1 unchanged · 0 failed` 并自动切到包含 6 个 Job/Trial 的 Evaluations；立即再次点击
+  显示 `0 imported · 6 unchanged · 0 failed`，验证真实目录上的增量与幂等行为。
+
+### 面试式总结
+
+设计重点是“共用证据，不混淆语义”：对话和评测都复用同一套 Provider-neutral Step Tree、Usage、
+脱敏与 Langfuse 补充数据，但在最上层用稳定的 Run Kind 分流。这样不会复制一套 Harbor 专用 Viewer，
+也不会让 Reward/Verifier 状态污染日常聊天的成功定义；新增评测类型或更多数据源时，可以继续沿用
+同一详情层和精确 Trace 关联规则。一键同步则把原来的显式 CLI 导入变成范围固定、幂等且失败隔离的
+用户动作，没有引入后台轮询，也不会在打开页面时悄悄修改结果。
+
+---
+
+## Agent Quality 阶段 3——Process Evaluation（过程评测）
+
+### 任务目标与原问题
+
+阶段 0～2 已经具备 Langfuse Trace、Provider-neutral `ExecutionRecord 1.0`、Harbor Runtime/Verifier
+合并和本地 Viewer，但只能回答“任务是否完成、Verifier 是否通过、调用了什么”，还不能离线判断
+“过程是否反复、失败后是否调整、修改后是否验证、是否陷入循环、是否明显低效”。本阶段在不改变
+Agent Loop、Harbor `result.json` 和既有 Outcome 语义的前提下，为已有 Record 增加确定性、可重复、
+可解释且可定位原始 Step 的过程评测。
+
+明确没有实现 Failure Attribution、Bad Case Mining、Regression、Baseline vs Candidate、Quality Gate、
+LLM Judge、实时拦截、新 Trace Storage 或新 Dashboard。
+
+### 参考实现、相关性与迁移决策
+
+检查了 Hermes `agent/tool_guardrails.py`、
+`tests/run_agent/test_tool_call_guardrail_runtime.py` 和
+`tests/tools/test_read_loop_detection.py`。Hermes 的实时 Guardrail 提供了有价值的行为参考：稳定的
+Tool+Args 签名、区分幂等/修改工具、相同失败计数，以及“相同结果才是无进展”的保守原则。但它位于
+执行路径中，会给模型警告或阻断工具；直接迁移会违反本阶段“纯离线、不侵入 Runtime”的边界。
+因此选择“参考行为、Aegis 独立实现”：没有复制其 Controller 或消息注入代码，只把保守判定原则
+适配到 `ExecutionRecord`。同时搜索了 Claude Code 参考仓库，没有找到与 Aegis Record Schema 和
+本阶段范围相符的完整离线 Process Grader 单元。两个参考仓库均未修改。
+
+### 架构、数据模型与主数据流
+
+`quality/process.py` 定义统一 `ProcessGrader` Protocol、`ProcessEvaluatorConfig`、只读
+`EvaluationContext`、6 个默认 Grader 和 `ProcessEvaluator`。数据流是：
+
+```text
+ExecutionRecord 1.0
+  → 按 sequence 构造只读 Step/Tool Action 视图
+  → 6 个相互独立的确定性 Grader
+  → 按实际配置权重做可解释加权平均
+  → 原子替换 quality.process_evaluation
+  → CLI / Viewer 读取派生结果
+```
+
+`ProcessGrade` 保存 `grader_name`、`grader_version`、0～1 `score`（数据不足时为 `null`）、
+`status`（pass/warning/fail/insufficient_data）、`severity`、`category`、`message`、`evidence`、
+`affected_steps` 和 `metadata`。`ProcessEvaluationResult` 保存 Schema/Evaluator 版本、UTC 评测时间、
+Overall Score/Status、摘要、全部 Grade、实际权重、有效配置，以及当时的 Runtime/Harbor Outcome 快照。
+`ExecutionRecord` 只新增默认可空的 `quality.process_evaluation`，`schema_version` 仍为 `1.0`；旧 JSON
+没有 `quality` 时由默认值补齐，原始 Steps、Execution、Usage、Evaluation 和 Artifacts 不被覆盖。
+
+Overall Score 只对有分数且权重大于零的 Grade 求简单加权平均；Overall Status 使用明确优先级：
+任一 Fail → Fail，否则 Warning → Warning，否则有 Pass → Pass，否则 Insufficient Data。结果每次完整
+替换，所以重复运行不会叠加旧 Issue；每个 Grader 版本与实际权重均持久化，支持以后安全重评分。
+
+### 6 个 Grader 的确定性规则
+
+1. **Repeated Tool Call**：同一 Tool、参数规范化后相同或相似度达到阈值、两次均明确成功、结果
+   完全相同，而且中间没有成功或成功未知的修改操作，才判定为无进展重复。失败重试交给 Repeated
+   Failure/Recovery，结果变化或字段不完整时不冒险误报；`affected_steps` 指向成对调用。
+2. **Repeated Failure**：只看按序排列的 Tool Stream；同一 Tool 且参数未调整的连续失败达到默认
+   3 次时 Fail。成功、换工具或参数变化都会重置连续段，避免把 `read(A) fail → list → read(B)
+   success` 误判成重复失败。
+3. **Failure Recovery**：分析失败的 Tool/Model，以及没有更细失败 Step 时的 Runtime Failure。
+   识别改参数、换工具、查询环境、路径变化和后续成功；全部调整后成功为 Pass，成功但没有可观察
+   调整为 Warning，存在未恢复失败为 Fail。Harbor Verifier Fail 不属于 Runtime 过程错误。
+4. **Final Verification**：默认只在明确成功的重要修改后要求验证；识别 write/edit/patch 等 Tool、
+   常见变更命令，以及 pytest/ruff/mypy/test/lint/build/check/git diff 等验证。验证必须位于最后一次
+   修改之后且成功。没有修改的聊天/只读任务直接 Pass；修改 Step 缺少 success 时返回
+   `insufficient_data`。任务 Metadata 可显式关闭/开启要求并扩充 Tool/Command Pattern。
+5. **Loop Detection**：在 Tool Action Stream 中枚举可配置最大周期，检测连续精确签名的 `A×N`、
+   `(A,B)×N` 等模式；默认至少重复 3 次。输出 `loop_detected`、`loop_start_step`、
+   `loop_start_sequence`、`loop_length`、`repeat_count`、Pattern 与全部受影响 Step。
+6. **Execution Efficiency**：统一生成 step/model/tool/failed-tool/repeated-call/token/cost/latency 指标。
+   默认只使用明确的重复调用与达到最小样本量的高失败比例；没有可靠 Baseline 时不设置“超过 15 步”
+   一类任意绝对阈值。任务可配置每个指标的绝对阈值或 Baseline+Multiplier，命中时返回 Warning 和
+   具体 Evidence，不使用 ML 或 LLM Judge。
+
+### 配置、失败处理与兼容性
+
+默认配置可以在代码中通过 `ProcessEvaluatorConfig` 注入；单个任务可在
+`record.metadata.process_evaluation_config` 覆盖参数相似度、重复/循环阈值、修改与验证模式、是否
+需要验证、效率阈值、Baseline、Multiplier 和 Grader Weight。未知 Metadata Key 被忽略，合法字段由
+Pydantic 校验。数据不足时使用 `insufficient_data`，不把未知伪装成零或 Pass/Fail。
+
+Process Evaluation 只在显式 CLI/API 调用时运行；异常不会改变原始 Agent 执行结果。Langfuse 与
+Harbor 都不是运行依赖，也没有新增第三方依赖。Harbor 对发生变化的 Result 重新 Finalize 时，会从
+已有 Final/Central Record 保留 Process Result，仍只读取、不修改 `result.json`。这同时保证
+Outcome PASS + Process FAIL、Outcome FAIL + Process PASS 都是合法状态。
+
+### CLI 与 Viewer
+
+- `uv run aegis quality evaluate <record-or-execution-id>`：评测指定 Record，保存中央副本；若传入
+  外部 JSON 路径，也原子更新该路径。
+- `uv run aegis quality evaluate --all`：批量评测当前 Store。
+- `--json`：输出机器可读结果。Process Fail 当前不改变退出码，因为这不是 Quality Gate；只有
+  Load/Evaluate/Save 操作错误返回非零。
+- `uv run aegis quality view`：Run 卡片增加 Process Score/Status；Execution Detail 将 Outcome、
+  Runtime Result、Harbor Verifier、Process Status 分开展示。Issue 列表包含 Grader、Severity、
+  Message、Affected Steps；点击有 Step 的 Issue 会定位并高亮第一个本地执行节点。旧 Record 没有
+  Process Result 时继续按原方式显示。
+
+### 测试、故障注入与结果
+
+新增 `tests/test_process_evaluation.py`，直接构造 Record，不调用真实模型；包含用户要求的
+`case_repeated_tool_call`、`case_repeated_failure`、`case_good_recovery`、`case_failed_recovery`、
+`case_missing_final_verification`、`case_good_final_verification`、`case_simple_loop`、
+`case_periodic_loop`、`case_no_loop`、`case_low_efficiency` 和 `case_clean_success`，并额外覆盖：
+
+- 相同调用但结果变化、或 success/result 缺失时不误报无进展；
+- 中间修改后重复 pytest 不误报；
+- 配置 Baseline 与默认无任意 Step 上限；
+- 旧版 Record、无 Tool 的纯聊天、Subagent Parent/Child、Runtime Failure、Harbor Evaluation Failure；
+- 重跑完整替换、Grader Version 保存、CLI 单条/批量/JSON/非法参数；
+- Viewer 同时暴露 Harbor Outcome PASS 与 Process FAIL；
+- Harbor 重新 Finalize 保留已有 Process Result。
+
+最终验收结果：
+
+- `tests/test_process_evaluation.py` 共 25 项；Process/Harbor/Viewer/ExecutionRecord 定向套件：
+  `54 passed in 4.30s`。
+- 单次 `uv run pytest -q` 因仓库既有的一分钟级 Runtime/Agent 边界用例超过长命令会话时间，未用
+  其中间输出冒充成功；随后按互斥文件集合完整分批执行全部 54 个测试文件，合计
+  `725 passed, 2 skipped`，零失败（完整分批后的新增 1 项 CLI Quality-Gate 边界测试也在最终定向
+  套件通过）。各批正式摘要分别为 `245 passed, 1 skipped`、`8 passed`、
+  `107 passed`、`25 passed, 1 skipped`、`209 passed`、`130 passed`。
+- 本次相关 Quality/CLI/Test 文件的 Ruff：`All checks passed!`；`git diff --check` 通过。
+- 全仓 `uv run ruff check .` 仍为 5 个既有问题：`mcp/client.py` 1 个、`sessions/__init__.py` 1 个、
+  `sessions/titles.py` 2 个、`tests/test_session_titles.py` 1 个；本阶段没有修改这些文件。
+- `quality/models.py`、`quality/process.py`、Harbor Adapter 和 Store 的定向 mypy：
+  `Success: no issues found in 4 source files`。全仓 `uv run mypy src` 仍有 39 个既有错误，分布在可选
+  Web/Harbor Import、MCP、旧 Viewer 汇总类型、Session、Skill、Tool、Runtime/Agent 和 CLI；新
+  Process 模块没有新增错误。
+- 从 `viewer_ui.py` 提取内嵌脚本并用 Windows Node `v24.14.0` 执行 `node --check -`，语法通过。
+- Hermes 工作树为 clean。Claude Code 参考仓库保留其开始前已有的未提交文件；本阶段所有参考仓库
+  操作均为 `grep`/`sed`/`find`/`git status` 只读检查，没有修改参考仓库。
+
+### 权衡、限制与阶段 4 预留
+
+- ExecutionRecord 目前没有通用的“工具是否修改状态”语义标签，第一版使用保守默认 Pattern 与任务
+  Metadata；自定义工具最好提供配置。外部系统在两次读取间改变状态只能通过结果变化避免误报，无法
+  归因是谁改变的。
+- 相似参数使用字符级确定性比较，适合离线复现，但不是语义相似度；阈值可配置。循环检测只判断连续
+  精确 Tool+Args 周期，不推断语义循环，以降低误报。
+- 没有可靠 Baseline 时 Efficiency 不根据绝对步数、Token、Cost 或 Latency 判低效；这会漏掉某些
+  “很长但没有重复/失败”的过程，是有意的保守选择。
+- `ProcessGrader`、独立 `category`/`severity`、结构化 Evidence、Affected Steps、每次 Grade Metadata
+  和统一 EvaluationContext 是阶段 4 Failure Attribution 的扩展接口。后续可新增 Attribution
+  Grader/证据图或消费现有失败/恢复 Assessment，而无需修改 Agent Loop、原始 Step 或 Harbor Outcome。
+
+### 面试式总结
+
+本阶段把“任务做没做成”和“过程做得好不好”拆成两个独立事实：Harbor/Runtime 继续提供 Outcome，
+ProcessEvaluator 在执行后只读地重放 Step 证据，给出 6 个可解释 Grade 和稳定聚合。关键设计不是
+堆规则，而是为每个结论保留版本、Evidence 和 Step 地址，对缺失数据明确说不知道，并把阈值与任务
+语义放进配置而非硬编码。这样既能马上用于人工分析，又为下一阶段 Failure Attribution 留下稳定、
+不污染原始轨迹的证据接口。
+
+## Agent Quality 补充——Trace Viewer 全量 Root、测试隔离与错误口径
+
+### 任务目标与原始问题
+
+实际运行 `uv run aegis quality view` 时，Conversations 页显示 `15 / 85`，但左侧可见内容与用户
+预期不符。现场检查确认这是三个问题叠加：Viewer 只请求最近 100 个 Langfuse Root；pytest 会从
+项目 `.env` 继承真实 Langfuse 凭据并上传测试 Trace；前端按 `trace_id` 合并时会静默丢弃同一 Trace
+下的重复 Root。顶部 `ERRORS 51` 又把 24 个失败 Run 内的 51 个错误 Observation 当成一个单值，
+容易被理解为 51 个失败会话。
+
+### 参考实现与迁移决策
+
+只读搜索了 Hermes 与 Claude Code 参考仓库，没有找到可复用的 Langfuse v4 Root 分页或本地
+Viewer 实现。本次采用 Aegis 独立增量实现，没有复制或改写参考仓库代码；Hermes 保持 clean，
+Claude Code 只保留任务开始前已有的未提交内容。
+
+### 设计、数据流与失败处理
+
+- `LangfuseReader.list_roots()` 在安全上限内跟随 SDK Cursor 自动分页；Viewer 默认最多读取
+  1,000 个 Root，并返回 `loaded_root_count`、`root_limit` 和 `has_more`。达到上限时 UI 明确显示
+  “first N roots”，不把部分窗口伪装为完整总数。
+- 云端列表项改用 `langfuse:<root_observation_id>` 作为唯一 UI ID；`trace_id` 继续用于读取 Trace
+  详情。本地/云端合并每个 Trace 最多消费一个云端 Root，其余 Root 独立保留，避免重复 Execution ID
+  导致静默丢数。详情页读取共享 Trace 时不会把整条 Trace 的 Aggregate 回写到任一单独 Root，避免
+  用户点开详情后污染列表汇总。
+- 新增按 Root 子树聚合：通过 `parentObservationId` 向上寻找最近的请求 Root，Model/Tool/Error/Usage
+  只计入所属 Root。多个 Root 共用一个 Trace 时，不再把整个 Trace 的统计重复乘到每个 Root 上。
+- UI 汇总改为 `FAILED RUNS / ERROR OBS`，同时展示失败 Run 数和错误 Observation 数；Session/Job
+  Summary 使用相同口径。
+- `tests/conftest.py` 的 autouse Fixture 把 Langfuse Public/Secret Key 设为空。`python-dotenv` 默认不
+  覆盖已存在环境变量，因此即使生产路径在测试中加载项目或用户 `.env`，单元测试也不会连接真实
+  Langfuse；显式 Fake Client 测试不受影响。
+
+现场数据从原页面的最近 100 个 Root 窗口恢复为完整 247 个 Root、247 个唯一 Root ID；其中
+Conversations 为 31 Sessions / 221 Turns。完整数据仍包含修复前已经上传的 pytest 历史，本次没有
+擅自删除云端数据。修复后全量测试前后 Root 数均为 247，证明测试隔离生效。
+
+### 测试与验证
+
+- Viewer + Observability 最终定向套件：`25 passed in 1.25s`。
+- 全仓测试：`728 passed, 2 skipped in 2057.53s`，零失败。
+- 本次相关文件 Ruff：`All checks passed!`。
+- 全仓 Ruff 仍有 5 个既有问题，位于 `mcp/client.py`、`sessions/__init__.py`、
+  `sessions/titles.py` 和 `tests/test_session_titles.py`；本次未修改这些位置。
+- 从 `viewer_ui.py` 提取内嵌 JavaScript 后由 Windows Node 执行 `node --check -`，语法通过；
+  `git diff --check` 通过。
+- 临时 `:8766` Viewer 实测显示 `Local + Langfuse · 247 roots`、`31 / 221`，错误卡片显示
+  `44 / 86`；API 返回 `has_more: false`、247 个唯一 ID。临时服务验证后已正常关闭。
+
+### 权衡、限制与后续
+
+1,000 Root 是避免本地页无界扫描的安全上限；超过时当前版本明确提示，但尚未提供用户点击继续加载
+下一窗口的按钮。历史 pytest 污染已在后续补充任务中按精确预览完成清理，测试隔离本身仍不会自动
+修改已有 Langfuse 数据。Root 子树统计依赖 SDK 返回 `parentObservationId`；无法关联到请求 Root
+的孤立 Observation 不会被猜测归属。
+
+### 面试式总结
+
+这次修复先区分了“数据窗口不完整”“测试遥测污染”和“UI 去重/统计口径”三个独立问题：Reader
+负责可靠分页和截断信号，Service 用 Root Observation ID 与 Parent 链建立准确统计边界，UI 分开
+呈现失败 Run 与错误节点，测试层则从源头阻断真实遥测。最终用现场 247 条数据、浏览器渲染、完整
+测试套件和云端前后计数共同验证，既没有继续污染 Langfuse，也没有删除用户历史数据。
+
+## Agent Quality 补充——历史 pytest Trace 清理
+
+用户明确授权直接清除历史 pytest Trace。清理前再次读取 Langfuse 全量 Root 与 Observation，并把
+候选限定为 pytest 临时目录标记、测试专用 Session ID 或测试专用 `trial-cli` Execution ID。随后用
+本地 `~/.aegis/state.db` Session 和 ExecutionRecord Trace ID 做反向保护，同时保留 Harbor
+`hello-world__*` 记录；两个同时命中测试标记与真实 Session 的 Trace 被排除，没有删除。
+
+最终通过 Langfuse v4 SDK 分五批删除 205 个纯测试 Trace，对应 228 个 Root Observation。删除后
+重新分页读取远端数据，确认剩余 19 个 Root / 19 个唯一 Trace：17 个本地真实会话 Root 和 2 个
+Harbor `hello-world` Root。此次为一次性远端数据清理，没有新增运行时代码；此前加入的 pytest
+凭据隔离继续负责阻止后续测试 Trace 上传，但不会自动删除历史数据。
+
+## Agent Quality 阶段 3 增量——Failure Recovery 规则 + LLM Judge 混合评测
+
+### 任务目标与原始问题
+
+原 `FailureRecoveryGrader` 在 Tool Failure 后顺序扫描后续动作，并把遇到的第一个成功 Tool Step
+直接当成 Recovery。这会把成功的 `read/search/find/status/inspect` 诊断动作、无关文件写入，甚至只凭
+最终 Runtime Success 误判为“原失败已经恢复”。本次保持 Process Evaluation 的离线、规则优先、
+可解释和可定位框架不变，只为 Failure Recovery 增加一个轻量、显式启用、失败安全的 LLM Judge；
+Repeated Tool Call、Repeated Failure、Final Verification、Loop Detection 和 Execution Efficiency
+继续完全使用确定性规则。
+
+### 参考关系与迁移决策
+
+本次没有从 Hermes 或 Claude Code 迁移 Grader。Failure Episode、Recovery 关联规则、Judge Prompt、
+响应校验和聚合评分均为 Aegis 独立实现。模型调用复用 Aegis 已有的 provider-neutral
+`ModelProvider`、`collect_response` 边界，以及 Memory Side Query 已采用的“单次调用、结构化 JSON、
+任何异常均 fail-open”架构模式；该内部模式最初受 Claude Code Side Query 行为启发，但本次没有复制
+Claude Code 代码。参考仓库只做状态检查，没有写入。
+
+### 设计与主数据流
+
+```text
+ExecutionRecord
+  → 5 个既有确定性 Grader（保持不变）
+  → FailureRecoveryGrader 提取 Failure Episode 并给出规则结果
+       failure step
+       + 完整后续 timeline
+       + diagnosis / mutation 标记
+       + tool / argument / path 调整
+       + related retries 及 success/result
+  → 未配置 Judge 或没有 Failure：直接保留规则结果
+  → 已配置 Judge 且存在 Failure：所有 Episode 合并为一次 Side Query
+       effective_diagnosis
+       adjustment_targets_failure
+       target_recovered + grounded recovery_step_id
+  → 合法响应精炼同一个 failure_recovery Grade
+  → 调用/解析/校验失败：Score、Status、Message 回退到规则结果
+  → 仍然汇总为 6 个 Grade，不改变 CLI/Viewer 数据形状
+```
+
+`FailureEpisode` 保留失败 Step 和直到规则确认恢复或 Trace 结束的事件序列。每个事件标记是否为
+Diagnostic、Mutation、Related Retry、Same Tool、Same Target，以及可观察到的调整。Metadata 同时保留
+完整 Timeline、诊断 Step、Mutation Step、相关重试、调整清单和 Rule Recovery Step，便于 Viewer、
+调试和未来 Attribution 消费。
+
+规则确认 Recovery 的条件被收紧为：后续 Step 明确成功、与原失败为同一 Tool 和同一 Target，且不是
+诊断动作。存在 Path/Target 字段时按 Target 关联；缺少显式 Target 时才回退到既有 Tool+Args 高相似
+签名。成功的诊断、Mutation、无关动作和最终 Runtime Success 都不单独构成恢复。Model Failure 仍只
+把后续成功 Model Call 当作同类重试；Runtime Failure 没有更细证据时保持未恢复。
+
+### LLM Judge、配置与失败处理
+
+`FailureRecoveryLLMGrader` 不新增第七个 Grade，而是可选精炼已有 `failure_recovery`，因此权重、Viewer、
+持久化 Schema 和下游消费者无需迁移。Judge 一次处理所有 Episode，并要求每项返回：
+
+- `effective_diagnosis`：诊断是否提供了有效信息；
+- `adjustment_targets_failure`：调整是否针对原失败目标；
+- `target_recovered`：原目标是否有证据证明恢复；
+- `recovery_step_id`：必须落在对应 Episode 的后续 Step 中；
+- 可选 Confidence 和简短 Reason。
+
+Judge Score 对三项分别使用 0.25 / 0.25 / 0.5 权重，突出“实际恢复”。任一 Target 未恢复为 Fail；
+全部恢复但诊断或定向调整不足为 Warning；三项均满足才 Pass。响应必须覆盖且仅覆盖输入 Failure ID，
+不能重复 ID；声称恢复时必须给出 Episode 内真实存在的 Recovery Step。未配置模型时直接使用规则；
+非法 JSON、ID 不匹配、虚构 Step 或 Provider 异常会记录 `llm_judge.status=fallback`，并保留规则层的
+Score/Status/Message，因此可选 Judge 不会破坏原有 Process Evaluation。
+
+API 通过 `ProcessEvaluator(failure_recovery_judge=provider)` 显式注入；CLI 通过
+`--failure-recovery-judge auto|openai|anthropic` 或 `AEGIS_FAILURE_RECOVERY_JUDGE` 启用。默认不配置时
+零模型调用；存在 Provider 但 Record 没有 Failure 时也不调用。单条 Record 可在
+`metadata.process_evaluation_config` 设置 `failure_recovery_llm_enabled=false` 禁用，或调整
+`failure_recovery_llm_max_prompt_chars`。输入先经过统一 Secret Sanitizer 和单值长度预览，整体 Prompt
+再有硬上限并记录是否截断，避免凭据外发或异常 Trace 导致无界 Judge 成本。
+
+### 兼容性、测试与验证
+
+- `ExecutionRecord` 和 `ProcessEvaluationResult` Schema 保持 `1.0`，没有新增必填字段；只把
+  `ProcessGrade` 文档语义从“确定性结果”放宽为“规则或可选 Judge 结果”。
+- Evaluator 升级为 `1.1.0`，只有 Failure Recovery Grader 升级为 `1.1.0`；其余五项仍为 `1.0.0`。
+- 默认仍返回 6 个 Grade；重跑继续完整替换派生结果，不修改原始 Step、Runtime Outcome 或 Harbor
+  Verifier。
+- 新增测试覆盖：诊断成功不算恢复、换 Read Target 不算恢复、Episode 中的诊断/Mutation/相关重试、
+  Model 重试、Judge 只在 Failure 时调用、按 Record 禁用、一次调用精炼、无关成功的否定判断、非法
+  JSON、Provider 异常、规则结果安全回退，以及 CLI 可选 Judge 接线。
+- 定向 `tests/test_process_evaluation.py`：`34 passed`；Process/Harbor/Viewer/ExecutionRecord 联合套件：
+  `66 passed`；相关 Ruff、Process/Models 定向 mypy 和 `git diff --check` 均通过。
+- 全仓 pytest：`737 passed, 2 skipped in 526.02s`，零失败。全仓 Ruff 的 18 项来自已下载的官方
+  Terminal-Bench Sample 文件 13 项，以及本任务开始前已有的 Aegis 5 项；相关修改文件 Ruff 为零。
+  全仓 mypy 仍报告 40 项可选依赖/既有模块类型问题，均不落在新增 Hybrid/Episode 逻辑；本次
+  Process/Models 定向 mypy 为零。
+
+### 权衡、限制与后续
+
+规则层故意只确认高置信度的同 Tool/同 Target 非诊断重试；例如换成另一个测试工具后成功，规则结果会
+偏保守，由可选 Judge 判断语义关联。LLM 判断仍可能受 Trace 文本质量、Prompt Injection 或截断影响，
+因此所有结论保留 Rule Result、Judge Version、Provider、Grounded Step 和 Reason，且 LLM 不参与另外
+五项确定性评分。当前没有引入多数投票、Judge 校准集或 Quality Gate；如以后需要，应先用真实 Harbor
+Failure Episode 建立离线标注集，再评估模型一致性和成本。
+
+### 面试式总结
+
+这次改动先修正了一个关键证据错误：成功动作不等于失败恢复，诊断和修复也不等于原目标已经重新通过。
+规则层现在负责完整、可复现地整理 Failure Episode 和高置信关联，LLM 只处理规则难以可靠回答的语义
+问题，并通过一次调用、严格 JSON/Step Grounding 和全路径 Fail-open 控制成本与风险。结果保持原有六项
+结构和 CLI/Viewer 兼容性，同时让 Failure Recovery 从“顺序上的第一个成功”提升为“原目标有证据地
+恢复”。
+
+## Agent Quality 阶段 3 增量——普通对话按 Turn 记录、历史回填与持久 Judge 配置
+
+### 目标与原问题
+
+此前 Process Evaluation 只能消费 `aegis run` 或 Harbor 已生成的 `ExecutionRecord`。普通交互 REPL
+虽然把原始消息保存在 SessionRepository，并可选发送 Langfuse Trace，却没有本地 Record，因此既不能
+按 `execution_id` 离线评测，也不能从已有 `session_id` 补录。与此同时 Failure Recovery Judge 只能靠
+每次 CLI 参数或 Provider 环境变量启用，Provider/Model 偏好不能作为普通应用配置持久保存。
+
+本次增量保持“默认不记录、默认纯规则”的兼容行为，增加两个显式入口：实时对话可选择每个 Turn 记录或
+记录后自动评测；已有 SQLite 会话可按 `session_id` 确定性重建。Judge 的启用状态、Provider、Model 和
+可选 Base URL 进入同一个 `~/.aegis/config.yaml`，API Key 仍只从环境或 `.env` 读取。
+
+### 参考关系与迁移决策
+
+这次功能直接组合 Aegis 已有的 `Observability`、`ExecutionRecorder`、`SessionRepository`、
+`ExecutionRecordStore` 和 `ProcessEvaluator` 边界，不需要 Hermes 或 Claude Code 的新实现单元，也没有
+读取或修改参考仓库。迁移决策是 Aegis 原创增量：保留单任务 Recorder 的职责，在外层增加按根 Turn
+创建 Recorder 的动态 Backend；历史数据只从 Aegis 自己的原始 Session 消息重建。
+
+### 设计与数据流
+
+实时路径为：
+
+```text
+显式 --record-conversations / 持久 record: true
+  → REPL 为 Turn 生成 UUID execution_id
+  → deterministic_trace_id(execution_id)
+  → Langfuse 与 ConversationExecutionRecorder 接收相同 ID
+  → ContextVar 将 Model/Tool/Subagent/Final 事件路由到当前 Turn Recorder
+  → 根 Agent Run 结束后原子保存 conversation ExecutionRecord
+  → 若 evaluate: true，再在保存前运行 ProcessEvaluator
+```
+
+`ConversationExecutionRecorder` 是长生命周期 Observability Backend，但内部仍复用现有单 Record
+`ExecutionRecorder`。每个根 Turn 创建新 Record；嵌套子 Agent 沿 ContextVar 写入父 Turn；没有活动根
+Turn 的孤立子 Agent 事件不会误建主对话 Record。评测异常被隔离并仍保存原始 Record，存储异常继续沿用
+Observability 的 fail-open 日志边界，不中断用户已经得到的回复。
+
+历史路径由 `aegis quality record-session <session-id>` 触发：按每条 User Message 切分 Turn，使用
+`session_id + client_msg_id/seq` 生成 UUIDv5，因此重复运行只覆盖同一文件。Assistant ToolCall 与 Tool
+Message 按 `tool_call_id` 配对；显式 `error`、失败 Status 或无语义豁免的非零 Exit Code 被保守识别为
+失败。每个 Record 标记 `source=session-backfill` 和 `reconstructed_from_session=true`。
+
+历史 Session 没有保存完整 Observability 数据，因此 Provider/Model、Usage、Cost、精确模型输入上下文
+和真实调用耗时保持 `null`；可用的 SQLite Message Timestamp 只用于事件定位。重建限制写入 Metadata，
+Tool Success 也标记为 `success_inferred`，避免把推导数据伪装为现场遥测。
+
+### 配置与优先级
+
+新增持久配置结构：
+
+```yaml
+quality:
+  conversations:
+    record: false
+    evaluate: false
+  failure_recovery_judge:
+    enabled: true
+    provider: openai
+    model: <judge-model>
+    base_url: null
+```
+
+显式 CLI/`AEGIS_FAILURE_RECOVERY_JUDGE` 覆盖 YAML Provider；YAML `model`/`base_url` 覆盖相应 Provider
+的默认环境值。OpenAI-compatible Key 使用 `AEGIS_API_KEY`，Anthropic Key 使用
+`ANTHROPIC_API_KEY`，密钥不会进入普通配置文件。配置缺失、Provider 无效或模型不可用时打印 Warning
+并回退规则结果。`quality evaluate --config`、`quality record-session --config` 和 REPL 的
+`--mcp-config` 可选择非默认配置文件。
+
+### 可靠性、不变量与边界
+
+- 未显式开启时，普通 REPL 的记录、存储和模型调用行为完全不变。
+- 一个用户 Turn 对应一个 Record；同 Session 的 Turn 共享 `session_id`，但 Execution/Trace ID 不同。
+- 实时本地 Record 和 Langfuse 使用相同确定性 Trace ID，Viewer 可精确关联。
+- 历史回填 ID 稳定，重跑不产生重复 Record，也不修改 Session 原始消息。
+- `--process-evaluate-conversations` 隐含开启记录；Judge 仍仅在存在 Failure Episode 时调用。
+- 自动评测失败不丢 Record、不影响聊天；Judge 不可用继续安全降级规则。
+- 历史缺失字段保持未知；不估算 Token、Cost、Provider 或精确 Latency。
+- 实时与历史 Record 都经过统一 Observability Sanitizer，Session 回填不会绕过密钥脱敏和大小上限。
+- `ExecutionRecord` / `ProcessEvaluationResult` Schema 继续保持 `1.0`，现有 Grader 和 Agent Loop 无需修改。
+
+### 测试与验证
+
+新增 `tests/test_conversation_quality.py`，覆盖两个实时 Turn 的 Record 隔离与共享 Session、Trace ID
+确定性、评测异常仍保存、历史 Tool Failure 重建、稳定回填 ID、SQLite CLI 回填并评测、REPL 显式记录、
+YAML Judge Provider/Model 构建及关闭配置。定向 Conversation/Process/ExecutionRecord 联合测试为
+`47 passed`，包含 Config/Viewer/Observability/Runtime 的相关联合套件为 `93 passed`；新增/相关源文件
+Ruff 通过，Conversation 与 Config 定向 mypy 通过。全仓 pytest 为
+`745 passed, 2 skipped in 537.40s`，零失败。全仓 Ruff 仍为本任务开始前已有的 18 项：官方
+Terminal-Bench Sample 13 项和既有 Aegis 文件 5 项；本次相关文件没有新增 Ruff 问题。全仓 mypy
+报告 39 项既有可选依赖/旧模块类型问题，均不在新增 Conversation Quality 模块；本次模块定向 mypy
+为零。
+
+### 权衡、限制与后续
+
+实时自动评测在 Turn 结束后同步执行；纯规则成本很低，但启用 Judge 的 Failure Turn 会增加一次模型调用
+延迟和费用，因此默认关闭。历史回填无法恢复未持久化的真实观测边界，适合规则分析和故障样本整理，不能
+替代实时记录用于精确性能/成本评测。当前 CLI 按整个 Session 回填全部有效 Turn；未来若超长 Session
+需要增量操作，可在不改变 ID 规则的前提下增加 Turn 范围过滤。
+
+### 面试式总结
+
+这次把 Process Evaluation 从“只评测专门任务和 Harbor Trial”扩展到显式选择的日常对话，同时没有让
+所有聊天默认承担存储或 Judge 成本。实时路径利用 Observability 事件保留完整证据，历史路径利用原始
+Session Message 做可审计、幂等、保守的降级重建；两条路径最终都进入同一个 ExecutionRecord 和
+ProcessEvaluator。Judge 的运行策略变成可持久配置但密钥仍与偏好分离，兼顾易用性、安全性和失败隔离。
+
+## Harbor 容器代理继承修复
+
+### 目标与原问题
+
+在 WSL 宿主机使用 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:10808` 时，Harbor
+适配器会通过进程环境回退自动把该代理转发进任务容器。容器中的回环地址指向容器自身，
+导致 Aegis 第一次模型调用在执行任何工具前以 `APIConnectionError` 失败。宿主机和容器
+直连 DashScope 均能得到预期 HTTP 响应，确认故障来自错误代理继承而非模型名、密钥或
+Provider 网络。
+
+### 实现与可靠性边界
+
+`src/aegis_agent/integrations/harbor.py` 继续允许 API Key、Base URL、Model 和
+Langfuse 设置从显式 Agent 环境或 Harbor 启动进程继承；八个大小写代理变量改为仅接受
+显式 `--ae` 值。这样宿主机回环代理不会无意进入容器，同时需要代理的用户仍能传入一个
+容器可达的代理地址。改动不改变 Agent Loop、Provider 或 Harbor 网络策略。
+
+### 参考关系与迁移决策
+
+这是根据本地 Harbor 作业日志、Docker/WSL 网络实测和 Aegis 适配器数据流独立完成的
+Aegis 修复；没有使用 Hermes 或 Claude Code 实现，也没有修改两个参考仓库。
+
+### 测试与验证
+
+新增可选 Harbor 适配器测试，覆盖八个大小写代理变量：宿主进程代理不得隐式继承，
+显式 Agent 代理必须保留。另以任务基础镜像验证容器可直连 DashScope，并确认返回预期的
+未认证 HTTP 状态而不是连接错误。Harbor 环境中的定向测试为 `16 passed`；Aegis 全仓
+测试为 `745 passed, 3 skipped`；相关源文件和测试 Ruff、`git diff --check` 均通过。
+
+### 权衡与后续
+
+如果模型端点只能通过代理访问，调用方必须把代理监听到容器可达的地址并显式使用 `--ae`
+传入；Aegis 不猜测宿主机地址，也不自动重写回环 URL。这样牺牲隐式便利性，换取跨 Docker、
+WSL 和远程 Harbor 环境的一致语义与更安全的凭据/网络边界。
+
+### 面试式总结
+
+问题不是 Provider 不可用，而是宿主和容器对 `127.0.0.1` 的网络命名空间语义不同。
+修复将代理配置从“环境回退”改为“显式跨边界传递”，并用正反测试锁定行为：宿主代理
+不会泄漏，用户明确配置的容器可达代理仍能工作。

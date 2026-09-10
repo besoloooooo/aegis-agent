@@ -463,24 +463,61 @@ Harbor repository was not modified.
 
 | Aegis file | Relationship | External reference | Notes |
 |---|---|---|---|
-| `src/aegis_agent/integrations/harbor.py` | **original adapter code** | Harbor `BaseAgent`, `BaseInstalledAgent`, custom Python import-path loading, `AgentContext` | Builds and installs the current Aegis wheel in the task environment, runs non-interactive Aegis in `/app`, preserves stdout/stderr and process failure, forwards explicit model/endpoint/credential settings, and backfills Harbor's inclusive token context. |
-| `src/aegis_agent/quality/models.py`, `store.py` | **original** | Harbor `TrialResult`; ATIF step/tool/observation concepts | Defines Aegis's provider-neutral ExecutionRecord and atomic local JSON store. It is neither a TrialResult copy nor an ATIF implementation. |
+| `src/aegis_agent/integrations/harbor.py` | **original adapter code** | Harbor `BaseAgent`, `BaseInstalledAgent`, custom Python import-path loading, `AgentContext` | Builds and installs the current Aegis wheel in the task environment, runs non-interactive Aegis in `/app`, preserves stdout/stderr and process failure, forwards explicit model/endpoint/credential settings, marks runtime records as evaluations, and backfills Harbor's inclusive token context. |
+| `src/aegis_agent/quality/models.py`, `store.py` | **original** | Harbor `TrialResult`; ATIF step/tool/observation concepts | Defines Aegis's provider-neutral ExecutionRecord, its stable conversation/task/evaluation run-kind discriminator, and atomic local JSON store. It is neither a TrialResult copy nor an ATIF implementation. |
 | `src/aegis_agent/quality/recorder.py`, `observability/composite.py` | **original additive code** | — | Reuses the existing Observability event boundary to capture the Runtime tree without duplicate instrumentation and fans out fail-open to Langfuse plus the local recorder. |
-| `src/aegis_agent/quality/adapters/harbor.py` | **original adapter code** | Harbor 0.22 `TrialResult`, `AgentContext`, job/trial log layout | Finalizes runtime records with exact job/trial/task identity, verifier rewards, combined Harbor usage, exceptions, and artifact paths while retaining detailed Aegis cache buckets. |
-| `src/aegis_agent/quality/run.py`, `src/aegis_agent/cli.py` | **original** | Harbor installed-agent process contract | Adds one-shot `aegis run` and post-verifier `aegis quality import-harbor`; the interactive REPL remains unchanged. |
+| `src/aegis_agent/quality/adapters/harbor.py` | **original adapter code** | Harbor 0.22 `TrialResult`, `AgentContext`, job/trial log layout | Finalizes runtime records with exact job/trial/task identity, verifier rewards, combined Harbor usage, exceptions, and artifact paths while retaining detailed Aegis cache buckets. Its jobs-directory sync skips current records by source/target mtime and validated evaluation identity, while containing per-result failures. |
+| `src/aegis_agent/quality/run.py`, `src/aegis_agent/cli.py` | **original** | Harbor installed-agent process contract | Adds one-shot `aegis run`, a validated run-kind boundary, and post-verifier `aegis quality import-harbor`; the interactive REPL remains unchanged. |
 | `tests/test_execution_record.py`, `tests/test_harbor_execution_record.py` | **original** | — | Deterministic runtime/usage/error/no-Langfuse/identity/CLI tests and Harbor TrialResult/verifier/artifact/sparse-data mappings. |
 
 Harbor is not added as an Aegis runtime dependency: the optional adapter is
 imported by Harbor from the Aegis source path. Consequently no new third-party
 license entry is required for this phase.
 
+### Harbor proxy-forwarding safety fix
+
+The Harbor adapter now inherits provider and observability settings as before,
+but forwards proxy variables only when explicitly supplied in the agent
+environment. This is an original Aegis reliability fix; neither Hermes nor
+Claude Code was used as a source, and neither reference repository was modified.
+
 ## Agent Quality — local Trace Viewer
 
 | Aegis file | Relationship | External reference | Notes |
 |---|---|---|---|
-| `src/aegis_agent/quality/viewer.py` | **original** | Langfuse Python SDK v4 Observations API | Read-only local HTTP service over ExecutionRecord plus optional cursor-paginated Langfuse observations. Uses v4 observation fields, exposes session identity, aggregates Model/Tool/error/usage statistics by trace, preserves zero versus unknown, sanitizes local and SDK-returned payloads, infers legacy status, and contains all remote failures. |
-| `src/aegis_agent/quality/viewer_ui.py` | **original** | — | Dependency-free three-pane Global → Session → Turn → Model/Tool/Final UI. It shows per-level usage, exact cache hit rate when all required buckets are known, errors, adjacent Model Call context growth, concise tool summaries, structured details, and collapsed raw payloads without inventing absent provider data. |
-| `src/aegis_agent/cli.py` (`quality view`) | **original** | — | Loopback-by-default viewer command with configurable port/store and optional browser opening. |
-| `tests/test_trace_viewer.py` | **original** | — | Local/cloud source separation, Global/Session/Turn summaries, zero/null usage semantics, error roll-up, old sparse records, current/legacy status inference, Model Call usage/cache aggregation, v4 API request, failure containment, HTTP detail, invalid-ID, and security-header coverage. |
+| `src/aegis_agent/quality/viewer.py` | **original** | Langfuse Python SDK v4 Observations API | Local HTTP service over ExecutionRecord plus optional cursor-paginated Langfuse observations with an explicit safety limit. Root observations remain independently addressable when execution/trace ids are reused, and Model/Tool/error/usage statistics are scoped to each root subtree rather than multiplied across a shared trace. GET trace APIs remain read-only; one explicit, lock-serialized Harbor sync POST is scoped to the configured jobs directory and protected by a per-server same-origin token. The service preserves zero versus unknown, sanitizes payloads, infers legacy status/run kind, and contains remote failures. |
+| `src/aegis_agent/quality/viewer_ui.py` | **original** | — | Dependency-free three-pane UI with one-click incremental Harbor sync and separate Conversations (Session → Turn), Evaluations (Job → Trial), and All Runs views before shared Model/Tool/Final detail. It reports loaded-root/truncation state and separates failed-run counts from error-observation counts while retaining per-level usage, evaluation reward/pass state, exact cache hit rate, adjacent Model Call context growth, concise tool summaries, structured details, and collapsed raw payloads. |
+| `src/aegis_agent/cli.py` (`quality view`) | **original** | — | Loopback-by-default viewer command with configurable port/store/Harbor jobs directory and optional browser opening. |
+| `tests/conftest.py`, `tests/test_trace_viewer.py`, `tests/test_harbor_execution_record.py` | **original** | — | Unit-test isolation forces inherited Langfuse credentials empty; deterministic coverage includes cursor pagination/truncation, repeated-trace root identity and subtree statistics, local/cloud source separation, run-kind routing, Job/Trial and Session/Turn summaries, Harbor sync, zero/null usage semantics, error roll-up, status inference, HTTP detail, invalid IDs, and security headers. |
 
 No third-party frontend or web-server dependency was added.
+
+## Agent Quality Phase 3 — Process Evaluation
+
+This phase is an Aegis offline-analysis implementation. Hermes was consulted as
+a behavioral reference for canonical tool-call signatures, idempotent versus
+mutating tool classification, repeated exact failures, and no-progress
+guardrails. Those Hermes controls operate in the live runtime; Aegis Phase 3
+does not port that controller or its blocking behavior. Instead it independently
+evaluates immutable `ExecutionRecord` data after execution. Claude Code was
+searched for a matching reusable offline process-grader unit; none suitable to
+this milestone and schema was found. Neither reference repository was modified.
+
+The later failure-recovery hybrid increment is also independently implemented
+in Aegis. It reuses Aegis's provider-neutral `ModelProvider`/`collect_response`
+boundary and the existing fail-open side-query pattern already used by Memory;
+no grader or prompt code was copied from Hermes or Claude Code. The original
+five deterministic graders remain unchanged, while rules now extract grounded
+Failure Episodes before an optional LLM judges only recovery semantics.
+
+| Aegis file | Relationship | Reference source | Notes |
+|---|---|---|---|
+| `src/aegis_agent/quality/process.py` | **original implementation informed by behavior** | Hermes `agent/tool_guardrails.py`, related guardrail tests; Aegis `memory/sidequery.py` architecture | Defines the ProcessGrader protocol, rule-first configuration/evaluator, five unchanged deterministic graders, Failure Episode extraction, and the optional `FailureRecoveryLLMGrader`. The LLM path uses one provider-neutral, grounded JSON side query only when failures exist and falls back to the unchanged rule score/status on every setup/call/validation failure. The algorithms and prompt are independently written for Aegis; no live warning/block logic was copied. |
+| `src/aegis_agent/quality/conversation.py` | **original additive code** | Aegis Observability and SessionRepository boundaries | Adds an opt-in per-root-Turn observability backend over the existing single-record recorder, plus deterministic reconstruction of historical SQLite sessions. Reconstruction uses only persisted message/tool evidence, marks inferred fields and unavailable telemetry, and is idempotent per user Turn. |
+| `src/aegis_agent/quality/models.py`, `quality/__init__.py` | **original additive code** | — | Adds optional `quality.process_evaluation`, versioned aggregate/grade models, `insufficient_data`, and public evaluator exports without changing ExecutionRecord 1.0 source fields. |
+| `src/aegis_agent/cli.py` (conversation Quality options, `quality record-session`, `quality evaluate`) | **original** | — | Opt-in live conversation capture and per-Turn auto-evaluation, historical session reconstruction, and offline record evaluation. Judge enabled/provider/model/base URL preferences can be persisted in app YAML while keys stay in environment; CLI flags remain temporary overrides and model unavailability remains fail-open. |
+| `src/aegis_agent/quality/viewer.py`, `viewer_ui.py` | **original additive code** | — | Surfaces Process score/status/issues separately from Runtime and Harbor Outcome; issue selection focuses the first affected local Step. |
+| `src/aegis_agent/quality/adapters/harbor.py` | **original compatibility change** | Harbor TrialResult lifecycle | Preserves an existing offline process result when a changed Harbor result is finalized again; `result.json` remains read-only. |
+| `tests/test_process_evaluation.py`, `tests/test_conversation_quality.py`, related Quality tests | **original** | — | Deterministic positive, negative, boundary, compatibility, CLI, Harbor-refresh, Viewer, live conversation isolation, historical reconstruction/idempotency, persistent Judge configuration, and safe-fallback contracts without real models. |
+
+No new runtime or third-party dependency was added.

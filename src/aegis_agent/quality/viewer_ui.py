@@ -54,6 +54,11 @@ VIEWER_HTML = r"""<!doctype html>
     }
     .brand h1 { margin: 0; font-size: 16px; letter-spacing: -.01em; }
     .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .view-tabs { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: rgba(13, 23, 20, .72); }
+    .view-tab { padding: 7px 11px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; font-weight: 700; }
+    .view-tab:hover { color: var(--text); background: rgba(31, 48, 43, .58); }
+    .view-tab.active { color: #07110d; background: var(--accent); }
+    .view-count { margin-left: 5px; opacity: .7; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
     .actions { display: flex; align-items: center; gap: 10px; }
     .search {
       width: 280px; padding: 10px 13px; color: var(--text);
@@ -66,6 +71,8 @@ VIEWER_HTML = r"""<!doctype html>
       background: var(--panel-2); cursor: pointer;
     }
     .refresh:hover { border-color: #40534d; }
+    .refresh.sync { color: var(--amber); border-color: rgba(245, 197, 107, .3); }
+    .refresh:disabled { opacity: .45; cursor: not-allowed; }
     .summary { padding: 10px 24px 12px; border-bottom: 1px solid var(--line-soft); }
     .summary-title { margin-bottom: 7px; color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .14em; }
     .summary-grid { display: grid; grid-template-columns: repeat(6, minmax(125px, 1fr)); gap: 9px; }
@@ -119,6 +126,8 @@ VIEWER_HTML = r"""<!doctype html>
     }
     .badge.cloud { color: var(--blue); border-color: rgba(114, 183, 255, .35); }
     .badge.local { color: var(--accent); border-color: rgba(101, 230, 173, .32); }
+    .badge.eval { color: var(--amber); border-color: rgba(245, 197, 107, .38); }
+    .badge.task { color: #c7a7ff; border-color: rgba(199, 167, 255, .32); }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: #6e817a; box-shadow: 0 0 0 3px rgba(110, 129, 122, .08); }
     .dot.ok { background: var(--accent); }
     .dot.bad { background: var(--red); }
@@ -177,6 +186,13 @@ VIEWER_HTML = r"""<!doctype html>
     .usage-cell { padding: 9px; border: 1px solid var(--line-soft); border-radius: 8px; background: rgba(11, 18, 16, .65); }
     .usage-cell label { display: block; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
     .usage-cell strong { display: block; margin-top: 3px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .process-summary { margin-top: 8px; padding: 11px; border: 1px solid rgba(114, 183, 255, .24); border-radius: 9px; background: rgba(18, 39, 50, .34); }
+    .process-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .process-score { font: 700 16px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .process-issue { width: 100%; margin-top: 6px; padding: 8px; text-align: left; color: inherit; border: 1px solid var(--line-soft); border-radius: 7px; background: rgba(10, 18, 21, .55); cursor: pointer; }
+    .process-issue:hover { border-color: rgba(114, 183, 255, .45); }
+    .process-issue strong { display: block; font-size: 11px; }
+    .process-issue span { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
     .block-title { margin: 19px 0 8px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
     pre {
       margin: 0; padding: 12px; max-height: 320px; overflow: auto;
@@ -187,6 +203,7 @@ VIEWER_HTML = r"""<!doctype html>
     details { margin-top: 20px; border-top: 1px solid var(--line-soft); }
     details summary { padding: 12px 0; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
     .error-banner { margin: 10px 12px; padding: 10px 12px; border: 1px solid rgba(245, 197, 107, .28); border-radius: 9px; color: var(--amber); background: rgba(245, 197, 107, .07); font-size: 11px; }
+    .notice-banner { margin: 10px 12px; padding: 10px 12px; border: 1px solid rgba(101, 230, 173, .28); border-radius: 9px; color: var(--accent); background: rgba(101, 230, 173, .07); font-size: 11px; }
     .spin { animation: spin .85s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (max-width: 1200px) {
@@ -202,26 +219,33 @@ VIEWER_HTML = r"""<!doctype html>
       <div class="mark">AE</div>
       <div><h1>Aegis Trace Viewer</h1><p>Runtime records with Langfuse detail</p></div>
     </div>
+    <nav class="view-tabs" aria-label="Run type">
+      <button class="view-tab active" data-view="conversation" type="button">Conversations <span id="conversation-count" class="view-count">0</span></button>
+      <button class="view-tab" data-view="evaluation" type="button">Evaluations <span id="evaluation-count" class="view-count">0</span></button>
+      <button class="view-tab" data-view="all" type="button">All Runs <span id="all-count" class="view-count">0</span></button>
+    </nav>
     <div class="actions">
       <input id="search" class="search" type="search" placeholder="Filter session, task, model, execution id…">
+      <button id="sync-harbor" class="refresh sync" type="button" disabled>⇄ Sync Harbor</button>
       <button id="refresh" class="refresh" type="button">↻ Refresh</button>
     </div>
   </header>
   <section class="summary">
-    <div class="summary-title">ALL SESSIONS</div>
+    <div id="summary-title" class="summary-title">CONVERSATIONS</div>
     <div class="summary-grid">
-      <div class="metric"><span>Sessions / Turns</span><strong id="m-count">—</strong></div>
-      <div class="metric"><span>Model / Tool Calls</span><strong id="m-calls">—</strong></div>
+      <div class="metric"><span id="m-count-label">Sessions / Turns</span><strong id="m-count">—</strong></div>
+      <div class="metric"><span id="m-calls-label">Model / Tool Calls</span><strong id="m-calls">—</strong></div>
       <div class="metric"><span>Input / Output</span><strong id="m-tokens">—</strong></div>
       <div class="metric"><span>Cache Read / Write</span><strong id="m-cache">—</strong></div>
       <div class="metric"><span>Cost</span><strong id="m-cost">—</strong></div>
-      <div class="metric"><span>Errors</span><strong id="m-errors">—</strong></div>
+      <div class="metric"><span>Failed Runs / Error Obs</span><strong id="m-errors">—</strong></div>
     </div>
   </section>
   <main class="workspace">
     <section class="pane">
-      <div class="pane-head"><h2>Sessions</h2><span id="source-status" class="small">Loading…</span></div>
+      <div class="pane-head"><h2 id="list-title">Conversations</h2><span id="source-status" class="small">Loading…</span></div>
       <div id="list-error"></div>
+      <div id="sync-notice"></div>
       <div id="run-list" class="run-list"></div>
     </section>
     <section class="pane">
@@ -236,7 +260,7 @@ VIEWER_HTML = r"""<!doctype html>
   </main>
 </div>
 <script>
-  const state = { executions: [], filtered: [], selected: null, selectedSession: null, detail: null, node: null, errorRollups: new WeakSet(), expandedSessions: new Set(), sessionsInitialized: false };
+  const state = { executions: [], filtered: [], view: "conversation", selected: null, selectedSession: null, detail: null, node: null, errorRollups: new WeakSet(), expandedSessions: new Set(), initializedViews: new Set(), syncToken: null, harborJobsDir: null, harborJobsExists: false };
   const $ = (id) => document.getElementById(id);
   const text = (value, fallback = "—") => value === null || value === undefined || value === "" ? fallback : String(value);
   const optionalNumber = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
@@ -297,6 +321,10 @@ VIEWER_HTML = r"""<!doctype html>
     return node;
   };
   const sessionKey = (item) => item.session_id ? `session:${item.session_id}` : `execution:${item.id}`;
+  const evaluationKey = (item) => item.job_id ? `job:${item.job_id}` : `evaluation:${item.id}`;
+  const runKind = (item) => ["conversation", "task", "evaluation"].includes(item?.run_kind) ? item.run_kind : "conversation";
+  const inActiveView = (item) => state.view === "all" || runKind(item) === state.view;
+  const groupKey = (item) => runKind(item) === "evaluation" ? evaluationKey(item) : sessionKey(item);
   const shortId = (value) => value && value.length > 16 ? `…${value.slice(-12)}` : text(value, "no session id");
   const first = (...values) => values.find((value) => value !== null && value !== undefined && value !== "");
   const sumState = (values) => {
@@ -326,6 +354,7 @@ VIEWER_HTML = r"""<!doctype html>
       : null;
   };
   const percent = (value) => optionalNumber(value) === null ? "—" : `${Number(value).toFixed(1)}%`;
+  const processScore = (value) => optionalNumber(value) === null ? "—" : `${Math.round(Number(value) * 100)} / 100`;
   const usageOf = (item) => {
     const usage = item?.usage || item?.usageDetails || {};
     const cost = item?.costDetails || {};
@@ -357,6 +386,7 @@ VIEWER_HTML = r"""<!doctype html>
       : cacheHitRate({cacheRead: cacheRead.value, inputIncludingCache: cacheInput.value, total: null, output: null, input: null, cacheWrite: null});
     return {
       turns: items.length,
+      failedRuns: items.filter((item) => item.has_error || optionalNumber(item.stats?.errors) > 0 || item.success === false).length,
       duration: sumState(items.map((item) => item.latency_ms)),
       modelCalls: sumState(stats.map((item) => item.modelCalls)),
       toolCalls: sumState(stats.map((item) => item.toolCalls)),
@@ -391,6 +421,20 @@ VIEWER_HTML = r"""<!doctype html>
     if (items.length && items.every((item) => item.success === true)) return {label: "OK", className: "ok"};
     return {label: "UNKNOWN", className: ""};
   };
+  const evaluationStatusOf = (items) => {
+    if (items.some((item) => item.has_error || optionalNumber(item.stats?.errors) > 0 || item.success === false)) return {label: "ERROR", className: "bad"};
+    if (items.length && items.every((item) => item.passed === true)) return {label: "PASS", className: "ok"};
+    if (items.some((item) => item.passed === false)) return {label: "FAIL", className: "warn"};
+    return {label: "UNSCORED", className: ""};
+  };
+  const primaryReward = (item) => optionalNumber(first(item?.reward, item?.rewards?.reward, item?.rewards?.pass));
+  const displayTaskId = (value) => {
+    const parsed = structured(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return value;
+    const path = first(parsed.path, parsed.id, parsed.name);
+    if (path && Object.keys(parsed).length === 1) return path;
+    return Object.entries(parsed).map(([key, item]) => `${key}: ${item}`).join(" · ");
+  };
   const coreValue = (value, keys, depth = 0, seen = new Set()) => {
     const parsed = structured(value);
     if (!parsed || typeof parsed !== "object" || depth > 5 || seen.has(parsed)) return null;
@@ -422,9 +466,14 @@ VIEWER_HTML = r"""<!doctype html>
     target.replaceChildren();
     if (value) target.append(element("div", "error-banner", value));
   };
+  const syncBanner = (value, failed = false) => {
+    const target = $("sync-notice");
+    target.replaceChildren();
+    if (value) target.append(element("div", failed ? "error-banner" : "notice-banner", value));
+  };
 
-  async function fetchJSON(url) {
-    const response = await fetch(url, { cache: "no-store" });
+  async function fetchJSON(url, options = {}) {
+    const response = await fetch(url, { cache: "no-store", ...options });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     return payload;
@@ -436,6 +485,14 @@ VIEWER_HTML = r"""<!doctype html>
       const payload = await fetchJSON("/api/executions");
       state.executions = payload.executions || [];
       const status = payload.status || {};
+      state.syncToken = status.sync_token || null;
+      state.harborJobsDir = status.harbor_jobs_dir || null;
+      state.harborJobsExists = Boolean(status.harbor_jobs_exists);
+      const syncButton = $("sync-harbor");
+      syncButton.disabled = !state.harborJobsExists;
+      syncButton.title = state.harborJobsExists
+        ? `Import new or changed Harbor trials from ${state.harborJobsDir}`
+        : `Harbor jobs directory not found: ${state.harborJobsDir || "not configured"}`;
       $("source-status").textContent = status.langfuse_enabled ? "Local · loading Langfuse…" : "Local records";
       errorBanner($("list-error"), null);
       updateMetrics();
@@ -458,10 +515,13 @@ VIEWER_HTML = r"""<!doctype html>
     try {
       const payload = await fetchJSON("/api/langfuse/roots");
       const cloud = payload.executions || [];
-      const byTrace = new Map(state.executions.filter((item) => item.trace_id).map((item) => [item.trace_id, item]));
+      const localByTrace = new Map(state.executions.filter((item) => item.source === "local" && item.trace_id).map((item) => [item.trace_id, item]));
+      const matchedLocalTraces = new Set();
+      const cloudIds = new Set(state.executions.filter((item) => item.source === "langfuse").map((item) => item.id));
       for (const item of cloud) {
-        const existing = byTrace.get(item.trace_id);
-        if (existing) {
+        const existing = !matchedLocalTraces.has(item.trace_id) ? localByTrace.get(item.trace_id) : null;
+        if (existing && item.trace_id) {
+          matchedLocalTraces.add(item.trace_id);
           existing.langfuse_available = true;
           if (!existing.session_id) existing.session_id = item.session_id;
           if (existing.success === null || existing.success === undefined) existing.success = item.success;
@@ -469,15 +529,22 @@ VIEWER_HTML = r"""<!doctype html>
           existing.usage = mergeKnown(existing.usage, item.usage);
           existing.stats = mergeStats(existing.stats, item.stats);
         }
-        else {
+        else if (!cloudIds.has(item.id)) {
           state.executions.push(item);
-          if (item.trace_id) byTrace.set(item.trace_id, item);
+          cloudIds.add(item.id);
         }
       }
       state.executions.sort((a, b) => text(b.started_at, "").localeCompare(text(a.started_at, "")));
-      $("source-status").textContent = payload.error ? "Local records" : "Local + Langfuse";
+      const loadedRoots = optionalNumber(payload.loaded_root_count) ?? cloud.length;
+      $("source-status").textContent = payload.error
+        ? "Local records"
+        : payload.has_more
+          ? `Local + Langfuse · first ${compact(loadedRoots)} roots`
+          : `Local + Langfuse · ${compact(loadedRoots)} roots`;
       const warning = payload.error
         ? `Langfuse unavailable: ${payload.error}`
+        : payload.has_more
+          ? `Langfuse has more data; showing the newest ${compact(loadedRoots)} roots (safety limit ${compact(payload.root_limit)}).`
         : payload.stats_error || payload.usage_error
           ? `Trace list loaded; summary unavailable: ${payload.stats_error || payload.usage_error}`
           : null;
@@ -491,30 +558,70 @@ VIEWER_HTML = r"""<!doctype html>
     }
   }
 
+  async function syncHarbor() {
+    const button = $("sync-harbor");
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "Syncing…";
+    syncBanner(null);
+    try {
+      const payload = await fetchJSON("/api/harbor/sync", {
+        method: "POST",
+        headers: {"X-Aegis-Sync-Token": state.syncToken || ""},
+      });
+      await loadExecutions(false);
+      setView("evaluation");
+      const message = `Harbor sync complete: ${payload.imported} imported · ${payload.unchanged} unchanged · ${payload.failed} failed`;
+      const firstError = payload.errors?.[0];
+      syncBanner(firstError ? `${message} · ${firstError.path}: ${firstError.error}` : message, payload.failed > 0);
+    } catch (error) {
+      syncBanner(`Harbor sync failed: ${error.message}`, true);
+    } finally {
+      button.textContent = originalLabel;
+      button.disabled = !state.harborJobsExists;
+    }
+  }
+
   function updateMetrics() {
-    const sessions = new Set(state.executions.map(sessionKey));
-    $("m-count").textContent = `${compact(sessions.size)} / ${compact(state.executions.length)}`;
-    const aggregate = aggregateExecutions(state.executions);
-    $("m-calls").textContent = `${displayTotal(aggregate.modelCalls)} / ${displayTotal(aggregate.toolCalls)}`;
+    const visible = state.executions.filter(inActiveView);
+    $("conversation-count").textContent = state.executions.filter((item) => runKind(item) === "conversation").length;
+    $("evaluation-count").textContent = state.executions.filter((item) => runKind(item) === "evaluation").length;
+    $("all-count").textContent = state.executions.length;
+    const groups = new Set(visible.map(groupKey));
+    $("summary-title").textContent = state.view === "conversation" ? "CONVERSATIONS" : state.view === "evaluation" ? "HARBOR EVALUATIONS" : "ALL RUNS";
+    $("list-title").textContent = state.view === "conversation" ? "Conversations" : state.view === "evaluation" ? "Evaluation Jobs" : "All Runs";
+    $("m-count-label").textContent = state.view === "evaluation" ? "Jobs / Trials" : state.view === "conversation" ? "Sessions / Turns" : "Groups / Runs";
+    $("m-count").textContent = `${compact(groups.size)} / ${compact(visible.length)}`;
+    const aggregate = aggregateExecutions(visible);
+    if (state.view === "evaluation") {
+      const passed = visible.filter((item) => item.passed === true).length;
+      const failed = visible.filter((item) => item.passed === false).length;
+      $("m-calls-label").textContent = "Passed / Failed";
+      $("m-calls").textContent = `${compact(passed)} / ${compact(failed)}`;
+    } else {
+      $("m-calls-label").textContent = "Model / Tool Calls";
+      $("m-calls").textContent = `${displayTotal(aggregate.modelCalls)} / ${displayTotal(aggregate.toolCalls)}`;
+    }
     $("m-tokens").textContent = `↑${displayTotal(aggregate.input)} / ↓${displayTotal(aggregate.output)}`;
     $("m-cache").textContent = `R ${displayTotal(aggregate.cacheRead)} / W ${displayTotal(aggregate.cacheWrite)} · ${percent(aggregate.cacheHitRate)}`;
     $("m-cost").textContent = displayTotal(aggregate.cost, money);
-    $("m-errors").textContent = displayTotal(aggregate.errors);
+    $("m-errors").textContent = `${compact(aggregate.failedRuns)} / ${displayTotal(aggregate.errors)}`;
   }
 
   function applyFilter() {
+    const visible = state.executions.filter(inActiveView);
     const query = $("search").value.trim().toLowerCase();
     if (!query) {
-      state.filtered = [...state.executions];
+      state.filtered = visible;
       renderRuns();
       return;
     }
-    const matchedSessions = new Set(state.executions.filter((item) => {
-      const haystack = [item.id, item.execution_id, item.trace_id, item.session_id, item.task, item.model, item.provider, item.name]
+    const matchedGroups = new Set(visible.filter((item) => {
+      const haystack = [item.id, item.execution_id, item.trace_id, item.session_id, item.job_id, item.trial_id, item.task_id, item.task, item.model, item.provider, item.name, item.run_kind, item.reward]
         .filter(Boolean).join(" ").toLowerCase();
       return haystack.includes(query);
-    }).map(sessionKey));
-    state.filtered = state.executions.filter((item) => matchedSessions.has(sessionKey(item)));
+    }).map(groupKey));
+    state.filtered = visible.filter((item) => matchedGroups.has(groupKey(item)));
     renderRuns();
   }
 
@@ -527,7 +634,7 @@ VIEWER_HTML = r"""<!doctype html>
     }
     const grouped = new Map();
     for (const item of state.filtered) {
-      const key = sessionKey(item);
+      const key = groupKey(item);
       if (!grouped.has(key)) grouped.set(key, []);
       grouped.get(key).push(item);
     }
@@ -535,13 +642,14 @@ VIEWER_HTML = r"""<!doctype html>
       items.sort((a, b) => text(a.started_at, "").localeCompare(text(b.started_at, "")));
       return {key, items, latest: items[items.length - 1]?.started_at};
     }).sort((a, b) => text(b.latest, "").localeCompare(text(a.latest, "")));
-    if (!state.sessionsInitialized && groups.length) {
+    if (!state.initializedViews.has(state.view) && groups.length) {
       state.expandedSessions.add(groups[0].key);
       state.selectedSession = groups[0].key;
-      state.sessionsInitialized = true;
+      state.initializedViews.add(state.view);
     }
     const searching = Boolean($("search").value.trim());
     for (const group of groups) {
+      const isEvaluation = group.items.some((item) => runKind(item) === "evaluation");
       const expanded = searching || state.expandedSessions.has(group.key);
       const session = element("section", `session${expanded ? "" : " collapsed"}${state.selectedSession === group.key ? " active" : ""}`);
       const head = element("button", "session-head");
@@ -550,13 +658,23 @@ VIEWER_HTML = r"""<!doctype html>
       head.append(element("span", "session-chevron", "▾"));
       const copy = element("span", "session-copy");
       const firstTask = group.items.find((item) => item.task)?.task;
-      copy.append(element("div", "session-title", firstTask || "Untitled session"));
-      const sessionId = group.items.find((item) => item.session_id)?.session_id;
-      copy.append(element("div", "session-sub", `${group.items.length} ${group.items.length === 1 ? "turn" : "turns"} · ${shortId(sessionId)} · ${when(group.latest)}`));
       const sessionAggregate = aggregateExecutions(group.items);
-      copy.append(element("div", "session-stats", `${displayTotal(sessionAggregate.duration, elapsed)} · ↑${displayTotal(sessionAggregate.input)} ↓${displayTotal(sessionAggregate.output)} · Cache R ${displayTotal(sessionAggregate.cacheRead)} · Hit ${percent(sessionAggregate.cacheHitRate)} · ${displayTotal(sessionAggregate.cost, money)}`));
+      if (isEvaluation) {
+        const jobId = group.items.find((item) => item.job_id)?.job_id;
+        const passed = group.items.filter((item) => item.passed === true).length;
+        const rewards = group.items.map(primaryReward).filter((value) => value !== null);
+        const meanReward = rewards.length ? rewards.reduce((sum, value) => sum + value, 0) / rewards.length : null;
+        copy.append(element("div", "session-title", jobId ? `Job ${shortId(jobId)}` : firstTask || "Harbor evaluation"));
+        copy.append(element("div", "session-sub", `${group.items.length} ${group.items.length === 1 ? "trial" : "trials"} · ${when(group.latest)}`));
+        copy.append(element("div", "session-stats", `Pass ${passed}/${group.items.length} · Reward ${compact(meanReward)} · ${displayTotal(sessionAggregate.duration, elapsed)} · ↑${displayTotal(sessionAggregate.input)} ↓${displayTotal(sessionAggregate.output)}`));
+      } else {
+        const sessionId = group.items.find((item) => item.session_id)?.session_id;
+        copy.append(element("div", "session-title", firstTask || (state.view === "all" ? "Standalone task" : "Untitled session")));
+        copy.append(element("div", "session-sub", `${group.items.length} ${group.items.length === 1 ? "turn" : "turns"} · ${shortId(sessionId)} · ${when(group.latest)}`));
+        copy.append(element("div", "session-stats", `${displayTotal(sessionAggregate.duration, elapsed)} · ↑${displayTotal(sessionAggregate.input)} ↓${displayTotal(sessionAggregate.output)} · Cache R ${displayTotal(sessionAggregate.cacheRead)} · Hit ${percent(sessionAggregate.cacheHitRate)} · ${displayTotal(sessionAggregate.cost, money)}`));
+      }
       head.append(copy);
-      const aggregate = statusOf(group.items);
+      const aggregate = isEvaluation ? evaluationStatusOf(group.items) : statusOf(group.items);
       const sessionStatus = element("span", "state");
       sessionStatus.append(element("i", `dot ${aggregate.className}`));
       sessionStatus.append(document.createTextNode(aggregate.label));
@@ -581,17 +699,21 @@ VIEWER_HTML = r"""<!doctype html>
           button.type = "button";
           button.addEventListener("click", () => selectExecution(item.id));
           const top = element("div", "run-top");
-          top.append(element("div", "run-title", `Turn ${index + 1}`));
-          const turnStatusValue = statusOf([item]);
+          top.append(element("div", "run-title", isEvaluation ? item.task || `Trial ${index + 1}` : `Turn ${index + 1}`));
+          const turnStatusValue = isEvaluation ? evaluationStatusOf([item]) : statusOf([item]);
           const turnStatus = element("span", "state");
           turnStatus.append(element("i", `dot ${turnStatusValue.className}`));
           turnStatus.append(document.createTextNode(turnStatusValue.label));
           top.append(turnStatus);
           button.append(top);
-          button.append(element("div", "run-task", item.task || item.execution_id || item.trace_id || "No task text"));
+          button.append(element("div", "run-task", isEvaluation ? `Trial ${shortId(item.trial_id || item.execution_id)}${item.task_id ? ` · ${displayTaskId(item.task_id)}` : ""}` : item.task || item.execution_id || item.trace_id || "No task text"));
           const turn = aggregateExecutions([item]);
-          button.append(element("div", "turn-summary", `${displayTotal(turn.duration, elapsed)} · ${displayTotal(turn.modelCalls)} Model · ${displayTotal(turn.toolCalls)} Tool\n↑${displayTotal(turn.input)} ↓${displayTotal(turn.output)} · Cache R ${displayTotal(turn.cacheRead)}/W ${displayTotal(turn.cacheWrite)} · Hit ${percent(turn.cacheHitRate)} · ${displayTotal(turn.cost, money)}`));
+          const evaluationPrefix = isEvaluation ? `Reward ${compact(primaryReward(item))} · ` : "";
+          const processPrefix = item.process_status ? `Process ${processScore(item.process_score)} ${String(item.process_status).toUpperCase()} · ` : "";
+          button.append(element("div", "turn-summary", `${evaluationPrefix}${processPrefix}${displayTotal(turn.duration, elapsed)} · ${displayTotal(turn.modelCalls)} Model · ${displayTotal(turn.toolCalls)} Tool\n↑${displayTotal(turn.input)} ↓${displayTotal(turn.output)} · Cache R ${displayTotal(turn.cacheRead)}/W ${displayTotal(turn.cacheWrite)} · Hit ${percent(turn.cacheHitRate)} · ${displayTotal(turn.cost, money)}`));
           const meta = element("div", "run-meta");
+          if (isEvaluation) meta.append(badge("HARBOR", "eval"));
+          else if (runKind(item) === "task") meta.append(badge("TASK", "task"));
           meta.append(badge(item.source === "local" ? "LOCAL" : "CLOUD", item.source === "local" ? "local" : "cloud"));
           if (item.langfuse_available && item.source === "local") meta.append(badge("LF", "cloud"));
           meta.append(document.createTextNode(`${when(item.started_at)} · ${elapsed(item.latency_ms)}`));
@@ -610,7 +732,7 @@ VIEWER_HTML = r"""<!doctype html>
     state.node = null;
     const selectedSummary = state.executions.find((item) => item.id === id);
     if (selectedSummary) {
-      state.selectedSession = sessionKey(selectedSummary);
+      state.selectedSession = groupKey(selectedSummary);
       state.expandedSessions.add(state.selectedSession);
     }
     renderRuns();
@@ -638,7 +760,8 @@ VIEWER_HTML = r"""<!doctype html>
       const cloud = await fetchJSON(`/api/langfuse/traces/${encodeURIComponent(traceId)}`);
       if (state.detail?.langfuse?.trace_id !== traceId) return;
       state.detail.langfuse = cloud;
-      const summary = state.executions.find((item) => item.trace_id === traceId);
+      const matchingSummaries = state.executions.filter((item) => item.trace_id === traceId);
+      const summary = matchingSummaries.length === 1 ? matchingSummaries[0] : null;
       if (summary && cloud.usage) {
         summary.usage = mergeKnown(summary.usage, cloud.usage);
         summary.stats = mergeStats(summary.stats, cloud.stats);
@@ -664,9 +787,9 @@ VIEWER_HTML = r"""<!doctype html>
     state.errorRollups = new WeakSet();
     let rendered = false;
     if (state.selectedSession) {
-      const sessionItems = state.executions.filter((item) => sessionKey(item) === state.selectedSession);
+      const sessionItems = state.executions.filter((item) => groupKey(item) === state.selectedSession);
       if (sessionItems.length) {
-        renderSessionSummary(target, sessionItems);
+        renderGroupSummary(target, sessionItems);
         rendered = true;
       }
     }
@@ -698,29 +821,45 @@ VIEWER_HTML = r"""<!doctype html>
     else if (langfuse.observations?.length) showDetail(langfuse.observations[0], "Langfuse");
   }
 
-  function renderSessionSummary(target, items) {
+  function renderGroupSummary(target, items) {
     const aggregate = aggregateExecutions(items);
+    const isEvaluation = items.some((item) => runKind(item) === "evaluation");
     const session = element("section", "session-summary");
     const head = element("div", "session-summary-head");
-    head.append(element("strong", "", "SESSION SUMMARY"));
-    const status = statusOf(items);
+    head.append(element("strong", "", isEvaluation ? "EVALUATION JOB SUMMARY" : "SESSION SUMMARY"));
+    const status = isEvaluation ? evaluationStatusOf(items) : statusOf(items);
     const statusNode = element("span", "state");
     statusNode.append(element("i", `dot ${status.className}`));
     statusNode.append(document.createTextNode(status.label));
     head.append(statusNode);
     session.append(head);
     const grid = element("div", "summary-mini-grid");
-    const values = [
-      ["Turns", compact(aggregate.turns)],
-      ["Model calls", displayTotal(aggregate.modelCalls)],
-      ["Tool calls", displayTotal(aggregate.toolCalls)],
-      ["Duration", displayTotal(aggregate.duration, elapsed)],
-      ["Input / Output", `↑${displayTotal(aggregate.input)} / ↓${displayTotal(aggregate.output)}`],
-      ["Cache read / write", `R ${displayTotal(aggregate.cacheRead)} / W ${displayTotal(aggregate.cacheWrite)}`],
-      ["Cache hit rate", percent(aggregate.cacheHitRate)],
-      ["Cost", displayTotal(aggregate.cost, money)],
-      ["Errors", displayTotal(aggregate.errors)],
-    ];
+    const passed = items.filter((item) => item.passed === true).length;
+    const rewards = items.map(primaryReward).filter((value) => value !== null);
+    const meanReward = rewards.length ? rewards.reduce((sum, value) => sum + value, 0) / rewards.length : null;
+    const values = isEvaluation
+      ? [
+          ["Trials", compact(items.length)],
+          ["Passed", `${passed} / ${items.length}`],
+          ["Mean reward", compact(meanReward)],
+          ["Duration", displayTotal(aggregate.duration, elapsed)],
+          ["Input / Output", `↑${displayTotal(aggregate.input)} / ↓${displayTotal(aggregate.output)}`],
+          ["Cache read / write", `R ${displayTotal(aggregate.cacheRead)} / W ${displayTotal(aggregate.cacheWrite)}`],
+          ["Cache hit rate", percent(aggregate.cacheHitRate)],
+          ["Cost", displayTotal(aggregate.cost, money)],
+          ["Failed runs / Error obs", `${compact(aggregate.failedRuns)} / ${displayTotal(aggregate.errors)}`],
+        ]
+      : [
+          ["Turns", compact(aggregate.turns)],
+          ["Model calls", displayTotal(aggregate.modelCalls)],
+          ["Tool calls", displayTotal(aggregate.toolCalls)],
+          ["Duration", displayTotal(aggregate.duration, elapsed)],
+          ["Input / Output", `↑${displayTotal(aggregate.input)} / ↓${displayTotal(aggregate.output)}`],
+          ["Cache read / write", `R ${displayTotal(aggregate.cacheRead)} / W ${displayTotal(aggregate.cacheWrite)}`],
+          ["Cache hit rate", percent(aggregate.cacheHitRate)],
+          ["Cost", displayTotal(aggregate.cost, money)],
+          ["Failed runs / Error obs", `${compact(aggregate.failedRuns)} / ${displayTotal(aggregate.errors)}`],
+        ];
     for (const [label, value] of values) {
       const cell = element("div", "summary-mini");
       cell.append(element("label", "", label));
@@ -895,6 +1034,7 @@ VIEWER_HTML = r"""<!doctype html>
         const status = rolledNodeStatus(item, source);
         const node = element("button", `node${depth === 0 ? " root" : ""}${status.className === "bad" ? " error" : ""}`);
         node.type = "button";
+        if (source === "local" && id) node.dataset.stepId = id;
         node.style.setProperty("--indent", `${Math.min(depth, 7) * 20}px`);
         node.addEventListener("click", () => {
           document.querySelectorAll(".node.active").forEach((entry) => entry.classList.remove("active"));
@@ -973,6 +1113,48 @@ VIEWER_HTML = r"""<!doctype html>
     target.append(fold);
   }
 
+  function appendProcessEvaluation(target, evaluation) {
+    if (!evaluation) return;
+    target.append(element("div", "block-title", "Process Evaluation"));
+    const box = element("section", "process-summary");
+    const head = element("div", "process-head");
+    head.append(element("strong", "process-score", processScore(evaluation.overall_score)));
+    const status = String(evaluation.status || "unknown").toUpperCase();
+    const stateNode = element("span", "state");
+    stateNode.append(element("i", `dot ${status === "PASS" ? "ok" : status === "FAIL" ? "bad" : "warn"}`));
+    stateNode.append(document.createTextNode(status));
+    head.append(stateNode);
+    box.append(head);
+    box.append(element("div", "node-sub", text(evaluation.summary)));
+    const grades = Array.isArray(evaluation.grades) ? evaluation.grades : [];
+    const issues = grades.filter((grade) => grade.status !== "pass");
+    for (const grade of issues) {
+      const issue = element("button", "process-issue");
+      issue.type = "button";
+      issue.append(element("strong", "", `${String(grade.status || "issue").toUpperCase()} · ${text(grade.grader_name).replaceAll("_", " ")} · ${text(grade.severity)}`));
+      const steps = Array.isArray(grade.affected_steps) && grade.affected_steps.length ? ` · Steps ${grade.affected_steps.join(" → ")}` : "";
+      issue.append(element("span", "", `${text(grade.message)}${steps}`));
+      if (Array.isArray(grade.affected_steps) && grade.affected_steps.length) {
+        issue.addEventListener("click", () => {
+          const match = [...document.querySelectorAll(".node[data-step-id]")]
+            .find((node) => node.dataset.stepId === String(grade.affected_steps[0]));
+          if (match) {
+            match.click();
+            match.scrollIntoView({behavior: "smooth", block: "center"});
+          }
+        });
+      } else {
+        issue.disabled = true;
+      }
+      box.append(issue);
+    }
+    const passed = grades.filter((grade) => grade.status === "pass");
+    if (passed.length) {
+      box.append(element("div", "node-sub", `Passed: ${passed.map((grade) => text(grade.grader_name).replaceAll("_", " ")).join(", ")}`));
+    }
+    target.append(box);
+  }
+
   function showDetail(item, source) {
     $("detail-source").textContent = source;
     const target = $("detail");
@@ -1038,17 +1220,27 @@ VIEWER_HTML = r"""<!doctype html>
 
     if (kind === "execution") {
       const summary = state.executions.find((value) => value.id === state.selected);
+      appendField(target, "Run type", String(summary?.run_kind || item.run_kind || "task").toUpperCase());
       appendField(target, "Execution", item.identity?.execution_id);
       appendField(target, "Trace", item.identity?.trace_id);
       appendField(target, "Session", item.identity?.session_id);
+      appendField(target, "Job", item.identity?.job_id);
+      appendField(target, "Trial", item.identity?.trial_id);
+      appendField(target, "Task ID", displayTaskId(item.identity?.task_id));
       appendField(target, "Model", item.agent?.model);
       appendField(target, "Provider", item.agent?.provider);
-      appendField(target, "Status", summary ? statusOf([summary]).label : item.execution?.success === true ? "OK" : item.execution?.success === false ? "ERROR" : "UNKNOWN");
+      appendField(target, "Outcome", summary
+        ? (runKind(summary) === "evaluation" ? evaluationStatusOf([summary]) : statusOf([summary])).label
+        : item.execution?.success === true ? "OK" : item.execution?.success === false ? "ERROR" : "UNKNOWN");
       appendField(target, "Runtime Result", item.execution?.success === true ? "SUCCESS" : item.execution?.success === false ? "FAILED" : "UNKNOWN");
+      appendField(target, "Harbor Verifier", item.evaluation?.passed === true ? "PASS" : item.evaluation?.passed === false ? "FAIL" : null);
+      appendField(target, "Reward", primaryReward(item.evaluation));
       appendField(target, "Duration", elapsed(item.execution?.latency_ms));
+      appendProcessEvaluation(target, item.quality?.process_evaluation);
       appendUsage(target, item);
       appendBlock(target, "Response", item.execution?.final_output);
       appendBlock(target, "Error", item.execution?.error);
+      appendBlock(target, "Evaluation", item.evaluation);
       appendRaw(target, item);
       return;
     }
@@ -1063,7 +1255,29 @@ VIEWER_HTML = r"""<!doctype html>
     appendRaw(target, item);
   }
 
+  function setView(view) {
+    state.view = view;
+    document.querySelectorAll(".view-tab").forEach((tab) => {
+      const active = tab.dataset.view === view;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-pressed", String(active));
+    });
+    state.selected = null;
+    state.selectedSession = null;
+    state.detail = null;
+    state.node = null;
+    updateMetrics();
+    applyFilter();
+    if (state.filtered.length) selectExecution(state.filtered[0].id);
+    else {
+      $("trace").replaceChildren(element("div", "empty", view === "evaluation" ? "No Harbor evaluations imported yet." : "No matching executions."));
+      $("detail").replaceChildren(element("div", "detail-empty", "Choose a run to inspect its data."));
+    }
+  }
+
+  document.querySelectorAll(".view-tab").forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
   $("search").addEventListener("input", applyFilter);
+  $("sync-harbor").addEventListener("click", syncHarbor);
   $("refresh").addEventListener("click", () => loadExecutions(true));
   loadExecutions(false);
 </script>

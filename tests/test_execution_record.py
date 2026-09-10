@@ -34,6 +34,7 @@ def test_runtime_observability_builds_and_persists_execution_record(tmp_path):
     execution_id = "trial-123"
     trace_id = deterministic_trace_id(execution_id)
     record = ExecutionRecord(identity=ExecutionIdentity(execution_id=execution_id))
+    assert record.run_kind == "task"
     store = ExecutionRecordStore(tmp_path)
     recorder = ExecutionRecorder(record, on_complete=store.save)
     provider = FakeModelProvider(
@@ -120,6 +121,8 @@ def test_noninteractive_cli_uses_selected_provider_and_writes_record(tmp_path):
             str(output_path),
             "--records-dir",
             str(tmp_path / "records"),
+            "--run-kind",
+            "evaluation",
             "--no-subagents",
         ],
     )
@@ -131,4 +134,23 @@ def test_noninteractive_cli_uses_selected_provider_and_writes_record(tmp_path):
     assert payload["final_text"] == "Echo: hello"
     record = ExecutionRecord.model_validate_json(output_path.read_text(encoding="utf-8"))
     assert record.agent.provider == "fake"
+    assert record.run_kind == "evaluation"
     assert record.identity.trace_id == deterministic_trace_id("trial-cli")
+
+
+def test_noninteractive_cli_rejects_unknown_run_kind():
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "--instruction",
+            "hello",
+            "--model-backend",
+            "fake",
+            "--run-kind",
+            "benchmark-ish",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "unsupported run kind: benchmark-ish" in result.output

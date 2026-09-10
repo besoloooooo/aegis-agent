@@ -45,8 +45,11 @@
 **代理质量基础**
 - 质量阶段 0 —— 可选 Langfuse 端到端追踪，覆盖 Agent 运行、模型调用、工具调用、子代理与最终结果
 - 质量阶段 1–2 —— Harbor 自定义代理集成，以及一个与提供者无关的 `ExecutionRecord`，
-  将运行时步骤、用量、Harbor 验证器结果与产物关联起来
-- 本地只读 Trace Viewer，支持 Global → Session → Turn → Observation 汇总及可选 Langfuse v4 详情
+  将运行时步骤、用量、Harbor 验证器结果与产物关联起来，并对代理转发采用容器安全的显式启用策略
+- 质量阶段 3 —— 规则优先、可解释的 Process Evaluation，包含可选的失败恢复 LLM Judge、
+  可选的实时/历史普通对话 Record、CLI 批量评测，以及可定位到 Trace Step 的 Viewer Issue
+- 本地 Trace Viewer，支持一键同步 Harbor、按游标分页读取 Langfuse Root、分栏展示
+  日常对话/评测/全部运行，并明确区分失败 Run 与错误 Observation
 
 ---
 
@@ -61,7 +64,7 @@ src/aegis_agent/
 ├── events.py       # 模型事件流
 ├── agents/         # 子代理、团队、代理间消息传递
 ├── observability/  # fail-open 追踪 API、脱敏、Langfuse 适配器
-├── quality/        # ExecutionRecord、本地存储、Harbor 结果适配器
+├── quality/        # ExecutionRecord、Process Evaluation、本地存储、Harbor 适配器
 ├── integrations/   # 可选的对外编排器适配器（Harbor）
 ├── models/         # 提供者无关协议、fake / OpenAI / Anthropic 适配器
 ├── tools/          # 工具注册表、执行器、内置工具
@@ -343,6 +346,11 @@ PYTHONPATH=../aegis-agent/src uv run harbor run \
   --ae LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL"
 ```
 
+宿主机代理变量不会被隐式复制进任务容器。`127.0.0.1:10808` 之类的回环代理在
+容器中会指向容器自身，并导致模型 `APIConnectionError`。如果提供者确实需要代理，
+应先使用容器可达的代理地址，再通过 `--ae HTTP_PROXY=...` / `--ae HTTPS_PROXY=...`
+显式传入。
+
 适配器会在 Harbor 任务环境中安装当前的 Aegis wheel，并在 `/app` 中运行工具。
 Harbor 的试验 UUID 成为 Aegis 的 `execution_id`；Langfuse trace id 由它
 确定性派生，因此无需时间戳匹配。运行时记录写入试验的 `agent/` 日志之下。
@@ -363,10 +371,23 @@ uv run aegis quality import-harbor ../harbor/jobs/<job-directory>
 uv run aegis quality view
 ```
 
+点击 **Sync Harbor** 即可从 `~/harbor/jobs` 导入所有新增或发生变化的已完成 Trial；已经同步且没有
+变化的记录会直接跳过。使用 `--harbor-jobs-dir PATH` 或 `AEGIS_HARBOR_JOBS_DIR` 可指定其他位置。
+需要只导入某一个 Result 或 Job 时，仍可使用 `quality import-harbor` 命令。
+
 查看器打开 `http://127.0.0.1:8765`，立即显示本地 ExecutionRecord，并通过 SDK 的 v4
-Observations API 在后台加载最近的 Langfuse 根 Observation 及每个 Trace 的详情。页面层级统一为
-Global（`ALL SESSIONS`）→ Session → Turn → Model/Tool/Final；各层按需展示调用次数、耗时、
-Input/Output Token、Cache Read/Write、缓存命中率、Cost 和错误状态。缓存命中率定义为
+Observations API 在后台按游标分页加载 Langfuse 根 Observation（最多 1,000 条；达到安全上限时
+页面会明确提示）及每个 Trace 的详情。即使外部 Execution ID 被重复使用、一个 Trace 中出现多个
+Root，每个 Root Observation 仍使用自己的 ID 独立展示。顶部按运行类型分成三个视图，避免日常
+聊天和基准评测混在一起：
+
+- **Conversations**：按 Session → Turn 组织交互式对话；
+- **Evaluations**：按 Job → Trial 组织已导入的 Harbor 评测，直接展示任务标识、Reward、Verifier
+  Pass/Fail、Runtime Error 和 Usage；
+- **All Runs**：合并的运维视图，也包含普通非交互式 `aegis run` 任务。
+
+选择任一运行后继续进入 Model/Tool/Final 详情；各层按需展示调用次数、耗时、Input/Output Token、
+Cache Read/Write、缓存命中率、Cost 和错误状态。缓存命中率定义为
 Cache Read ÷ Provider 报告的总输入 Token。对阿里云百炼 OpenAI 兼容接口的隐式缓存，就是
 `prompt_tokens_details.cached_tokens / prompt_tokens`；当 Cache Write 未返回时，Viewer 用等价的
 `prompt_tokens` 原值或 `total_tokens - output_tokens` 得到精确分母。真实的零会显示为零（例如
@@ -377,12 +398,98 @@ Provider 没有返回的 Usage 或 Cost 则保持未知（`—`）；部分组�
 选择一个 Turn 后，页面先展示最后一次模型调用实际收到的完整消息上下文（`system`、`user`、
 `assistant`、`tool`）和最终模型输出，再展示 Agent/Model/Tool/Final 执行树。Model 和 Tool 节点会
 直接显示关键字段；右栏优先展示状态、Usage、Request 和 Response，Raw Payload 放在最后的折叠区。
-错误 Observation 会被明显标红，并向 Turn 与 Session 汇总。Python 响应边界会再次统一脱敏，
+错误 Observation 会被明显标红，并向 Turn 与 Session 汇总。汇总卡片将失败 Run 与错误
+Observation 数分开，避免把一次包含多个错误节点的失败显示成多个失败 Run。Python 响应边界会再次统一脱敏，
 因此 Langfuse SDK 后加的 Metadata 或历史本地字段中的凭据也不会进入浏览器。历史 Message 本身没有
 独立时间戳，因此时间只展示在真实执行节点上，不做猜测。共享 `session_id` 的 Turn 会显示在一个
 可折叠的 Session 组中，组内保持时间顺序并聚合状态。Langfuse 凭据保留在 Python 进程中，绝不会
-发送到浏览器 JavaScript。HTTP 表面是只读的、没有 CORS 或变更端点，默认绑定回环地址；需要时
-可用 `--no-open`、`--port` 或 `--records-dir`。
+发送到浏览器 JavaScript。Trace GET 接口保持只读；唯一的变更接口是用户显式点击触发的 Harbor
+Sync POST，它只访问配置好的 Jobs 目录，并使用每次启动随机生成的同源令牌保护。服务不开放 CORS，
+默认绑定回环地址；需要时可用 `--no-open`、`--port`、`--records-dir` 或
+`--harbor-jobs-dir`。
+
+## 🔎 过程评测（质量阶段 3）
+
+Process Evaluation 只消费已有 `ExecutionRecord`，不强依赖 Langfuse 或 Harbor，也不改变
+Agent Loop。默认只运行确定性规则，不调用模型。可以评测一个 JSON Record/Execution ID，或批量
+评测本地 Store：
+
+```bash
+uv run aegis quality evaluate <execution-id-or-record.json>
+uv run aegis quality evaluate --all
+uv run aegis quality evaluate --all --json
+uv run aegis quality evaluate <record> --failure-recovery-judge openai
+```
+
+普通交互对话保持显式启用：`--record-conversations` 为每个 Turn 写一个独立的
+`run_kind=conversation` Record；`--process-evaluate-conversations` 还会在 Turn 完成后立即评测。
+同一对话的 Turn 共享 `session_id`，但各自使用不同的 Execution/Trace ID：
+
+```bash
+uv run aegis --record-conversations
+uv run aegis --process-evaluate-conversations
+```
+
+已有 SQLite 会话可以事后重建。命令按用户 Turn 生成确定性 ID，因此重复执行只覆盖同一批 Record，
+不会制造重复数据：
+
+```bash
+uv run aegis quality record-session <session-id>
+uv run aegis quality record-session <session-id> --evaluate
+```
+
+重建 Record 保留已持久化的消息、工具名/参数/结果、关联 ID 和可用时间戳，并标记
+`reconstructed_from_session`。历史中没有保存的 Provider/Model、Usage、Cost、精确请求上下文和调用耗时
+保持未知，不做推测。
+
+命令会安全替换派生字段 `quality.process_evaluation`，但保持 `schema_version: "1.0"`、原始 Step、
+Runtime Outcome 和 Harbor Verifier 数据不变。每次结果保存评测时间、Evaluator 版本、实际权重、
+Overall Score/Status，以及 6 个带版本、可解释的 Grade：
+
+- 重复工具调用：参数相同或高度相似、结果相同，且中间没有成功的状态修改；
+- 重复失败：同一未调整的工具操作达到可配置的连续失败阈值；
+- 失败恢复：为每个 Tool/Model/Runtime Failure 提取完整 Episode，包含诊断、工具/参数/路径变化、
+  Mutation、相关重试及结果；成功的 read/search/status 和无关成功动作本身绝不算 Recovery；
+- 最终验证：检测到重要状态修改后，查找成功且与任务匹配的验证工具或命令；
+- 循环检测：识别连续 `A×N` 和周期性 `(A,B)×N` 工具模式；
+- 执行效率：记录 Step/Model/Tool/Failure/Repeat/Token/Cost/Latency；只有显式配置阈值或
+  Baseline 时才使用绝对/相对上限。
+
+可选的 `FailureRecoveryLLMGrader` 只精炼已有 `failure_recovery` Grade：仅在至少存在一个 Failure
+Episode 时发起一次 Side Query，判断诊断是否有效、调整是否针对原失败、原失败目标是否真正恢复。
+通过 `--failure-recovery-judge`（或 `AEGIS_FAILURE_RECOVERY_JUDGE`）选择 `auto`、`openai` 或
+`anthropic`。没有模型配置、Provider 异常、JSON 非法、Episode ID 不匹配或 Recovery Step 无法落到
+原 Trace 时，Score/Status 保持规则结果；其余 5 个 Grader 始终为确定性规则。
+
+长期 Quality 偏好可写入 `~/.aegis/config.yaml`（或通过 `--config` / `--mcp-config` 指定的文件）：
+
+```yaml
+quality:
+  conversations:
+    record: false
+    evaluate: false
+  failure_recovery_judge:
+    enabled: true
+    provider: openai       # auto、openai 或 anthropic
+    model: <judge-model>
+    base_url: null         # 可选兼容 Endpoint
+```
+
+API Key 不写入 YAML。OpenAI-compatible Judge 读取 `AEGIS_API_KEY`，未在上面覆盖时读取
+`AEGIS_MODEL` / `AEGIS_BASE_URL`；Anthropic Judge 读取 `ANTHROPIC_API_KEY`，并可读取
+`ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL`。显式 CLI 参数临时覆盖配置的 Provider；
+`enabled: false` 会让所有 Process Evaluation 保持纯规则模式。
+
+每个非 Pass Grade 都包含 Severity、Evidence 和可定位的 `step_id`。如果字段不足以可靠判断，
+结果使用 `insufficient_data`，不伪造结论。任务可通过
+`record.metadata.process_evaluation_config` 覆盖验证规则、相似度/循环阈值、效率阈值或 Baseline，
+以及 Grader 权重；`failure_recovery_llm_enabled=false` 可按 Record 禁用 Judge。Process FAIL 目前
+只是分析结果，不是 Quality Gate，因此 CLI 只会在读取、评测或保存发生操作错误时返回非零。
+
+Viewer 将 Harbor **Outcome** 与 **Process** 状态分开展示，因此允许 `Outcome PASS` 同时
+`Process FAIL`。Run 卡片显示 Process Score/Status；ExecutionRecord 详情显示每个 Issue 的 Grader、
+Severity、Message 和 Affected Steps，点击 Issue 会尽量定位第一个受影响的本地 Step。Harbor 重导入
+会保留已有 Process Result，并且永远不修改原始 `result.json`。
 
 ### 触发与记录生命周期
 
@@ -393,15 +500,18 @@ CLI 会先加载项目目录的 `.env`，再加载 `~/.aegis/.env`。只有同�
 
 | 操作 | 触发条件 | 结果 |
 |---|---|---|
-| `uv run aegis --session <id>` | 每次用户提交消息并进入 `AgentRuntime.run_turn()` | 写入普通 Session 历史；启用 Langfuse 时，每个 Turn 再产生一个云端 Trace。不生成 ExecutionRecord。同一会话的多个 Turn 可以共享 `session_id`，但使用不同的 `trace_id`。 |
-| `uv run aegis run ...` | 一个非交互式任务 | 始终写入本地 ExecutionRecord；启用 Langfuse 时同时发送 Trace。缺少 `execution_id` 时生成 UUID；`session_id` 默认等于它；`trace_id` 根据它确定性生成。 |
-| `uv run harbor run ... --agent aegis_agent.integrations.harbor:Aegis` | 一个或多个 Harbor Trial | Harbor 启动每个 Docker 任务环境、安装 Aegis，并将 Trial UUID 作为 `execution_id`。Aegis 写入 Runtime Record，然后 Harbor 运行 Verifier 并写入 `result.json`。 |
+| `uv run aegis --session <id>` | 每次用户提交消息并进入 `AgentRuntime.run_turn()` | 写入普通 Session 历史；启用 Langfuse 时，每个 Turn 再产生一个标记为 `conversation` 的云端 Trace。只有显式使用 `--record-conversations`、`--process-evaluate-conversations` 或对应持久配置时才生成 ExecutionRecord。 |
+| `uv run aegis quality record-session <session-id>` | 显式重建已有 SQLite 会话 | 为每个已持久化的用户 Turn 写入一个确定、幂等的 `conversation` ExecutionRecord；`--evaluate` 同时运行过程评测。缺失的历史遥测保持未知，并在 Record Metadata 中说明。 |
+| `uv run aegis run ...` | 一个非交互式任务 | 始终写入标记为 `task` 的本地 ExecutionRecord；启用 Langfuse 时同时发送 Trace。缺少 `execution_id` 时生成 UUID；`session_id` 默认等于它；`trace_id` 根据它确定性生成。`--run-kind evaluation` 保留给评测适配器。 |
+| `uv run harbor run ... --agent aegis_agent.integrations.harbor:Aegis` | 一个或多个 Harbor Trial | Harbor 启动每个 Docker 任务环境、安装 Aegis，将 Trial UUID 作为 `execution_id`，并把运行标记为 `evaluation`。Aegis 写入 Runtime Record，然后 Harbor 运行 Verifier 并写入 `result.json`。 |
 | `uv run aegis quality import-harbor <result-or-job>` | 显式执行 Verifier 后导入 | 把 Harbor Identity、Verifier Reward、异常、汇总 Usage 和 Artifact 合并到最终 ExecutionRecord。参数可以是单个 `result.json` 或整个 Job 目录。 |
-| `uv run aegis quality view` | 启动本地只读查看页 | 先读取本地 JSON，再在后台读取可选 Langfuse Observation；不会创建或修改 Trace 数据。 |
+| `uv run aegis quality evaluate <record>` / `--all` | 显式离线过程评测 | 运行 5 个确定性 Grader 和规则优先的 Failure Recovery；显式配置的 Judge 只精炼 Failure Episode，失败时安全保留规则结果。原子更新 `quality.process_evaluation`；Outcome/Verifier 字段与原始 Step 保持不变。 |
+| `uv run aegis quality view` | 启动本地查看页 | 先读取本地 JSON，再按游标读取可选 Langfuse Root，达到安全上限时明确提示；**Sync Harbor** 从配置的 Jobs 目录增量导入新增或变化的已完成 TrialResult，不修改 Langfuse Trace。单元测试会强制把 Langfuse 凭据设为空，防止开发者 `.env` 把 pytest Trace 上传到云端；该隔离只阻止后续上传，不会自动修改已有的 Langfuse 历史。 |
 
 Langfuse 采用异步上传。CLI 正常退出时会调用 Runtime `shutdown()`，Flush 等待中的
-Observation。Harbor 最终合并是独立的显式步骤：没有执行 `import-harbor` 时，Trial 中仍有
-Aegis Runtime Record 和 Harbor 原始 `result.json`，但中央 Record 尚未加入 Verifier 输出。
+Observation。Harbor 最终合并是独立的显式步骤：没有执行 `import-harbor` 或点击
+**Sync Harbor** 时，Trial 中仍有 Aegis Runtime Record 和 Harbor 原始 `result.json`，但中央
+Record 尚未加入 Verifier 输出。
 
 ### 记录的数据
 
@@ -415,8 +525,9 @@ Stop Reason、迭代/Tool 数量和耗时。子节点记录：
   Model/Tool/Final Tree。
 - Final Result：输出、成功或错误和 Stop Reason。
 
-本地 `ExecutionRecord` Schema 还包含稳定的 Execution/Task/Trial/Job/Session/Trace Identity、
-Agent 配置、Execution 时间与状态、按父子关系排序的 Step Tree、Usage 计数桶、Harbor Verifier
+本地 `ExecutionRecord` Schema 还包含稳定的 `run_kind`（`conversation`、`task` 或
+`evaluation`）、Execution/Task/Trial/Job/Session/Trace Identity、Agent 配置、Execution 时间与状态、
+按父子关系排序的 Step Tree、Usage 计数桶、Harbor Verifier
 Result/Reward/Pass 状态和 Artifact/日志路径。Runtime 成功与 Verifier Pass/Fail 始终分开。
 Provider 或 Harbor 没有提供的字段保持 `null`。
 
@@ -437,10 +548,11 @@ Provider 或 Harbor 没有提供的字段保持 `null`。
 | Harbor 原始结果 | `<trial-dir>/result.json` | Harbor 在 Verifier 完成后写入。 |
 | Harbor 最终 Record | `<trial-dir>/execution-record.json` | 由 `quality import-harbor` 写入。 |
 | 导入后的中央副本 | `~/.aegis/quality/executions/<trial-uuid>.json` | 包含合并后的 Runtime 与 Verifier 结果。 |
-| Trace Viewer | 不存储数据 | 只读取本地 Record 和 Langfuse v4 Observations API。 |
+| Trace Viewer | 不创建独立存储 | 读取本地 Record 和 Langfuse v4 Observation；显式 Harbor Sync 会把 Final Record 写入既有中央 Store 和 TrialResult 旁。 |
 
-查看页使用 `session_id` 对 Turn 分组，但同一个 Turn 的本地与云端副本仍通过精确 `trace_id`
-关联，不依赖时间戳。云端成功状态优先读取 Aegis 显式 Success Metadata；旧 Trace 则根据 Level、
+查看页使用 `session_id` 对 Conversation 分组，使用 `job_id` 对 Harbor Evaluation 分组；同一个运行的
+本地与云端副本仍通过精确 `trace_id` 关联，不依赖时间戳。云端成功状态优先读取 Aegis 显式 Success
+Metadata；旧 Trace 则根据 Level、
 `stop_reason`、结束时间和 Output 兼容推导。`CLOUD` 表示只有 Langfuse 的 Trace，`LOCAL` 表示
 ExecutionRecord，本地条目上的 `LF` 表示找到了相同的 Langfuse Trace。搜索命中任一 Turn 时会
 保留完整 Session，避免隐藏追问上下文。

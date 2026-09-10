@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -9,6 +10,7 @@ from aegis_agent.quality.adapters.harbor import (
     RUNTIME_RECORD_NAME,
     finalize_harbor_job,
     finalize_harbor_trial,
+    sync_harbor_jobs,
 )
 from aegis_agent.quality.models import (
     ExecutionIdentity,
@@ -16,6 +18,7 @@ from aegis_agent.quality.models import (
     ExecutionSummary,
     UsageSummary,
 )
+from aegis_agent.quality.process import ProcessEvaluator
 from aegis_agent.quality.store import ExecutionRecordStore
 
 
@@ -86,6 +89,7 @@ def test_finalize_harbor_trial_merges_runtime_and_verifier_without_losing_cache_
 
     record = finalize_harbor_trial(result_path, store=store)
 
+    assert record.run_kind == "evaluation"
     assert record.identity.execution_id == "trial-123"
     assert record.identity.trial_id == "trial-123"
     assert record.identity.job_id == "job-456"
@@ -108,7 +112,9 @@ def test_finalize_harbor_trial_merges_runtime_and_verifier_without_losing_cache_
     assert store.load("trial-123") == record
 
 
-def test_verifier_failure_does_not_turn_successful_execution_into_runtime_failure(tmp_path):
+def test_verifier_failure_does_not_turn_successful_execution_into_runtime_failure(
+    tmp_path,
+):
     runtime = ExecutionRecord(
         identity=ExecutionIdentity(execution_id="trial-123"),
         execution=ExecutionSummary(success=True, final_output="wrong answer"),
@@ -146,7 +152,9 @@ def test_harbor_exception_marks_execution_failed(tmp_path):
     assert record.execution.error == "agent timed out"
 
 
-def test_missing_runtime_record_uses_harbor_combined_usage_without_guessing_buckets(tmp_path):
+def test_missing_runtime_record_uses_harbor_combined_usage_without_guessing_buckets(
+    tmp_path,
+):
     _write_trial(tmp_path, _trial_result())
 
     records = finalize_harbor_job(
@@ -189,3 +197,78 @@ def test_sparse_harbor_result_keeps_unknown_fields_none(tmp_path):
     assert record.evaluation.passed is None
     assert record.usage.input_tokens is None
     assert record.identity.job_id is None
+
+
+def test_sync_harbor_jobs_imports_only_new_or_changed_trials(tmp_path):
+    result_path = _write_trial(tmp_path, _trial_result())
+    store = ExecutionRecordStore(tmp_path / "records")
+
+    first = sync_harbor_jobs(tmp_path / "jobs", store=store)
+    second = sync_harbor_jobs(tmp_path / "jobs", store=store)
+
+    assert first["scanned"] == 1
+    assert first["imported"] == 1
+    assert first["unchanged"] == 0
+    assert first["failed"] == 0
+    assert first["execution_ids"] == ["trial-123"]
+    assert second["imported"] == 0
+    assert second["unchanged"] == 1
+
+    changed = _trial_result(reward=0)
+    result_path.write_text(json.dumps(changed), encoding="utf-8")
+    newest_target = max(
+        (result_path.parent / FINAL_RECORD_NAME).stat().st_mtime_ns,
+        store.path_for("trial-123").stat().st_mtime_ns,
+    )
+    os.utime(result_path, ns=(newest_target + 1_000_000, newest_target + 1_000_000))
+
+    third = sync_harbor_jobs(tmp_path / "jobs", store=store)
+
+    assert third["imported"] == 1
+    assert third["unchanged"] == 0
+    assert store.load("trial-123").evaluation.passed is False
+
+
+def test_sync_harbor_jobs_contains_bad_results_and_keeps_scanning(tmp_path):
+    _write_trial(tmp_path, _trial_result())
+    broken = tmp_path / "jobs" / "job-broken" / "trial-broken" / "result.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text("{not-json", encoding="utf-8")
+
+    report = sync_harbor_jobs(
+        tmp_path / "jobs",
+        store=ExecutionRecordStore(tmp_path / "records"),
+    )
+
+    assert report["scanned"] == 2
+    assert report["imported"] == 1
+    assert report["failed"] == 1
+    assert report["errors"][0]["path"] == "job-broken/trial-broken/result.json"
+
+
+def test_sync_harbor_jobs_rejects_missing_directory(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Harbor jobs directory not found"):
+        sync_harbor_jobs(tmp_path / "missing")
+
+
+def test_harbor_refinalization_preserves_offline_process_evaluation(tmp_path):
+    runtime = ExecutionRecord(
+        identity=ExecutionIdentity(execution_id="trial-123"),
+        execution=ExecutionSummary(success=True),
+    )
+    result_path = _write_trial(tmp_path, _trial_result(), runtime)
+    original_result = result_path.read_bytes()
+    store = ExecutionRecordStore(tmp_path / "records")
+    first = finalize_harbor_trial(result_path, store=store)
+    process = ProcessEvaluator().evaluate(first)
+    store.save(first)
+    store.save(first, result_path.parent / FINAL_RECORD_NAME)
+
+    refreshed = finalize_harbor_trial(result_path, store=store)
+
+    assert refreshed.quality.process_evaluation is not None
+    assert (
+        refreshed.quality.process_evaluation.evaluator_version
+        == process.evaluator_version
+    )
+    assert result_path.read_bytes() == original_result

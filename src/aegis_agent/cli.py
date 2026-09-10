@@ -14,14 +14,17 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import typer
 
 from aegis_agent import __version__
+from aegis_agent.config import load_app_config
 from aegis_agent.env import load_dotenv
 from aegis_agent.exceptions import AegisError
-from aegis_agent.models.base import Message, Role
+from aegis_agent.models.base import Message, ModelProvider, Role
 from aegis_agent.runtime import DEFAULT_MAX_ITERATIONS, AgentRuntime, StopReason
 from aegis_agent.sessions.title_generator import SessionTitleService
 from aegis_agent.slash_commands import (
@@ -32,7 +35,9 @@ from aegis_agent.slash_commands import (
 )
 from aegis_agent.tui import Tui
 
-app = typer.Typer(add_completion=False, help="Aegis Agent — minimal interactive agent runtime.")
+app = typer.Typer(
+    add_completion=False, help="Aegis Agent — minimal interactive agent runtime."
+)
 quality_app = typer.Typer(help="Offline execution records and quality tooling.")
 app.add_typer(quality_app, name="quality")
 
@@ -108,6 +113,7 @@ def _main(
     ),
     mcp_config: str | None = typer.Option(
         None,
+        "--config",
         "--mcp-config",
         help="Path to the config file (default: ~/.aegis/config.yaml). Holds both MCP servers and app settings.",
     ),
@@ -152,11 +158,40 @@ def _main(
         help="SQLite session store path (default: ~/.aegis/state.db; in project scope: "
         "<project home>/state.db).",
     ),
+    record_conversations: bool | None = typer.Option(
+        None,
+        "--record-conversations/--no-record-conversations",
+        envvar="AEGIS_RECORD_CONVERSATIONS",
+        help="Write one ExecutionRecord per interactive conversation turn.",
+    ),
+    evaluate_conversations: bool | None = typer.Option(
+        None,
+        "--process-evaluate-conversations/--no-process-evaluate-conversations",
+        envvar="AEGIS_PROCESS_EVALUATE_CONVERSATIONS",
+        help="Record and process-evaluate every completed conversation turn.",
+    ),
+    quality_records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+        help="ExecutionRecord store used by opt-in conversation recording.",
+    ),
+    failure_recovery_judge: str | None = typer.Option(
+        None,
+        "--failure-recovery-judge",
+        envvar="AEGIS_FAILURE_RECOVERY_JUDGE",
+        help="Temporary Judge override: auto, openai, or anthropic.",
+    ),
     ephemeral: bool = typer.Option(
-        False, "--ephemeral", help="Use the in-memory session store (nothing is persisted)."
+        False,
+        "--ephemeral",
+        help="Use the in-memory session store (nothing is persisted).",
     ),
     resume: str | None = typer.Option(
-        None, "--resume", "-r", help="Resume an existing session id from the session store."
+        None,
+        "--resume",
+        "-r",
+        help="Resume an existing session id from the session store.",
     ),
     no_lease: bool | None = typer.Option(
         None,
@@ -165,12 +200,16 @@ def _main(
         "running the same session duplicate model requests and interleave history).",
     ),
     snapshot_every_n: int | None = typer.Option(
-        None, "--snapshot-every-n", help="Write a fast-resume snapshot every N messages (0=off)."
+        None,
+        "--snapshot-every-n",
+        help="Write a fast-resume snapshot every N messages (0=off).",
     ),
     list_sessions: bool = typer.Option(
         False, "--list", "-l", help="List all recorded sessions and exit."
     ),
-    version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
+    version: bool = typer.Option(
+        False, "--version", "-V", help="Show version and exit."
+    ),
 ) -> None:
     """Start the interactive Aegis Agent REPL (default action)."""
     if version:
@@ -203,11 +242,21 @@ def _main(
     enable_memory = resolve_enabled(no_memory, cfg, "memory", "enabled", default=True)
     # Recall / extract default ON; recall/extract are also suppressed when the
     # whole memory subsystem is disabled.
-    enable_recall = resolve_flag(memory_recall, cfg, "memory", "recall", default=True) and enable_memory
-    enable_extract = resolve_flag(memory_extract, cfg, "memory", "extract", default=True) and enable_memory
+    enable_recall = (
+        resolve_flag(memory_recall, cfg, "memory", "recall", default=True)
+        and enable_memory
+    )
+    enable_extract = (
+        resolve_flag(memory_extract, cfg, "memory", "extract", default=True)
+        and enable_memory
+    )
     project_resolved = resolve_value(project, cfg, "memory", "project", None)
-    enable_compress = resolve_enabled(no_compress, cfg, "context", "compress", default=True)
-    max_iter_resolved = resolve_value(max_iterations, cfg, "iterations", "max", DEFAULT_MAX_ITERATIONS)
+    enable_compress = resolve_enabled(
+        no_compress, cfg, "context", "compress", default=True
+    )
+    max_iter_resolved = resolve_value(
+        max_iterations, cfg, "iterations", "max", DEFAULT_MAX_ITERATIONS
+    )
     snapshot_n = resolve_value(snapshot_every_n, cfg, "session", "snapshot_every_n", 20)
     db_path_resolved = resolve_value(db_path, cfg, "session", "db_path", None)
 
@@ -240,6 +289,19 @@ def _main(
     # An explicit --db / AEGIS_DB_PATH / session.db_path always wins.
     db_path_resolved = _scoped_db_path(db_path_resolved, project_resolved)
     repository = _build_repository(db_path_resolved, ephemeral)
+    conversation_cfg = _nested_mapping(cfg, "quality", "conversations")
+    record_conversations_resolved = _resolve_optional_bool(
+        record_conversations,
+        conversation_cfg.get("record"),
+        default=False,
+    )
+    evaluate_conversations_resolved = _resolve_optional_bool(
+        evaluate_conversations,
+        conversation_cfg.get("evaluate"),
+        default=False,
+    )
+    if evaluate_conversations_resolved:
+        record_conversations_resolved = True
     if list_sessions:
         _print_session_list(repository)
         raise typer.Exit()
@@ -281,8 +343,10 @@ def _main(
     lease_backend_env_set = bool(os.environ.get("AEGIS_SESSION_LEASE_BACKEND"))
     skip_lease = not enable_lease or (ephemeral and not lease_backend_env_set)
     if ephemeral and enable_lease and not lease_backend_env_set:
-        typer.echo("[note] ephemeral store: session lease skipped "
-                   "(nothing is shared across processes).")
+        typer.echo(
+            "[note] ephemeral store: session lease skipped "
+            "(nothing is shared across processes)."
+        )
     if not skip_lease:
         lease_manager = _start_lease(repository, session_id, interrupt, lease_lost)
         if lease_manager is None:
@@ -295,6 +359,31 @@ def _main(
     runtime: AgentRuntime | None = None
     title_service: SessionTitleService | None = None
     try:
+        observability = None
+        if record_conversations_resolved:
+            from aegis_agent.observability import (
+                CompositeObservability,
+                create_observability,
+            )
+            from aegis_agent.quality.conversation import (
+                ConversationExecutionRecorder,
+            )
+            from aegis_agent.quality.process import ProcessEvaluator
+            from aegis_agent.quality.store import ExecutionRecordStore
+
+            evaluator = None
+            if evaluate_conversations_resolved:
+                judge_provider = _resolve_failure_recovery_judge(
+                    failure_recovery_judge,
+                    cfg,
+                    warn=lambda message: typer.echo(f"[warning] {message}"),
+                )
+                evaluator = ProcessEvaluator(failure_recovery_judge=judge_provider)
+            recorder = ConversationExecutionRecorder(
+                store=ExecutionRecordStore(quality_records_dir),
+                evaluator=evaluator,
+            )
+            observability = CompositeObservability([create_observability(), recorder])
         runtime = AgentRuntime.with_defaults(
             provider=provider,
             repository=repository,
@@ -311,12 +400,17 @@ def _main(
             memory_project=project_resolved,
             context_token_budget=context_budget,
             summary_provider=summary_provider,
+            observability=observability,
         )
         tui = Tui()
-        tui.banner(label=label, session_id=session_id, startup_info=runtime.startup_info)
+        tui.banner(
+            label=label, session_id=session_id, startup_info=runtime.startup_info
+        )
         if resume:
-            tui.say(f"Resumed session {session_id} "
-                    f"({repository.message_count(session_id)} messages).")
+            tui.say(
+                f"Resumed session {session_id} "
+                f"({repository.message_count(session_id)} messages)."
+            )
             _print_resume_preview(repository, session_id, tui=tui)
 
         # ---- slash commands ----------------------------------------------
@@ -327,7 +421,9 @@ def _main(
         def _rotate_session(title: str | None) -> str | None:
             nonlocal session_id
             new_id = _new_session_id()
-            repository.create_session(new_id, title=title, title_source="manual" if title else None)
+            repository.create_session(
+                new_id, title=title, title_source="manual" if title else None
+            )
             if lease_manager is not None and not lease_manager.switch_session(new_id):
                 return None
             session_id = new_id
@@ -358,6 +454,7 @@ def _main(
             snapshot_every_n=snapshot_n,
             title_service=title_service,
             startup_info=runtime.startup_info,
+            record_conversations=record_conversations_resolved,
         )
     finally:
         # Wait for any in-flight background memory work (recall/extract) before
@@ -413,6 +510,12 @@ def run_once(
     ),
     task_id: str | None = typer.Option(None, "--task-id", envvar="AEGIS_TASK_ID"),
     task_name: str | None = typer.Option(None, "--task-name", envvar="AEGIS_TASK_NAME"),
+    run_kind: str = typer.Option(
+        "task",
+        "--run-kind",
+        envvar="AEGIS_RUN_KIND",
+        help="Quality record kind: task or evaluation.",
+    ),
     record_path: str | None = typer.Option(
         None,
         "--record-path",
@@ -449,12 +552,30 @@ def run_once(
     if model_backend not in {"auto", "fake", "openai", "anthropic"}:
         typer.echo(
             json.dumps(
-                {"success": False, "error": f"unsupported model backend: {model_backend}"},
+                {
+                    "success": False,
+                    "error": f"unsupported model backend: {model_backend}",
+                },
                 ensure_ascii=False,
             ),
             err=True,
         )
         raise typer.Exit(code=2)
+    if run_kind not in {"task", "evaluation"}:
+        typer.echo(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": f"unsupported run kind: {run_kind}",
+                },
+                ensure_ascii=False,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    from aegis_agent.quality.models import RunKind
+
+    typed_run_kind = cast(RunKind, run_kind)
     try:
         provider, _ = _select_provider(model_backend)
         from aegis_agent.quality.run import run_task
@@ -477,7 +598,8 @@ def run_once(
             mcp_config_path=mcp_config,
             enable_subagents=enable_subagents,
             enable_memory=enable_memory,
-            metadata={"source": "aegis-run"},
+            run_kind=typed_run_kind,
+            metadata={"source": "harbor" if run_kind == "evaluation" else "aegis-run"},
         )
     except Exception as exc:
         typer.echo(
@@ -533,6 +655,239 @@ def import_harbor(
     )
 
 
+@quality_app.command("record-session")
+def record_quality_session(
+    session_id: str = typer.Argument(..., help="Existing Aegis session id."),
+    db_path: str | None = typer.Option(
+        None,
+        "--db",
+        envvar="AEGIS_DB_PATH",
+        help="SQLite session store containing the session.",
+    ),
+    records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+    ),
+    evaluate: bool | None = typer.Option(
+        None,
+        "--evaluate/--no-evaluate",
+        help="Run Process Evaluation on every reconstructed turn.",
+    ),
+    failure_recovery_judge: str | None = typer.Option(
+        None,
+        "--failure-recovery-judge",
+        envvar="AEGIS_FAILURE_RECOVERY_JUDGE",
+        help="Temporary Judge override: auto, openai, or anthropic.",
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        help="App config path (default: ~/.aegis/config.yaml).",
+    ),
+) -> None:
+    """Create one idempotent ExecutionRecord per turn in an existing session."""
+    from aegis_agent.quality.conversation import persist_session_records
+    from aegis_agent.quality.process import ProcessEvaluator
+    from aegis_agent.quality.store import ExecutionRecordStore
+    from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
+
+    cfg = load_app_config(config_path)
+    conversation_cfg = _nested_mapping(cfg, "quality", "conversations")
+    evaluate_resolved = _resolve_optional_bool(
+        evaluate,
+        conversation_cfg.get("evaluate"),
+        default=False,
+    )
+    evaluator = None
+    if evaluate_resolved:
+        judge_provider = _resolve_failure_recovery_judge(
+            failure_recovery_judge,
+            cfg,
+            warn=lambda message: typer.echo(f"[warning] {message}", err=True),
+        )
+        evaluator = ProcessEvaluator(failure_recovery_judge=judge_provider)
+
+    repository = SQLiteSessionRepository(db_path)
+    store = ExecutionRecordStore(records_dir)
+    try:
+        records = persist_session_records(
+            repository,
+            session_id,
+            store=store,
+            evaluator=evaluator,
+        )
+    except Exception as exc:
+        typer.echo(f"[error] {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        repository.close()
+    typer.echo(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "count": len(records),
+                "execution_ids": [record.identity.execution_id for record in records],
+                "records_dir": str(store.directory),
+                "evaluated": evaluate_resolved,
+                "reconstructed": True,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+@quality_app.command("evaluate")
+def evaluate_quality_process(
+    record: str | None = typer.Argument(
+        None,
+        help="ExecutionRecord path or execution id.",
+    ),
+    all_records: bool = typer.Option(
+        False,
+        "--all",
+        help="Evaluate every record in the configured local store.",
+    ),
+    records_dir: str | None = typer.Option(
+        None,
+        "--records-dir",
+        envvar="AEGIS_EXECUTION_RECORDS_DIR",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable evaluation results.",
+    ),
+    failure_recovery_judge: str | None = typer.Option(
+        None,
+        "--failure-recovery-judge",
+        envvar="AEGIS_FAILURE_RECOVERY_JUDGE",
+        help="Optional LLM backend for failure recovery: auto, openai, or anthropic.",
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        help="App config path (default: ~/.aegis/config.yaml).",
+    ),
+) -> None:
+    """Run rule-first process graders and update ExecutionRecords."""
+    from aegis_agent.quality.process import ProcessEvaluator
+    from aegis_agent.quality.store import ExecutionRecordStore
+
+    if (record is None) == (not all_records):
+        typer.echo("[error] provide one RECORD or use --all (not both)", err=True)
+        raise typer.Exit(code=2)
+
+    store = ExecutionRecordStore(records_dir)
+    try:
+        if all_records:
+            records = store.list()
+            targets: list[Path | None] = [None] * len(records)
+        else:
+            assert record is not None
+            candidate = Path(record).expanduser()
+            explicit = candidate.resolve() if candidate.is_file() else None
+            records = [store.load(explicit or record)]
+            targets = [explicit]
+    except Exception as exc:
+        typer.echo(f"[error] {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    cfg = load_app_config(config_path)
+    judge_provider = _resolve_failure_recovery_judge(
+        failure_recovery_judge,
+        cfg,
+        warn=lambda message: typer.echo(f"[warning] {message}", err=True),
+    )
+
+    evaluator = ProcessEvaluator(failure_recovery_judge=judge_provider)
+    rendered: list[dict[str, object]] = []
+    failures: list[str] = []
+    for current, target in zip(records, targets):
+        try:
+            result = evaluator.evaluate(current)
+            store.save(current)
+            if (
+                target is not None
+                and target != store.path_for(current.identity.execution_id).resolve()
+            ):
+                store.save(current, target)
+            rendered.append(
+                {
+                    "execution_id": current.identity.execution_id,
+                    "task": current.identity.task_name,
+                    "record_path": str(
+                        target or store.path_for(current.identity.execution_id)
+                    ),
+                    "process_evaluation": result.model_dump(
+                        mode="json", exclude_none=True
+                    ),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - batch mode contains per-record errors
+            failures.append(
+                f"{current.identity.execution_id}: {type(exc).__name__}: {exc}"
+            )
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {"evaluated": rendered, "failed": failures},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        if not rendered and not failures:
+            typer.echo("No ExecutionRecords found.")
+        for index, item in enumerate(rendered):
+            if index:
+                typer.echo("")
+            _print_process_evaluation(item)
+        if all_records and rendered:
+            typer.echo(
+                f"\nEvaluated {len(rendered)} record(s); {len(failures)} error(s)."
+            )
+        for failure in failures:
+            typer.echo(f"[error] {failure}", err=True)
+    if failures:
+        raise typer.Exit(code=1)
+
+
+def _print_process_evaluation(item: dict[str, object]) -> None:
+    payload = item["process_evaluation"]
+    assert isinstance(payload, dict)
+    score = payload.get("overall_score")
+    score_text = "N/A" if score is None else f"{float(score):.2f}"
+    typer.echo("Process Evaluation")
+    typer.echo("")
+    typer.echo(f"Execution: {item['execution_id']}")
+    typer.echo(f"Task: {item.get('task') or '—'}")
+    typer.echo("")
+    typer.echo(f"Overall Score: {score_text}")
+    typer.echo(f"Process Status: {str(payload.get('status', 'unknown')).upper()}")
+    typer.echo("")
+    grades = payload.get("grades")
+    if not isinstance(grades, list):
+        grades = []
+    for grade in grades:
+        if not isinstance(grade, dict):
+            continue
+        label = str(grade.get("grader_name", "grader")).replace("_", " ").title()
+        typer.echo(f"{str(grade.get('status', 'unknown')).upper():<17} {label}")
+    issues = [
+        grade
+        for grade in grades
+        if isinstance(grade, dict)
+        and grade.get("status") in {"warning", "fail", "insufficient_data"}
+    ]
+    if issues:
+        typer.echo("\nIssues:")
+        for grade in issues:
+            steps = grade.get("affected_steps") or []
+            where = f" (steps {', '.join(map(str, steps))})" if steps else ""
+            typer.echo(f"- {grade.get('message', 'Process issue')}{where}")
+
+
 @quality_app.command("view")
 def view_quality_traces(
     host: str = typer.Option(
@@ -546,9 +901,15 @@ def view_quality_traces(
         "--records-dir",
         envvar="AEGIS_EXECUTION_RECORDS_DIR",
     ),
+    harbor_jobs_dir: str | None = typer.Option(
+        None,
+        "--harbor-jobs-dir",
+        envvar="AEGIS_HARBOR_JOBS_DIR",
+        help="Harbor jobs directory used by the Sync Harbor button.",
+    ),
     open_browser: bool = typer.Option(True, "--open/--no-open"),
 ) -> None:
-    """Open the read-only local ExecutionRecord and Langfuse trace viewer."""
+    """Open the local trace viewer with explicit Harbor result sync."""
     from aegis_agent.quality.viewer import serve_viewer
 
     try:
@@ -556,6 +917,7 @@ def view_quality_traces(
             host=host,
             port=port,
             records_dir=records_dir,
+            harbor_jobs_dir=harbor_jobs_dir,
             open_browser=open_browser,
         )
     except KeyboardInterrupt:
@@ -573,7 +935,9 @@ def _select_provider(model_flag: str):
     from aegis_agent.models.openai_compat import ENV_API_KEY, ENV_MODEL
 
     want_openai = model_flag == "openai" or (
-        model_flag == "auto" and os.environ.get(ENV_API_KEY) and os.environ.get(ENV_MODEL)
+        model_flag == "auto"
+        and os.environ.get(ENV_API_KEY)
+        and os.environ.get(ENV_MODEL)
     )
     if want_openai:
         from aegis_agent.models.openai_compat import OpenAICompatibleProvider
@@ -596,11 +960,163 @@ def _select_provider(model_flag: str):
     if want_anthropic:
         from aegis_agent.models.anthropic import AnthropicProvider
 
-        provider = AnthropicProvider.from_env()
-        return provider, f"anthropic model '{provider.model}'"
+        anthropic_provider = AnthropicProvider.from_env()
+        return anthropic_provider, f"anthropic model '{anthropic_provider.model}'"
     from aegis_agent.models.fake import FakeModelProvider
 
     return FakeModelProvider(chunk_text=True), "fake model"
+
+
+def _nested_mapping(cfg: dict[str, object], *keys: str) -> dict[str, object]:
+    current: object = cfg
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def _resolve_optional_bool(
+    explicit: bool | None,
+    configured: object,
+    *,
+    default: bool,
+) -> bool:
+    if explicit is not None:
+        return explicit
+    if configured is not None:
+        return bool(configured)
+    return default
+
+
+def _resolve_failure_recovery_judge(
+    requested: str | None,
+    cfg: dict[str, object],
+    *,
+    warn: Callable[[str], None],
+) -> ModelProvider | None:
+    """Build the optional deterministic Judge client from CLI/env + YAML.
+
+    CLI or ``AEGIS_FAILURE_RECOVERY_JUDGE`` wins over
+    ``quality.failure_recovery_judge.provider``. API keys intentionally remain
+    in environment/.env files; provider, model and endpoint may live in the
+    ordinary app config.
+    """
+
+    settings = _nested_mapping(cfg, "quality", "failure_recovery_judge")
+    explicitly_requested = requested is not None
+    enabled = explicitly_requested or bool(settings.get("enabled", False))
+    if not enabled:
+        return None
+    backend_value = requested or settings.get("provider") or "auto"
+    backend = str(backend_value).lower()
+    if backend not in {"auto", "openai", "anthropic"}:
+        message = "failure recovery Judge provider must be auto, openai, or anthropic"
+        if explicitly_requested:
+            raise typer.BadParameter(message, param_hint="--failure-recovery-judge")
+        warn(f"{message}; using rules")
+        return None
+
+    load_dotenv()
+    load_dotenv(Path.home() / ".aegis" / ".env")
+    model_override = _optional_config_string(settings.get("model"))
+    base_url_override = _optional_config_string(settings.get("base_url"))
+    try:
+        if model_override is None and base_url_override is None:
+            selected, _ = _select_provider(backend)
+            if backend == "auto" and selected.name == "fake":
+                warn("no real judge model is configured; using rule-only recovery grading")
+                return None
+            return _build_summary_provider(selected) or selected
+        return _build_configured_judge_provider(
+            backend,
+            model=model_override,
+            base_url=base_url_override,
+        )
+    except AegisError as exc:
+        warn(f"failure-recovery judge unavailable ({exc}); using rules")
+        return None
+
+
+def _build_configured_judge_provider(
+    backend: str,
+    *,
+    model: str | None,
+    base_url: str | None,
+) -> ModelProvider:
+    from aegis_agent.context.compress_config import SUMMARY_MAX_TOKENS
+    from aegis_agent.exceptions import ModelProviderError
+    from aegis_agent.models.anthropic import (
+        ENV_API_KEY as ANTHROPIC_API_KEY,
+    )
+    from aegis_agent.models.anthropic import (
+        ENV_BASE_URL as ANTHROPIC_BASE_URL,
+    )
+    from aegis_agent.models.anthropic import (
+        ENV_MODEL as ANTHROPIC_MODEL,
+    )
+    from aegis_agent.models.openai_compat import (
+        ENV_API_KEY as OPENAI_API_KEY,
+    )
+    from aegis_agent.models.openai_compat import (
+        ENV_BASE_URL as OPENAI_BASE_URL,
+    )
+    from aegis_agent.models.openai_compat import (
+        ENV_MODEL as OPENAI_MODEL,
+    )
+
+    selected = backend
+    if selected == "auto":
+        if os.environ.get(OPENAI_API_KEY) and (model or os.environ.get(OPENAI_MODEL)):
+            selected = "openai"
+        elif os.environ.get(ANTHROPIC_API_KEY) and (
+            model or os.environ.get(ANTHROPIC_MODEL)
+        ):
+            selected = "anthropic"
+        else:
+            raise ModelProviderError("no real judge model is configured")
+
+    if selected == "openai":
+        from aegis_agent.models.openai_compat import OpenAICompatibleProvider
+
+        api_key = os.environ.get(OPENAI_API_KEY)
+        resolved_model = model or os.environ.get(OPENAI_MODEL)
+        if not api_key:
+            raise ModelProviderError(f"{OPENAI_API_KEY} is not set")
+        if not resolved_model:
+            raise ModelProviderError(f"{OPENAI_MODEL} or Judge model is not set")
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            base_url=base_url or os.environ.get(OPENAI_BASE_URL),
+            model=resolved_model,
+            stream=False,
+            temperature=0.0,
+            max_tokens=SUMMARY_MAX_TOKENS,
+        )
+
+    from aegis_agent.models.anthropic import AnthropicProvider
+
+    api_key = os.environ.get(ANTHROPIC_API_KEY)
+    resolved_model = model or os.environ.get(ANTHROPIC_MODEL)
+    if not api_key:
+        raise ModelProviderError(f"{ANTHROPIC_API_KEY} is not set")
+    if not resolved_model:
+        raise ModelProviderError(f"{ANTHROPIC_MODEL} or Judge model is not set")
+    return AnthropicProvider(
+        api_key=api_key,
+        base_url=base_url or os.environ.get(ANTHROPIC_BASE_URL),
+        model=resolved_model,
+        stream=False,
+        temperature=0.0,
+        max_tokens=SUMMARY_MAX_TOKENS,
+    )
+
+
+def _optional_config_string(value: object) -> str | None:
+    if value is None:
+        return None
+    rendered = str(value).strip()
+    return rendered or None
 
 
 def _build_summary_provider(provider):
@@ -633,7 +1149,10 @@ def _new_session_id() -> str:
     import datetime
     import uuid
 
-    return datetime.datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+    return (
+        datetime.datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_")
+        + uuid.uuid4().hex[:6]
+    )
 
 
 def _build_repository(db_path: str | None, ephemeral: bool):
@@ -720,7 +1239,9 @@ def _session_scope_hint(session_id: str, project: str | None) -> str | None:
     return None
 
 
-def _print_resume_preview(repository, session_id: str, exchanges: int = 4, tui: Tui | None = None) -> None:
+def _print_resume_preview(
+    repository, session_id: str, exchanges: int = 4, tui: Tui | None = None
+) -> None:
     """Print the last few exchanges so the user can see what was discussed.
 
     Mirrors Hermes' resumed-session preview: last N user messages and
@@ -746,7 +1267,9 @@ def _print_resume_preview(repository, session_id: str, exchanges: int = 4, tui: 
                 pairs.append((current_user, current_assistant))
             current_user = m
             current_assistant = None
-        elif m.role is Role.ASSISTANT and current_assistant is None and m.content.strip():
+        elif (
+            m.role is Role.ASSISTANT and current_assistant is None and m.content.strip()
+        ):
             current_assistant = m
     if current_user is not None:
         pairs.append((current_user, current_assistant))
@@ -811,7 +1334,9 @@ def _start_lease(
     )
     from aegis_agent.sessions.sqlite_store import SQLiteSessionRepository
 
-    repo_for_lease = repository if isinstance(repository, SQLiteSessionRepository) else None
+    repo_for_lease = (
+        repository if isinstance(repository, SQLiteSessionRepository) else None
+    )
     try:
         backend = get_lease_backend(repo_for_lease)
     except SessionLeaseUnavailableError as exc:
@@ -842,6 +1367,7 @@ def _repl(
     snapshot_every_n: int = 20,
     title_service: SessionTitleService | None = None,
     startup_info: dict[str, int | str] | None = None,
+    record_conversations: bool = False,
 ) -> None:
     """Read user lines, run turns, stream replies until an exit command / EOF.
 
@@ -905,8 +1431,28 @@ def _repl(
             # (via the interrupt event) rather than raising KeyboardInterrupt.
             _turn_active = True
             try:
+                execution_id = None
+                trace_id = None
+                trace_metadata = None
+                if record_conversations:
+                    import uuid
+
+                    from aegis_agent.observability import deterministic_trace_id
+
+                    execution_id = str(uuid.uuid4())
+                    trace_id = deterministic_trace_id(execution_id)
+                    trace_metadata = {
+                        "execution_id": execution_id,
+                        "run_kind": "conversation",
+                    }
                 result = runtime.run_turn(
-                    session_id, turn_input, interrupt=interrupt, on_event=tui.on_event_factory(state)
+                    session_id,
+                    turn_input,
+                    interrupt=interrupt,
+                    on_event=tui.on_event_factory(state),
+                    execution_id=execution_id,
+                    trace_id=trace_id,
+                    trace_metadata=trace_metadata,
                 )
             finally:
                 _turn_active = False
