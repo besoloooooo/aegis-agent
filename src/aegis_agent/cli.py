@@ -762,7 +762,7 @@ def evaluate_quality_process(
         None,
         "--failure-recovery-judge",
         envvar="AEGIS_FAILURE_RECOVERY_JUDGE",
-        help="Optional LLM backend for failure recovery: auto, openai, or anthropic.",
+        help="Judge backend override for failure recovery: auto, openai, or anthropic.",
     ),
     config_path: str | None = typer.Option(
         None,
@@ -995,17 +995,19 @@ def _resolve_failure_recovery_judge(
     *,
     warn: Callable[[str], None],
 ) -> ModelProvider | None:
-    """Build the optional deterministic Judge client from CLI/env + YAML.
+    """Build the fail-open Judge client from CLI/env + YAML.
 
     CLI or ``AEGIS_FAILURE_RECOVERY_JUDGE`` wins over
     ``quality.failure_recovery_judge.provider``. API keys intentionally remain
     in environment/.env files; provider, model and endpoint may live in the
-    ordinary app config.
+    ordinary app config. The Judge is enabled by default and automatically
+    falls back to rule-only grading when no real model is configured.
     """
 
     settings = _nested_mapping(cfg, "quality", "failure_recovery_judge")
     explicitly_requested = requested is not None
-    enabled = explicitly_requested or bool(settings.get("enabled", False))
+    explicitly_configured = bool(settings)
+    enabled = explicitly_requested or bool(settings.get("enabled", True))
     if not enabled:
         return None
     backend_value = requested or settings.get("provider") or "auto"
@@ -1025,7 +1027,11 @@ def _resolve_failure_recovery_judge(
         if model_override is None and base_url_override is None:
             selected, _ = _select_provider(backend)
             if backend == "auto" and selected.name == "fake":
-                warn("no real judge model is configured; using rule-only recovery grading")
+                if explicitly_requested or explicitly_configured:
+                    warn(
+                        "no real judge model is configured; "
+                        "using rule-only recovery grading"
+                    )
                 return None
             return _build_summary_provider(selected) or selected
         return _build_configured_judge_provider(
@@ -1034,7 +1040,8 @@ def _resolve_failure_recovery_judge(
             base_url=base_url_override,
         )
     except AegisError as exc:
-        warn(f"failure-recovery judge unavailable ({exc}); using rules")
+        if explicitly_requested or explicitly_configured:
+            warn(f"failure-recovery judge unavailable ({exc}); using rules")
         return None
 
 

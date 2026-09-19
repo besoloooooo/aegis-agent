@@ -454,7 +454,8 @@ def _stdio_errlog() -> Any:
     """Return a file-like object that discards MCP server stderr output."""
     global _stdio_devnull
     if _stdio_devnull is None:
-        _stdio_devnull = open(_os.devnull, "w")
+        # Intentionally process-lifetime: every MCP stdio session shares it.
+        _stdio_devnull = open(_os.devnull, "w")  # noqa: SIM115
     return _stdio_devnull
 
 

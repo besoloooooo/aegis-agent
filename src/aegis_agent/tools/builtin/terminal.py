@@ -21,6 +21,8 @@ watch patterns, ``notify_on_complete`` chat framing.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -33,17 +35,29 @@ from aegis_agent.tools import schemas
 from aegis_agent.tools.danger import detect_dangerous_command
 from aegis_agent.tools.process_registry import ProcessRegistry
 from aegis_agent.tools.registry import ToolContext
+from aegis_agent.tools.shell import build_shell_argv
 
 _DEFAULT_TIMEOUT = 60
 _MAX_TIMEOUT = 600                  # foreground clamp (mirrors FOREGROUND_MAX_TIMEOUT)
 _MAX_OUTPUT_CHARS = 50_000          # combined output cap (head 40% + tail 60%)
 
-#: Substrings that suggest a command is a long-lived server/watcher → nudge to background.
-_SERVER_HINTS = (
-    "run dev", "start", "serve", "uvicorn", "gunicorn", "flask run",
-    "npm start", "pnpm dev", "yarn dev", "watch", "tail -f", "docker-compose up",
-    "docker compose up", "jupyter", "streamlit run",
-)
+_LONG_RUNNING_EXECUTABLES = {
+    "daphne",
+    "gunicorn",
+    "hypercorn",
+    "jupyter",
+    "nodemon",
+    "ptw",
+    "pytest-watch",
+    "serve",
+    "streamlit",
+    "uvicorn",
+    "vite",
+    "watch",
+    "watchexec",
+}
+_SHELL_WRAPPERS = {"command", "exec", "nohup", "sudo", "time"}
+_PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 
 
 class TerminalTool:
@@ -90,8 +104,7 @@ class TerminalTool:
         is_cancelled: Callable[[], bool] | None = None,
     ) -> ToolResult:
         # Nudge long-lived server/watch commands toward background mode.
-        lowered = command.lower()
-        if command.rstrip().endswith("&") or any(h in lowered for h in _SERVER_HINTS):
+        if _looks_long_running(command):
             hint = (
                 "This looks like a long-running server/watch command. Prefer "
                 "background=true and then manage it with the 'process' tool."
@@ -107,7 +120,7 @@ class TerminalTool:
         else:
             note = None
 
-        argv = ["cmd", "/c", command] if _is_windows() else ["/bin/sh", "-c", command]
+        argv = build_shell_argv(command)
         try:
             proc = subprocess.Popen(
                 argv,
@@ -139,16 +152,20 @@ class TerminalTool:
 
         output = _truncate_output(output)
 
-        payload: dict[str, Any] = {"output": output, "exit_code": returncode, "error": None}
+        payload: dict[str, Any] = {
+            "output": output,
+            "exit_code": returncode,
+            "error": None if returncode == 0 else f"Command exited with status {returncode}.",
+        }
         if returncode != 0:
-            meaning = _exit_code_meaning(returncode)
+            meaning = _exit_code_meaning(command, returncode)
             if meaning:
                 payload["exit_code_meaning"] = meaning
         if hint:
             payload["hint"] = hint
         if note:
             payload["pty_note"] = note
-        is_error = returncode != 0 and not payload.get("exit_code_meaning")
+        is_error = returncode != 0
         return ToolResult(tool_call_id="", name=self.definition.name, content=json.dumps(payload, ensure_ascii=False), is_error=is_error)
 
     # -- background ----------------------------------------------------------
@@ -183,13 +200,148 @@ def _truncate_output(output: str) -> str:
     )
 
 
-def _exit_code_meaning(code: int) -> str | None:
-    """Human note for non-error non-zero exit codes (grep/diff/find conventions)."""
+def _exit_code_meaning(command: str, code: int) -> str | None:
+    """Return command-aware context without overriding non-zero error status."""
     if code == 1:
-        return "exit code 1 — often 'no matches' / 'files differ' for grep/diff/find; not necessarily an error."
+        executable_names = {
+            _basename(invocation[0])
+            for words in _command_segments(command)
+            if (invocation := _unwrap_invocation(words))
+        }
+        if executable_names & {"grep", "egrep", "fgrep", "rg"}:
+            return "exit code 1 — grep-style commands use this when no lines were selected."
+        if executable_names & {"cmp", "diff"}:
+            return "exit code 1 — diff-style commands use this when inputs differ."
+        return "exit code 1 — a non-zero, command-specific failure or negative result."
     if code == 124:
         return "exit code 124 — command timed out."
     return None
+
+
+def _looks_long_running(command: str) -> bool:
+    """Detect server/watch invocations from command words, never argument substrings."""
+    if _ends_with_background_operator(command):
+        return True
+    return any(_invocation_looks_long_running(words) for words in _command_segments(command))
+
+
+def _ends_with_background_operator(command: str) -> bool:
+    try:
+        lexer = shlex.shlex(command, posix=not _is_windows(), punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    return bool(tokens and tokens[-1] == "&")
+
+
+def _command_segments(command: str) -> list[list[str]]:
+    """Split a shell command at control operators while respecting quotes."""
+    try:
+        lexer = shlex.shlex(command, posix=not _is_windows(), punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token and all(char in ";&|()" for char in token):
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _invocation_looks_long_running(words: list[str]) -> bool:
+    words = _unwrap_invocation(words)
+    if not words:
+        return False
+    executable = _basename(words[0])
+    args = [word.lower() for word in words[1:]]
+
+    if executable in _LONG_RUNNING_EXECUTABLES:
+        return True
+    if _PYTHON_RE.fullmatch(executable):
+        try:
+            module = args[args.index("-m") + 1]
+        except (ValueError, IndexError):
+            return False
+        return module in {
+            "flask",
+            "http.server",
+            "jupyter",
+            "streamlit",
+            "uvicorn",
+            "watchdog.watchmedo",
+        }
+    if executable == "flask":
+        return "run" in args
+    if executable in {"npm", "pnpm", "yarn", "bun"}:
+        scripts = [arg for arg in args if not arg.startswith("-")]
+        if scripts[:1] == ["run"]:
+            scripts = scripts[1:]
+        return bool(scripts and scripts[0] in {"dev", "serve", "start", "watch"})
+    if executable in {"docker", "podman"}:
+        return len(args) >= 2 and args[0] == "compose" and args[1] == "up" and "-d" not in args
+    if executable in {"docker-compose", "podman-compose"}:
+        return bool(args and args[0] == "up" and "-d" not in args)
+    if executable == "tail":
+        return "-f" in args or "--follow" in args
+    if executable in {"cargo", "dotnet"}:
+        return bool(args and args[0] == "watch")
+    if executable in {"next", "rails"}:
+        return bool(args and args[0] in {"dev", "server", "s"})
+    if executable in {"tsc", "webpack"}:
+        return "--watch" in args
+    return False
+
+
+def _unwrap_invocation(words: list[str]) -> list[str]:
+    remaining = list(words)
+    while remaining:
+        while remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
+            remaining.pop(0)
+        if not remaining:
+            return []
+        executable = _basename(remaining[0])
+        if executable in _SHELL_WRAPPERS:
+            remaining.pop(0)
+            while remaining and remaining[0].startswith("-"):
+                remaining.pop(0)
+            continue
+        if executable == "env":
+            remaining.pop(0)
+            while remaining and (
+                remaining[0].startswith("-")
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0])
+            ):
+                remaining.pop(0)
+            continue
+        if (
+            executable in {"uv", "poetry", "pipenv"}
+            and len(remaining) > 1
+            and remaining[1].lower() == "run"
+        ):
+            remaining = remaining[2:]
+            continue
+        if executable in {"npx", "pnpx"}:
+            remaining.pop(0)
+            while remaining and remaining[0].startswith("-"):
+                remaining.pop(0)
+            continue
+        break
+    return remaining
+
+
+def _basename(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def _wait_and_drain(

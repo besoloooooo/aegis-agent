@@ -2,12 +2,13 @@
 
 ## 1. Repository boundaries
 
-There are three repositories in the current VS Code workspace:
+There are four repositories available in the current development workspace:
 
-Target repository:
+Writable target repositories:
 
 ```text
 /home/nacha/aegis-agent
+/home/nacha/harbor
 ```
 
 Reference repositories:
@@ -18,6 +19,9 @@ Reference repositories:
 ```
 
 The Hermes and Claude Code repositories are read-only reference source code.
+Harbor is a writable target repository for Harbor framework, evaluation,
+integration, task, and developer-workflow changes. Follow Harbor's own
+`AGENTS.md` and other repository-local instructions whenever modifying it.
 
 Never modify, rename, delete, format, move, commit, or generate files under:
 
@@ -26,13 +30,16 @@ Never modify, rename, delete, format, move, commit, or generate files under:
 /home/nacha/Claude-Code
 ```
 
-All new source code, tests, scripts, configuration, and documentation must be created under:
+All new source code, tests, scripts, configuration, and documentation must be
+created under the appropriate writable target repository:
 
 ```text
 /home/nacha/aegis-agent
+/home/nacha/harbor
 ```
 
-Before editing any file, verify that its absolute path belongs to the target repository.
+Before editing any file, verify that its absolute path belongs to the intended
+writable target repository.
 
 Do not copy an entire reference repository by default.
 

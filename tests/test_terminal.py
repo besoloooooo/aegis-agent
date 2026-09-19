@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+
+import pytest
 
 from aegis_agent.tools.builtin import TerminalTool
 from aegis_agent.tools.process_registry import ProcessRegistry
@@ -29,8 +33,91 @@ def test_terminal_foreground_captures_output_and_exit_code(tmp_path):
 def test_terminal_nonzero_exit(tmp_path):
     tool, _, ctx = _make(tmp_path)
     result = tool.run({"command": "exit 3"}, ctx)
+    assert result.is_error
     payload = json.loads(result.content)
     assert payload["exit_code"] == 3
+    assert payload["error"] == "Command exited with status 3."
+
+
+def test_terminal_python_exit_one_is_error(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": 'python -c "raise SystemExit(1)"'}, ctx)
+    payload = json.loads(result.content)
+    assert result.is_error
+    assert payload["exit_code"] == 1
+    assert "non-zero" in payload["exit_code_meaning"]
+
+
+def test_terminal_grep_explanation_does_not_override_error(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": "printf found | grep missing"}, ctx)
+    payload = json.loads(result.content)
+    assert result.is_error
+    assert payload["exit_code"] == 1
+    assert "no lines were selected" in payload["exit_code_meaning"]
+
+
+def test_terminal_pytest_exit_one_is_error(tmp_path):
+    (tmp_path / "test_failing.py").write_text(
+        "def test_failing():\n    assert False\n",
+        encoding="utf-8",
+    )
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": "python -m pytest -q test_failing.py"}, ctx)
+    payload = json.loads(result.content)
+    assert result.is_error
+    assert payload["exit_code"] == 1
+    assert "1 failed" in payload["output"]
+
+
+def test_terminal_git_exit_one_is_error(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run(
+        {
+            "command": (
+                "git init -q && git config user.email test@example.invalid "
+                "&& git config user.name Test && git commit -m empty"
+            )
+        },
+        ctx,
+    )
+    payload = json.loads(result.content)
+    assert result.is_error
+    assert payload["exit_code"] == 1
+    assert payload["error"] == "Command exited with status 1."
+
+
+def test_terminal_server_path_argument_does_not_trigger_hint(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": "printf '%s\\n' /git/server.git"}, ctx)
+    payload = json.loads(result.content)
+    assert "hint" not in payload
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["python -m http.server --help", "watch --help"],
+)
+def test_terminal_real_server_and_watch_commands_trigger_hint(tmp_path, command):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run({"command": command}, ctx)
+    payload = json.loads(result.content)
+    assert "long-running server/watch command" in payload["hint"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="POSIX Bash pipefail is unavailable",
+)
+def test_terminal_pipeline_reports_upstream_failure(tmp_path):
+    tool, _, ctx = _make(tmp_path)
+    result = tool.run(
+        {"command": 'python -c "raise SystemExit(7)" 2>&1 | head -100'},
+        ctx,
+    )
+    payload = json.loads(result.content)
+    assert result.is_error
+    assert payload["exit_code"] == 7
 
 
 def test_terminal_timeout(tmp_path):
@@ -135,8 +222,6 @@ def test_detect_dangerous_command_subset():
 
 def test_terminal_foreground_cancel_raises(tmp_path):
     """A cooperative cancel aborts the foreground command (raises, no result)."""
-    import pytest
-
     from aegis_agent.exceptions import OperationCancelled
 
     tool, _, _ = _make(tmp_path)

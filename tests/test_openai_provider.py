@@ -196,6 +196,28 @@ def test_from_env_builds_provider(monkeypatch):
     assert provider.model == "gpt-4o-mini"
 
 
+def test_from_env_reads_model_timeout(monkeypatch):
+    monkeypatch.setattr("aegis_agent.env.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setenv(ENV_API_KEY, "k")
+    monkeypatch.setenv(ENV_MODEL, "gpt-4o-mini")
+    monkeypatch.setenv("AEGIS_MODEL_TIMEOUT", "300")
+
+    provider = OpenAICompatibleProvider.from_env()
+
+    assert provider._timeout == 300.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number", "nan", "inf"])
+def test_from_env_rejects_invalid_model_timeout(monkeypatch, value):
+    monkeypatch.setattr("aegis_agent.env.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setenv(ENV_API_KEY, "k")
+    monkeypatch.setenv(ENV_MODEL, "gpt-4o-mini")
+    monkeypatch.setenv("AEGIS_MODEL_TIMEOUT", value)
+
+    with pytest.raises(ModelProviderError, match="AEGIS_MODEL_TIMEOUT"):
+        OpenAICompatibleProvider.from_env()
+
+
 # -- wire-format mapping -----------------------------------------------------
 
 

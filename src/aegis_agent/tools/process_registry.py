@@ -11,9 +11,9 @@
 # Dropped (Hermes coupling): sandbox backends (``spawn_via_env``), PTY via
 # ptyprocess, watch-pattern rate limiting + global circuit breaker, gateway
 # notification routing, crash-recovery checkpoint file, per-profile HOME
-# isolation and provider-secret env scrubbing.  The shell wrappers
-# (``[shell, -lic, "set +m; <cmd>"]``) and login-shell env handling are replaced
-# with a plain ``/bin/sh -c`` / ``cmd /c`` invocation.
+# isolation and provider-secret env scrubbing.  The login-shell environment
+# handling is replaced with the shared local shell selector; POSIX pipelines
+# use Bash ``pipefail`` when available and Windows retains ``cmd /c``.
 """In-memory registry of managed background processes.
 
 Tracks processes spawned via the ``terminal`` tool with ``background=true``:
@@ -40,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from aegis_agent.exceptions import OperationCancelled
+from aegis_agent.tools.shell import build_shell_argv
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +77,6 @@ def _resolve_safe_cwd(cwd: str | None) -> str:
             break
         parent = nxt
     return os.getcwd()
-
-
-def _spawn_argv(command: str) -> list[str]:
-    """Build the argv used to run ``command`` through a shell."""
-    if _IS_WINDOWS:
-        return ["cmd", "/c", command]
-    return ["/bin/sh", "-c", command]
 
 
 @dataclass
@@ -149,7 +143,7 @@ class ProcessRegistry:
             popen_kwargs["preexec_fn"] = os.setsid  # new process group → tree-kill
 
         proc = subprocess.Popen(
-            _spawn_argv(command),
+            build_shell_argv(command),
             text=True,
             cwd=session.cwd,
             env=env,

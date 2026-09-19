@@ -125,8 +125,9 @@ manages the background processes it spawns.
 
 | Aegis file | Relationship | Hermes source → symbol | Notes |
 |---|---|---|---|
-| `src/aegis_agent/tools/process_registry.py` | **ADAPT** | `tools/process_registry.py` → `ProcessRegistry`, `ProcessSession`, `spawn_local`, `_reader_loop`, `_reconcile_local_exit`, `poll`/`read_log`/`wait`/`kill_process`/`write_stdin`/`submit_stdin`/`close_stdin`/`list_sessions`, `_prune_if_needed` | Local-only port of the in-memory background-process registry: `_running`/`_finished` dicts + lock, per-session rolling 200KB `output_buffer` + daemon reader thread, `subprocess.Popen` + `os.setsid` process group, TTL + LRU pruning, orphaned-pipe reconcile fix, psutil / `taskkill /T /F` tree-kill, ANSI strip. Dropped: sandbox backends (`spawn_via_env`), ptyprocess PTY, watch-pattern rate limiting + global circuit breaker, gateway notification routing, crash-recovery checkpoint file, per-profile HOME isolation, provider-secret env scrubbing. Shell wrapper simplified to `/bin/sh -c` / `cmd /c`. Attribution header retained. |
-| `src/aegis_agent/tools/builtin/terminal.py` | **REWRITE** | `tools/terminal_tool.py` → `terminal_tool` | `{command, timeout, workdir, background, pty}` → foreground `{output, exit_code, error}` (timeout → exit_code 124 with partial stdout/stderr preserved, head/tail truncation, grep/diff exit-code-meaning note, server-command → background hint) or background `{session_id, pid, ...}`. Dangerous-command guardrail retained (operator-only `allow_dangerous_shell`). Dropped: sandbox backends, approval/`force`, watch patterns, notify_on_complete framing. |
+| `src/aegis_agent/tools/process_registry.py` | **ADAPT** | `tools/process_registry.py` → `ProcessRegistry`, `ProcessSession`, `spawn_local`, `_reader_loop`, `_reconcile_local_exit`, `poll`/`read_log`/`wait`/`kill_process`/`write_stdin`/`submit_stdin`/`close_stdin`/`list_sessions`, `_prune_if_needed` | Local-only port of the in-memory background-process registry: `_running`/`_finished` dicts + lock, per-session rolling 200KB `output_buffer` + daemon reader thread, `subprocess.Popen` + `os.setsid` process group, TTL + LRU pruning, orphaned-pipe reconcile fix, psutil / `taskkill /T /F` tree-kill, ANSI strip. Dropped: sandbox backends (`spawn_via_env`), ptyprocess PTY, watch-pattern rate limiting + global circuit breaker, gateway notification routing, crash-recovery checkpoint file, per-profile HOME isolation, provider-secret env scrubbing. Shell selection is delegated to Aegis's shared helper. Attribution header retained. |
+| `src/aegis_agent/tools/shell.py` | **original** | — | Shared platform shell selection: Windows retains `cmd /c`; POSIX non-pipelines retain `/bin/sh -c`; real pipelines use Bash `pipefail` when Bash is available, with `/bin/sh` as the compatibility fallback. Quoted or escaped pipe characters and `||` do not trigger pipeline mode. |
+| `src/aegis_agent/tools/builtin/terminal.py` | **REWRITE + original hardening** | `tools/terminal_tool.py` → `terminal_tool` | `{command, timeout, workdir, background, pty}` → foreground `{output, exit_code, error}` or background `{session_id, pid, ...}`. Every non-zero foreground status is an error; command-aware grep/diff explanations remain diagnostic only. Long-running hints parse command positions and executable names rather than searching arbitrary substrings. Timeout output preservation, head/tail truncation, background management, and the operator-only dangerous-command guardrail remain intact. |
 | `src/aegis_agent/tools/builtin/process.py` | **REWRITE** | `tools/terminal_tool.py` process actions (delegating to `process_registry`) | Thin wrapper mapping `action ∈ {list, poll, log, wait, kill, write, submit, close}` onto the shared `ProcessRegistry`; unknown id → `{status: "not_found"}`. |
 | `src/aegis_agent/tools/builtin/run_shell.py` | **removed** | — | Superseded by `terminal`. Its schema/registration and `RunShellTool` references removed; `tools/schemas.RUN_SHELL` deleted. |
 | `src/aegis_agent/models/fake.py`, `tui.py`, `cli.py`, `tools/danger.py`, `tools/registry.py` (docstrings/help) | **original** | — | Updated `run_shell` → `terminal` references (demo shorthand, result renderer, CLI help, guardrail docstrings). |
@@ -208,13 +209,13 @@ computer-use, platform hints, Nous branding + docs URL).
 | Aegis file | Relationship | Hermes source → symbol | Notes |
 |---|---|---|---|
 | `src/aegis_agent/context/system_prompt.py` (`DEFAULT_IDENTITY`) | **ADAPT** | `agent/prompt_builder.py` → `DEFAULT_AGENT_IDENTITY` | De-branded: same helpful/direct/uncertainty-admitting/targeted persona, Nous branding and docs-site pointer removed. Symbol name unchanged so existing imports/tests are unaffected. |
-| `src/aegis_agent/context/prompt_sections.py` (`TaskCompletionContributor`, `ToolUseEnforcementContributor` + their text) | **ADAPT** | `agent/prompt_builder.py` → `TASK_COMPLETION_GUIDANCE`, `TOOL_USE_ENFORCEMENT_GUIDANCE` | Text adapted (de-branded). Rendered only when the tool registry is non-empty. Unlike Hermes these are NOT model-family-gated — the model-substring matching table (`TOOL_USE_ENFORCEMENT_MODELS`) is out of scope. |
+| `src/aegis_agent/context/prompt_sections.py` (`TaskCompletionContributor`, `ToolUseEnforcementContributor` + their text) | **ADAPT + original hardening** | `agent/prompt_builder.py` → `TASK_COMPLETION_GUIDANCE`, `TOOL_USE_ENFORCEMENT_GUIDANCE` | Text adapted (de-branded), with Aegis-specific acceptance rules requiring explicit criteria to be identified and verified from real output; unallowed failures cannot be dismissed as pre-existing/unrelated or reported complete. Rendered only when the tool registry is non-empty. Unlike Hermes these are NOT model-family-gated. |
 | `src/aegis_agent/context/prompt_sections.py` (`ModelIdentityContributor`) | **ADAPT** | `agent/system_prompt.py` → alibaba model-name line | Renders "You are powered by the model named …" only when the provider exposes a truthy `model` (read via `getattr`); fake provider → nothing. |
-| `src/aegis_agent/context/prompt_sections.py` (`EnvironmentContributor`, `_is_wsl`, `_WSL_ENVIRONMENT_HINT`) | **ADAPT** | `agent/prompt_builder.py` → `build_environment_hints` (local branch), `WSL_ENVIRONMENT_HINT`; `hermes_constants.py` → `is_wsl` | Host OS line (WSL/Windows/macOS/Linux) + home + cwd (the ToolContext cwd) + WSL filesystem hint. Remote-backend branch dropped (Aegis has no docker/ssh/modal terminals). |
+| `src/aegis_agent/context/prompt_sections.py` (`EnvironmentContributor`, `_is_container`, `_is_wsl`, `_WSL_ENVIRONMENT_HINT`) | **ADAPT + original hardening** | `agent/prompt_builder.py` → `build_environment_hints` (local branch), `WSL_ENVIRONMENT_HINT`; `hermes_constants.py` → `is_wsl` | Host OS line + home + tool cwd. Aegis's container-marker check takes precedence over WSL kernel detection so Docker-on-WSL reports a Linux container and omits the host-only `/mnt/c` hint. Remote-backend branches remain out of scope. |
 | `src/aegis_agent/context/prompt_sections.py` (`TimestampContributor`) | **ADAPT** | `agent/system_prompt.py` → volatile timestamp line | Date-only "Conversation started: …" for prompt-cache byte-stability (Hermes PR #20451 rationale). Session-id/model/provider sub-lines dropped. |
 | `src/aegis_agent/runtime.py` (`with_defaults` wiring) | **original** | — | Registers the five contributors on `prompt_builder` in Hermes' section order (identity → task-completion → tool-use → skills → mcp → model-identity → environment → timestamp). No change to `run_turn` or the source-of-truth invariant. |
 | `src/aegis_agent/context/__init__.py` (updated) | **original** | — | Re-exports the new contributors. |
-| `tests/test_prompt_sections.py` | **original** | — | 14 tests: per-contributor render/drop conditions + composed-prompt ordering and exclusion of unsupported-subsystem terms (`memory`, `session_search`, `SOUL`, `Hermes`). |
+| `tests/test_prompt_sections.py` | **original** | — | Per-contributor render/drop conditions, acceptance-rule presence, container-over-WSL precedence, composed-prompt ordering, and exclusion of unsupported subsystem terms. |
 
 ## Stage 14 — personal long-term memory (Stage 1: storage format + MEMORY.md index injection + behaviour prompt)
 
@@ -463,7 +464,7 @@ Harbor repository was not modified.
 
 | Aegis file | Relationship | External reference | Notes |
 |---|---|---|---|
-| `src/aegis_agent/integrations/harbor.py` | **original adapter code** | Harbor `BaseAgent`, `BaseInstalledAgent`, custom Python import-path loading, `AgentContext` | Builds and installs the current Aegis wheel in the task environment, runs non-interactive Aegis in `/app`, preserves stdout/stderr and process failure, forwards explicit model/endpoint/credential settings, marks runtime records as evaluations, and backfills Harbor's inclusive token context. |
+| `src/aegis_agent/integrations/harbor.py` | **original adapter code** | Harbor `BaseAgent`, `BaseInstalledAgent`, custom Python import-path loading, `AgentContext` | Builds and installs the current Aegis wheel in the task environment, runs non-interactive Aegis in `/app`, preserves stdout/stderr and process failure, forwards explicit model/endpoint/credential settings, marks runtime records as evaluations, and backfills Harbor's inclusive token context. Explicit container-reachable proxies span system-package setup, pip wheel installation, and runtime; explicit pip mirror/retry settings reach pip, while loopback proxy URLs fail early instead of timing out. |
 | `src/aegis_agent/quality/models.py`, `store.py` | **original** | Harbor `TrialResult`; ATIF step/tool/observation concepts | Defines Aegis's provider-neutral ExecutionRecord, its stable conversation/task/evaluation run-kind discriminator, and atomic local JSON store. It is neither a TrialResult copy nor an ATIF implementation. |
 | `src/aegis_agent/quality/recorder.py`, `observability/composite.py` | **original additive code** | — | Reuses the existing Observability event boundary to capture the Runtime tree without duplicate instrumentation and fans out fail-open to Langfuse plus the local recorder. |
 | `src/aegis_agent/quality/adapters/harbor.py` | **original adapter code** | Harbor 0.22 `TrialResult`, `AgentContext`, job/trial log layout | Finalizes runtime records with exact job/trial/task identity, verifier rewards, combined Harbor usage, exceptions, and artifact paths while retaining detailed Aegis cache buckets. Its jobs-directory sync skips current records by source/target mtime and validated evaluation identity, while containing per-result failures. |
@@ -478,8 +479,12 @@ license entry is required for this phase.
 
 The Harbor adapter now inherits provider and observability settings as before,
 but forwards proxy variables only when explicitly supplied in the agent
-environment. This is an original Aegis reliability fix; neither Hermes nor
-Claude Code was used as a source, and neither reference repository was modified.
+environment. Forwarding covers package setup, pip installation, and runtime;
+loopback URLs are rejected because they resolve inside the task container. The
+Harbor helper gained an explicit per-install environment boundary instead of
+inheriting arbitrary host variables. This is an original Aegis/Harbor
+reliability fix; neither Hermes nor Claude Code was used as a source, and
+neither reference repository was modified.
 
 ## Agent Quality — local Trace Viewer
 
@@ -513,11 +518,49 @@ Failure Episodes before an optional LLM judges only recovery semantics.
 | Aegis file | Relationship | Reference source | Notes |
 |---|---|---|---|
 | `src/aegis_agent/quality/process.py` | **original implementation informed by behavior** | Hermes `agent/tool_guardrails.py`, related guardrail tests; Aegis `memory/sidequery.py` architecture | Defines the ProcessGrader protocol, rule-first configuration/evaluator, five unchanged deterministic graders, Failure Episode extraction, and the optional `FailureRecoveryLLMGrader`. The LLM path uses one provider-neutral, grounded JSON side query only when failures exist and falls back to the unchanged rule score/status on every setup/call/validation failure. The algorithms and prompt are independently written for Aegis; no live warning/block logic was copied. |
-| `src/aegis_agent/quality/conversation.py` | **original additive code** | Aegis Observability and SessionRepository boundaries | Adds an opt-in per-root-Turn observability backend over the existing single-record recorder, plus deterministic reconstruction of historical SQLite sessions. Reconstruction uses only persisted message/tool evidence, marks inferred fields and unavailable telemetry, and is idempotent per user Turn. |
+| `src/aegis_agent/quality/conversation.py` | **original additive code** | Aegis Observability and SessionRepository boundaries | Adds an opt-in per-root-Turn observability backend over the existing single-record recorder, plus deterministic reconstruction of historical SQLite sessions. Reconstruction uses only persisted message/tool evidence, treats every non-zero integer exit code as failed even when an explanatory field is present, keeps sanitized inferred errors string-typed, marks unavailable telemetry, and is idempotent per user Turn. |
 | `src/aegis_agent/quality/models.py`, `quality/__init__.py` | **original additive code** | — | Adds optional `quality.process_evaluation`, versioned aggregate/grade models, `insufficient_data`, and public evaluator exports without changing ExecutionRecord 1.0 source fields. |
-| `src/aegis_agent/cli.py` (conversation Quality options, `quality record-session`, `quality evaluate`) | **original** | — | Opt-in live conversation capture and per-Turn auto-evaluation, historical session reconstruction, and offline record evaluation. Judge enabled/provider/model/base URL preferences can be persisted in app YAML while keys stay in environment; CLI flags remain temporary overrides and model unavailability remains fail-open. |
+| `src/aegis_agent/cli.py` (conversation Quality options, `quality record-session`, `quality evaluate`) | **original** | — | Opt-in live conversation capture and per-Turn auto-evaluation, historical session reconstruction, and offline record evaluation. Failure-recovery Judge resolution defaults to enabled/auto, calls a model only for actual Failure Episodes, and remains fail-open when no real model is available; app YAML can disable it or persist provider/model/base URL preferences while keys stay in environment, and CLI flags remain temporary overrides. |
 | `src/aegis_agent/quality/viewer.py`, `viewer_ui.py` | **original additive code** | — | Surfaces Process score/status/issues separately from Runtime and Harbor Outcome; issue selection focuses the first affected local Step. |
 | `src/aegis_agent/quality/adapters/harbor.py` | **original compatibility change** | Harbor TrialResult lifecycle | Preserves an existing offline process result when a changed Harbor result is finalized again; `result.json` remains read-only. |
 | `tests/test_process_evaluation.py`, `tests/test_conversation_quality.py`, related Quality tests | **original** | — | Deterministic positive, negative, boundary, compatibility, CLI, Harbor-refresh, Viewer, live conversation isolation, historical reconstruction/idempotency, persistent Judge configuration, and safe-fallback contracts without real models. |
 
 No new runtime or third-party dependency was added.
+
+### Harbor network and request-timeout hardening (2026-09-18)
+
+The explicit setup proxy boundary in sibling Harbor's
+`src/harbor/agents/installed/base.py`, Aegis `integrations/harbor.py` proxy/pip
+forwarding and opt-in Linux host-gateway alias, and `scripts/aegis-eval.sh`
+agent/verifier proxy wiring are independently implemented from observed Harbor
+failures. They are not ports from Hermes or Claude Code. The alias is only
+created for an explicitly requested `host.docker.internal` proxy and does not
+start or expose a listener.
+
+`models/openai_compat.py` and `models/anthropic.py` retain their existing source
+relationships above; their new `AEGIS_MODEL_TIMEOUT` environment parsing is an
+original additive configuration change. Explicit caller timeouts take precedence,
+the default remains 60 seconds, and the Harbor wrapper selects 300 seconds.
+Invalid, non-positive, or non-finite environment values fail before model calls.
+The sample-based review in `docs/process-evaluator-review-20260918.md` is an
+original analysis; it does not modify the process grader's scoring algorithms.
+
+## 2026-09-19 Harbor environment startup recovery
+
+Independent Harbor fix, with neither Hermes nor Claude Code used as references: stream Docker Compose build/up progress through the existing logger and reap buffered subprocesses on cancellation. Implementation and regression tests live in `/home/nacha/harbor/src/harbor/environments/docker/docker.py` and `/home/nacha/harbor/tests/unit/environments/test_docker.py`. No copied or adapted reference code.
+
+## 2026-09-19 Batch evaluation setup reliability
+
+- Harbor prebuilt-image acquisition and APT recovery are independently written
+  infrastructure fixes; neither Hermes nor Claude Code code was copied.
+- Aegis managed-Python provisioning references the behavior in
+  `/home/nacha/hermes-agent/scripts/install.sh` (shared managed interpreter
+  directory, Python provisioning, and uv venv creation). The adapter independently
+  stages a pinned, checksum-verified official uv binary from the host, checks
+  architecture/version, and creates Python 3.11 plus an isolated venv under `/opt`.
+  The Hermes installer and its distribution machinery were not ported.
+- Source files: Harbor `src/harbor/environments/docker/docker.py`,
+  `src/harbor/environments/docker/docker-compose-prebuilt.yaml`,
+  `src/harbor/agents/installed/base.py`, `scripts/aegis-eval.sh`; Aegis
+  `src/aegis_agent/integrations/harbor.py`. No attribution change is required for
+  independently written behavior; existing third-party notices remain intact.

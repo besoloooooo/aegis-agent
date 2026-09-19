@@ -23,6 +23,7 @@ streaming (default) and a non-streaming mode; both are normalised to the same
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterator, Sequence
 from typing import Any
@@ -37,6 +38,7 @@ from aegis_agent.models.usage import parse_openai_usage
 ENV_API_KEY = "AEGIS_API_KEY"
 ENV_BASE_URL = "AEGIS_BASE_URL"
 ENV_MODEL = "AEGIS_MODEL"
+ENV_TIMEOUT = "AEGIS_MODEL_TIMEOUT"
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -77,7 +79,7 @@ class OpenAICompatibleProvider:
         cls,
         *,
         stream: bool = True,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> OpenAICompatibleProvider:
@@ -100,6 +102,7 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(f"{ENV_API_KEY} is not set; export it to use the OpenAI-compatible provider.")
         if not model:
             raise ModelProviderError(f"{ENV_MODEL} is not set; export it (e.g. 'gpt-4o-mini').")
+        timeout = _resolve_timeout(timeout)
         return cls(
             api_key=api_key,
             base_url=base_url,
@@ -176,6 +179,22 @@ class OpenAICompatibleProvider:
             raise ModelProviderError("the 'openai' package is required for the OpenAI-compatible provider") from exc
         self._client = OpenAI(api_key=self._api_key, base_url=self._base_url, timeout=self._timeout)
         return self._client
+
+
+def _resolve_timeout(explicit: float | None) -> float:
+    """Resolve the request timeout, preferring an explicit caller value."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(ENV_TIMEOUT)
+    if raw is None:
+        return DEFAULT_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ModelProviderError(f"{ENV_TIMEOUT} must be a positive number of seconds.") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ModelProviderError(f"{ENV_TIMEOUT} must be a positive number of seconds.")
+    return timeout
 
 
 # -- wire helpers -----------------------------------------------------------

@@ -325,7 +325,7 @@ def _reconstruct_turn(
                     input=sanitize(arguments),
                     output=sanitize(message.content),
                     success=success,
-                    error=sanitize(error),
+                    error=_string_or_none(sanitize(error)),
                     started_at=step_time,
                     finished_at=step_time,
                     metadata={
@@ -384,7 +384,6 @@ def _infer_historical_tool_result(content: str) -> tuple[bool, str | None]:
         failed = (
             isinstance(exit_code, int)
             and exit_code != 0
-            and not payload.get("exit_code_meaning")
         )
     return (False, str(error or content)) if failed else (True, None)
 

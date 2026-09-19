@@ -4385,3 +4385,270 @@ WSL 和远程 Harbor 环境的一致语义与更安全的凭据/网络边界。
 问题不是 Provider 不可用，而是宿主和容器对 `127.0.0.1` 的网络命名空间语义不同。
 修复将代理配置从“环境回退”改为“显式跨边界传递”，并用正反测试锁定行为：宿主代理
 不会泄漏，用户明确配置的容器可达代理仍能工作。
+
+## Harbor/Terminal-Bench 工具结果语义与验收提示加固
+
+### 目标与原问题
+
+Harbor 轨迹暴露了五个相互放大的证据问题：`terminal` 为所有退出码 1 添加通用
+`exit_code_meaning`，随后又把“存在解释字段”当作成功豁免，导致 Python、pytest、git 等真实失败在
+Trace 中显示成功；历史 Session 重建也复制了同一豁免。长运行提示对整条命令做子串搜索，使普通参数
+`/git/server.git` 因包含 `serve` 被误报。POSIX 前台和后台均使用 `/bin/sh -c`，管道末端成功可覆盖
+上游失败。System prompt 只要求实际执行，没有把用户明确验收项变成完成门槛。最后，Docker Desktop
+容器共享 WSL2 内核版本字符串，单纯检查 `/proc/version` 会把容器误报为 WSL 并注入宿主 `/mnt/c`
+提示。
+
+### 参考关系与迁移决策
+
+本次是在 Aegis 已有 Terminal、ProcessRegistry、Prompt Contributor 和 Quality Reconstruction 边界内
+独立完成的最小加固，没有复制 Hermes 或 Claude Code 新代码，也没有读取或修改两个参考仓库。原有
+`terminal.py`、`process_registry.py` 和 prompt contributor 中已注明的 Hermes 来源与 MIT attribution
+继续保留；新增的退出语义、命令解析、shell 选择、验收规则和容器优先检测均记为 Aegis 原创增量。
+
+### 设计与行为变化
+
+- `terminal` 现在对每个非零返回码设置 `ToolResult.is_error=True`，JSON 同时保留 stdout/stderr、数值
+  `exit_code` 和明确的 `error`。退出码 1 的说明改成命令感知：grep/diff 可获得约定说明，其他命令只
+  得到保守的“命令特定失败或否定结果”；说明字段不再改变成功状态。
+- 历史 Conversation Record 重建对所有非零整数退出码保守判失败，即使旧结果含
+  `exit_code_meaning`；仅由 exit code 推导出的错误先统一脱敏再转为字符串，保持 Schema 类型稳定。
+- 长运行判断先按 shell 控制操作符切分，再只检查每段的真实可执行程序、子命令、模块或 watch 参数；
+  支持常见 server/watch 命令及 `uv run`/`npx` 等包装器，但不扫描普通路径和参数的任意子串。尾随真实
+  `&` 仍提示使用托管后台模式。
+- 新增共享 `tools/shell.py`。Windows 完全保留 `cmd /c`；POSIX 无管道命令保留 `/bin/sh -c`；只有
+  检测到未引用、未转义的真实管道时，才在 Bash 可用时使用 `bash -o pipefail -c`。Bash 不存在则兼容
+  回退 `/bin/sh`。前台 terminal 与后台 ProcessRegistry 共用同一选择逻辑。
+- `TASK_COMPLETION_GUIDANCE` 明确要求开始时识别用户验收条件、结束前逐项用当前真实工具输出验证；任何
+  未被用户明确允许失败的测试或验收项仍失败时不得宣布完成，也不得自行降级为历史、既有或无关问题。
+- 环境提示先检测 Linux 容器的环境变量、Docker/Podman 标记和常见 cgroup 标记，再检测 WSL。因而
+  Docker-on-WSL 显示 `Host: Linux container`，保留真实 home/cwd，但不再注入 `/mnt/c` 宿主提示。
+- 危险命令检测和 operator-only `allow_dangerous_shell` 没有改动；`rm -rf` 等保护保持原语义。
+
+### 测试、验收与文档
+
+新增回归覆盖 Python `SystemExit(1)`、真实 pytest 失败、真实 git commit 退出 1、grep 解释不豁免错误、
+`/git/server.git` 不提示、真实 HTTP server/watch 提示、前台与托管后台管道上游失败、System prompt
+验收规则、容器优先于 WSL，以及旧 Session 中“解释字段 + 非零退出码”的保守重建。定向核心套件为
+`58 passed`；MCP/Session lint 相关小套件为 `22 passed`；全仓为
+`757 passed, 3 skipped in 527.97s`。修改文件 Ruff 与最终 `uv run ruff check .` 均通过，
+`git diff --check` 通过。
+
+为遵守“不修改 benchmark 文件”，Ruff 将仓库内 byte-for-byte 保存的
+`benchmarks/terminal-bench-sample` 明确排除为外部评测输入；样例内容未改。此前全仓 Ruff 还暴露 5 个
+Aegis 既有 lint，均以无行为变化的最小修正处理：进程生命周期 devnull 句柄加意图注释、导出/导入
+排序，以及对有意把参数当字符集合的 `str.strip` 加局部说明。README 英中版本同步更新了里程碑说明、
+terminal 语义、pipefail 与 Harbor 容器提示；source map 记录了原创加固边界。
+
+### 权衡、限制与尚存风险
+
+`pipefail` 只在 Bash 可用时启用；极简 POSIX 系统若没有 Bash 会安全回退 `/bin/sh`，此时管道仍可能
+保留传统“最后命令决定状态”的语义。`pipefail` 也会把预期的 SIGPIPE（例如无限输出接 `head`）显示为
+非零；这是为避免掩盖上游失败而选择的保守行为，模型仍可根据输出判断。长运行识别刻意采用常见命令
+白名单，未知框架可能不会获得提示，但普通路径不会再误触发。容器检测覆盖主流 Docker、Podman、
+Kubernetes 和 LXC 标记，无法保证识别没有这些标记的定制容器。
+
+### 面试式总结
+
+这次修复的核心是把“解释证据”和“成功判定”彻底分离：退出码与命令约定仍完整交给模型，但任何非零
+状态都不会在遥测层伪装成成功。随后从两端补齐证据链——执行端用 pipefail 防止管道吞错，提示端把
+用户验收项设为不可自行降级的完成门槛；同时用结构化命令识别消除路径子串误报，并让容器身份优先于
+共享的 WSL 内核信息。所有变更都留在 Aegis，既没有削弱危险命令保护，也没有修改外部 benchmark。
+
+## Process Evaluation 默认启用 Failure-Recovery LLM Judge
+
+### 目标与原问题
+
+过程评测已经支持规则优先、LLM 辅助的 Failure Recovery Grader，但没有显式 CLI 参数或 YAML
+配置时，Judge 默认关闭。这与预期的日常运行方式不符：操作者希望直接执行
+`aegis quality evaluate --all`，在已有模型配置可用时自动获得 LLM 对失败诊断、针对性调整和目标恢复的
+精炼判断。
+
+### 设计与行为变化
+
+- Judge 的缺省设置由关闭改为 `enabled: true`、`provider: auto`。现有的 CLI/环境 Provider 覆盖和
+  YAML 中的 model/base URL 覆盖优先级保持不变。
+- LLM 调用边界不变：只有 Record 中至少存在一个 Failure Episode 时才进行一次 Side Query，其余五个
+  Grader 始终为确定性规则。
+- Fail-open 语义不变：没有真实模型配置、Provider 初始化或调用失败、JSON 非法或证据无法映射回 Trace
+  时，保留规则分数与状态，整批评测继续运行。完全隐式的默认配置在模型不可用时静默降级，以保持
+  `--json` 输出纯净；显式 CLI/YAML Judge 配置不可用时仍输出警告。
+- `quality.failure_recovery_judge.enabled: false` 仍是明确的纯规则模式开关。
+- 单元测试现在显式清空可能从开发者 `.env` 继承的 Aegis/Anthropic 模型凭据，避免默认开启后测试误调
+  真实外部 API；需要 Judge 的测试自行注入假凭据或 Fake Provider。
+
+### 参考关系与验证
+
+这是 Aegis Process Evaluation 配置策略的原创调整，没有读取、复制或修改 Hermes、Claude Code。
+新增回归验证无 Quality 配置时能从标准 Aegis 环境自动建立 Judge，并保留显式关闭契约；中英文 README
+同步说明默认开启、按 Failure Episode 调用及安全降级行为。Process/Conversation 定向套件为
+`44 passed`；全仓回归为 `759 passed, 3 skipped in 528.32s`；全仓 Ruff 与 `git diff --check` 均通过。
+
+### 权衡与剩余风险
+
+默认开启意味着含 Failure Episode 的真实评测会产生一次额外模型调用及相应成本；操作者可用
+`enabled: false` 全局关闭，或在单条 Record 的 `process_evaluation_config` 中禁用。`provider: auto`
+依赖可用凭据和模型配置；配置不完整时只给出警告并回退规则结果，不会把 Process Evaluation 变成硬失败。
+
+## Harbor Agent Setup 显式代理贯通
+
+### 目标与原问题
+
+为扩充 Process Evaluation 样本并行启动 5 个 Terminal-Bench Trial 时，所有 Trial 都在进入 Agent
+Loop 前失败：3 个 `AgentSetupTimeoutError`、1 个 Debian 下载 `NetworkConnectionError`、1 个随后产生的
+非零 Setup 退出。宿主 WSL 使用 `127.0.0.1:10808`，该回环地址在容器中指向容器自身；与此同时，Aegis
+原先只把显式代理送入 Runtime，Harbor 的 `apt-get` 与 Aegis Wheel 的 pip 安装收不到代理。已有评测
+脚本传入的 pip 镜像、超时和重试参数也没有进入 pip 子进程。
+
+### 设计与行为变化
+
+- Harbor `BaseInstalledAgent.ensure_system_dependencies()` 新增显式 `env` 边界；缺依赖时把该环境合并到
+  apt/dnf/yum/apk 安装命令，apt 仍强制 `DEBIAN_FRONTEND=noninteractive`。默认调用不传环境，旧行为不变。
+- Aegis Adapter 只读取 `extra_env` 中用户显式提供的代理，不继承宿主代理；同一代理现在传入系统包安装、
+  pip Wheel 安装和 Runtime。
+- pip 安装阶段同时接收显式 `PIP_INDEX_URL`、Extra Index、Timeout、Retries、CA/证书以及离线
+  `PIP_NO_INDEX`/`PIP_FIND_LINKS` 设置。
+- 显式 `localhost`、IPv4/IPv6 回环代理在 Setup 前直接报错，避免等待 360 秒后才得到模糊 timeout；错误
+  不回显完整代理 URL，避免代理凭据泄露。
+- `scripts/aegis-eval.sh` 新增 `AEGIS_HARBOR_PROXY`/`AEGIS_HARBOR_NO_PROXY` 映射。只有专用变量存在时
+  才传代理，不会把宿主 `127.0.0.1` 自动复制进容器。
+
+### 参考关系、验证与权衡
+
+这是基于真实 Harbor 失败日志完成的 Aegis/Harbor 原创可靠性修复，没有使用 Hermes 或 Claude Code。
+Harbor 系统依赖定向测试验证默认兼容与 apt 环境合并；Aegis 适配器测试验证宿主代理隔离、显式代理贯通、
+三种回环地址拒绝及 pip 设置传递。操作者仍需让代理监听容器可达地址；代码不会自动开放本地代理
+端口。Timeout multiplier 只作为慢网兜底，不再承担代理配置修复职责。
+
+### 真实运行发现与追加修复
+
+第一轮代理贯通后 Setup 完成，模型完成第一次调用并写文件，第二次调用超时。排查时原代理 URL
+使用的 `172.20.10.2` 已不可达，WSL 接口显示为 `10.25.20.239`，证明固定局域网 IP 不适合长 Trial。
+这支持网络变化导致中断的判断，但不能据此断言模型本身需要更大的超时。
+
+当显式代理 URL 使用 `host.docker.internal` 且容器没有解析该名字时，Adapter 使用容器默认路由的
+网关补充 `/etc/hosts`；已有解析保持不变。这个方案针对本地 Linux/WSL Docker，不承诺其他远程
+容器后端的网关就是操作者的本机。主机名映射不改变监听接口或防火墙。
+
+两种模型 Provider 新增 `AEGIS_MODEL_TIMEOUT`，默认仍是 60 秒，显式调用参数优先；非法、非正数、
+NaN/Infinity 在创建 Provider 前报错。Harbor wrapper 缺省传 300 秒。它是 SDK 传输超时，
+不是整条 Agent 运行的总时限，SDK 重试或持续收到流式数据可让总耗时超过该值。
+
+第二轮稳定代理试验 `d2ebf469-f9e4-44f1-92d3-bbeab70bef25` 完成 5 次模型调用、4 次工具调用，
+Runtime success=true；但 Verifier 下载 uv 超时。Verifier 环境独立于 Agent，因此 wrapper
+进一步为两者都传入大小写 HTTP(S) 代理和 NO_PROXY；小写形式也覆盖 apt/curl 的环境约定。
+测试用临时 TCP 转发，仅用于本次验收，不写入用户持久配置。
+
+### 验证结果与范围
+
+- Aegis 全仓：`uv run pytest -q` → `764 passed, 3 skipped`；最后的有限数校验追加后，
+  Provider/Harbor record 定向套件 → `44 passed, 1 skipped`；`uv run ruff check .` 通过。
+- 在 Harbor 环境加载 Aegis Adapter 的定向测试 → `22 passed`，避免 Aegis 默认环境因 Harbor
+  可选依赖缺失而把整个 Adapter 文件跳过。
+- Harbor 系统依赖与 wrapper 定向测试 → `18 passed`；修改文件 Ruff、格式和 base.py 的 ty 通过。
+- Harbor 全量 unit 尝试在收集阶段遇到 12 个缺可选依赖错误（如 pandas、anthropic、hypothesis、
+  云环境 SDK）；全仓 ty 为 160 个诊断，包含可选依赖缺失及其他模块类型问题，不能报告全仓通过。
+- 原始 Trial、Runtime Record 与 verifier 日志保留；评测结果通过正常 import/evaluate 写入中央
+  Store。未修改 benchmark、奖励或评分算法来让样例通过。
+- Hermes 工作树干净；Claude Code 既有改动列表与之前一致，本次没有对参考仓库执行写操作。
+
+### 过程评测复核
+
+`docs/process-evaluator-review-20260918.md` 记录原始样例、当前评分、人工复核依据和 P0–P3
+改进顺序。确认 Setup 失败的空轨迹可被当前规则给 1.0 PASS，自定义 Python 自测可被漏判，
+网络中断触发的真实 LLM Judge 仍缺少“是否有恢复机会”的归责信息。网络修复为扩充有效样例
+提供基础；评分算法改动保持为可审阅方案。
+
+### 面试式总结
+
+把超时拆解成安装、模型传输、独立验证三个阶段，用真实日志定位代理边界、动态宿主 IP 和
+Verifier 隔离问题。通过显式代理传递、按需网关映射及独立可配置模型超时修复运行链路，
+同时用真实失败与成功轨迹检查评测器本身，区分缺证据、错误行为和基础设施中断。
+
+### 本轮变更文件与验证命令
+
+网络与超时实现涉及 Aegis `src/aegis_agent/integrations/harbor.py`、
+`src/aegis_agent/models/openai_compat.py`、`src/aegis_agent/models/anthropic.py`，以及对应的
+`tests/test_harbor_adapter.py`、`tests/test_openai_provider.py`、`tests/test_anthropic_provider.py`；
+Harbor 涉及 `src/harbor/agents/installed/base.py`、
+`tests/unit/agents/installed/test_system_dependencies.py`、`scripts/aegis-eval.sh`、
+`tests/unit/test_aegis_eval_script.py`。文档涉及中英文 README、source-map、本开发日志和
+`docs/process-evaluator-review-20260918.md`。未提交 Git，也未覆盖同工作树中的其他既有修改。
+
+主要命令为 `uv run pytest -q`、Provider/Harbor 相关的定向 pytest、`uv run ruff check .`、
+Harbor `uv run --with pytest --with pytest-asyncio python -m pytest` 的定向及全量 unit 尝试、
+`uv run --with ruff ruff format --check <changed-files>`、`uv run --with ty ty check`
+以及 base.py 的定向检查、两仓 `git diff --check`。真实验收用 wrapper 启动 Harbor，
+随后执行 `uv run aegis quality import-harbor <job>` 和 `uv run aegis quality evaluate <id>`。
+
+Harbor 全仓 Ruff 已通过。原始 verifier uv 安装地址预检曾返回 403，三条最终样例额外预装了
+GitHub 官方相同版本 uv 0.7.13，并校验同 Release 的 SHA256；随后日志汇总任务的原始 installer
+也成功运行，因此这不是已证实的永久站点不可达。环境准备和复现限制详见样例报告。
+
+### 最终三条 Harbor 验收样例
+
+- log-summary-date-ranges：`bbc25635-6d91-4f6a-b035-467a5c7cffad`，Harbor reward=1、官方
+  2 项测试通过，Process=1.0 PASS。人工复核发现其 Final Verification 的 `required=false`
+  理由有误，未识别内联 Python 写 CSV。
+- regex-log：`acd1dc0e-cdce-410f-848b-5edef2e1c37d`，Harbor reward=1、官方 1 项测试通过，
+  Process=0.8333 FAIL。实际 Python heredoc 自测被遗漏，再现 Final Verification 误报。
+- polyglot-c-py：`d23d64b7-159f-4a73-ada3-01e37384a8a7`，Harbor reward=0、官方目录约束失败，
+  Process=0.8333 FAIL。LLM Judge 确实应用并确认 SyntaxError 已恢复；本地做过数值验证，
+  但多余 `cmain`、`test_warn.c` 未清理，因此评分需要表达“部分验收覆盖”而非“未验证”。
+
+三条均无 Harbor 基础设施异常，已导入并评分。测试用临时 TCP 转发已停止，Docker 无运行中的
+测试容器，原始 Job/记录仍保留。方案完成在报告中，评分规则本身尚未实施上述改进。
+
+## 2026-09-19：修复 chess-best-move 环境启动超时并保留诊断
+
+### 原始问题与证据
+
+Job `2026-09-18__21-23-49` 在 Docker Compose up 阶段等待 600 秒后抛出
+`EnvironmentStartTimeoutError`，Agent 尚未运行。任务包 digest 为
+`9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da`，指定镜像
+`alexgshaw/chess-best-move:20251031`。Docker daemon 同时记录镜像站
+`docker.xuanyuan.me` 返回 403，另一镜像站出现 Host doesn't match；重复拉取卡在
+`c38c7b25e3de` 层（约 144 MB）。这说明以前针对 pip/模型/Verifier 的修复不覆盖此阶段。
+
+### 修复、来源与数据流
+
+从 `registry-1.docker.io/alexgshaw/chess-best-move:20251031` 成功获取原镜像，随后
+将同一镜像标记为任务要求的名称。拉取 digest 为
+`sha256:bb447f94d9e2a8ed879f85c85a514b213b7418f9fe11fd7b2428a0b0e436e647`。
+没有拿旧 GHCR 镜像替代，也没有改任务内容、镜像站全局配置或历史结果。
+
+Harbor `DockerEnvironment.start` 将 build/up 输出交给已有流式收集器，逐行写入
+trial logger；外层启动超时后依然保留已收到的下载进度。缓冲收集器新增外部取消时的
+子进程终止与等待，随后原样抛出 CancelledError，保留 Trial 的超时分类。
+现有流式收集器已支持取消清理。测试覆盖真实子进程的取消清理及启动日志在取消前可见。
+本次是 Harbor 独立缺陷修复，未参考、复制或改编 Hermes / Claude Code；不涉及迁移。
+
+### 变更文件
+
+- Harbor：`src/harbor/environments/docker/docker.py`、`tests/unit/environments/test_docker.py`。
+- Aegis：`README.md`、`README.zh-CN.md`、`docs/source-map.md`、`docs/development-log.md`。
+- 验收产物：Harbor `jobs/chess-startup-recovery-20260919/`，不改写原 Job。
+
+### 验证与命令
+
+执行 `docker pull registry-1.docker.io/alexgshaw/chess-best-move:20251031`、
+`docker tag registry-1.docker.io/alexgshaw/chess-best-move:20251031 alexgshaw/chess-best-move:20251031`。
+使用原 digest 对应的本地缓存任务执行 `uv run --no-sync harbor run -p <原任务缓存目录>
+-a nop --disable-verification --job-name chess-startup-recovery-20260919 -n 1 -k 1`。
+验收 19 秒完成，异常数为 0，容器进入 Healthy 并正常清理；不调用付费模型、不运行评分器，
+因此这不是 Qwen 解题通过的证据，显示 Mean=0 属于禁用验证后的结果。
+
+Docker/Podman 定向回归：157 passed、1 skipped。相关文件 Ruff 检查及格式化通过，
+`uv run --with ty ty check src/harbor/environments/docker/docker.py` 通过。
+完整 environments 测试收集被七个可选云 SDK 缺失阻断；全仓 ty 有 160 条既有/缺依赖诊断，
+未为此修改无关模块。两仓 `git diff --check` 通过。
+`git status --porcelain` 确认 Hermes 保持干净、Claude Code 既有修改列表与检查前一致。
+
+### 限制与面试总结
+
+当前任务镜像已经缓存，重跑无需再次下载；其他未缓存镜像仍可能受镜像站或网络影响。
+没有增加重试或盲目拉长所有超时；后续可根据实时下载日志判断是否需要独立环境启动预算。
+没有重新执行完整 Qwen 评测，也没有宣称修复所有其他错误。保留已有工作树修改，不提交。
+本次将问题定位到模型执行之前的镜像下载，恢复准确的输入镜像，同时修复诊断日志与取消
+清理，使基础设施失败可被定位且不会留下未回收的 Compose 客户端。
+
+最终全仓静态检查：Harbor `uv run --with ruff ruff check .` 全部通过；`uv run --with ruff ruff format --check .` 确认 1356 个文件无需格式化。Aegis 本轮仅改文档，未重复运行其运行时全套测试。

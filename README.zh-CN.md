@@ -18,7 +18,7 @@
 4. Skills 子系统 —— `SKILL.md` 发现 / 加载 / 路由
 5. 轻量 MCP 客户端 —— stdio + Streamable HTTP
 6. 文件编辑工具 —— write_file / patch / search_files
-7. 终端与后台进程工具
+7. 终端与后台进程工具 —— 严格的非零退出语义与 POSIX 管道失败保留
 8. Web 工具 —— 带 SSRF 防护的 web_search / web_extract
 9. 技能管理 —— `skill_manage`
 
@@ -28,7 +28,7 @@
 12. SQLite 持久化 + 快照快速恢复 + 跨进程租约
 
 **提示 / 记忆 / 搜索**
-13. 动态系统提示词段
+13. 动态系统提示词段 —— 验收门槛与容器感知的环境提示
 14. 个人长期记忆（Auto Memory）—— `USER.md` + `MEMORY.md` 索引
 15. 记忆召回 + 后台提取
 16. 会话历史搜索 —— FTS5 `session_search`
@@ -43,9 +43,11 @@
 19. 多代理编排 —— `Agent`、`team_create`、`send_message`、`/agents`
 
 **代理质量基础**
+- Harbor 安装可靠性 —— 有界 Docker Hub 恢复、严格 APT 索引刷新及一次软件包 404 恢复、独立兼容 Python。
 - 质量阶段 0 —— 可选 Langfuse 端到端追踪，覆盖 Agent 运行、模型调用、工具调用、子代理与最终结果
 - 质量阶段 1–2 —— Harbor 自定义代理集成，以及一个与提供者无关的 `ExecutionRecord`，
-  将运行时步骤、用量、Harbor 验证器结果与产物关联起来，并对代理转发采用容器安全的显式启用策略
+  将运行时步骤、用量、Harbor 验证器结果与产物关联起来，支持 Setup/Runtime/Verifier 显式代理、
+  按需 Docker 宿主别名和可配置模型请求超时
 - 质量阶段 3 —— 规则优先、可解释的 Process Evaluation，包含可选的失败恢复 LLM Judge、
   可选的实时/历史普通对话 Record、CLI 批量评测，以及可定位到 Trace Step 的 Viewer Issue
 - 本地 Trace Viewer，支持一键同步 Harbor、按游标分页读取 Langfuse Root、分栏展示
@@ -319,7 +321,8 @@ Anthropic 的 API 不返回总 token 或直接成本，因此 Aegis 让这些字
 
 Aegis 提供非交互式 runner 和一个 Harbor 自定义已安装代理。
 Harbor 仍然负责任务、环境、试验（trials）、重试/并发、验证器与奖励；
-Harbor 仓库本身无需修改。
+启用代理的 Setup 使用本次集成在兄弟 Harbor 仓库中增加的
+`ensure_system_dependencies(..., env=...)` 接口。
 
 直接运行一个 Aegis 任务（除非显式使用 `--model-backend fake`，否则
 使用所选的真实提供者）：
@@ -341,17 +344,58 @@ PYTHONPATH=../aegis-agent/src uv run harbor run \
   --model openai/qwen-model \
   --ae AEGIS_API_KEY="$AEGIS_API_KEY" \
   --ae AEGIS_BASE_URL="$AEGIS_BASE_URL" \
+  --ae AEGIS_MODEL_TIMEOUT=300 \
   --ae LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
   --ae LANGFUSE_SECRET_KEY="$LANGFUSE_SECRET_KEY" \
   --ae LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL"
 ```
 
 宿主机代理变量不会被隐式复制进任务容器。`127.0.0.1:10808` 之类的回环代理在
-容器中会指向容器自身，并导致模型 `APIConnectionError`。如果提供者确实需要代理，
-应先使用容器可达的代理地址，再通过 `--ae HTTP_PROXY=...` / `--ae HTTPS_PROXY=...`
-显式传入。
+容器中会指向容器自身，显式传入时也会被提前拒绝。如果 Setup 或模型端点需要代理，
+应先把代理暴露到容器可达的地址，再通过 `--ae HTTP_PROXY=...` / `--ae HTTPS_PROXY=...`
+显式传入。在原生 Linux/WSL Docker 上，推荐让代理 URL 使用 `host.docker.internal`；
+只有显式使用该主机名时，适配器才会把它映射到当前任务容器的 Docker 网关，因此即使
+WSL 的局域网地址在 Trial 中途变化也保持稳定。显式代理现在同时覆盖系统包安装、
+Aegis Wheel 安装和 Runtime；显式的
+`PIP_INDEX_URL`、`PIP_DEFAULT_TIMEOUT`、`PIP_RETRIES` 等 pip 设置也会用于 Wheel 安装。
+本地 `scripts/aegis-eval.sh` 用 `AEGIS_HARBOR_PROXY` 为 Agent 和 Verifier 同时配置大小写
+HTTP(S) 代理变量，并用 `AEGIS_HARBOR_NO_PROXY` 配置两者的绕过列表。代理必须监听 Docker
+可达的接口；主机名映射本身不会启动代理，也不会开放仅监听 localhost 的端口。
+
+Docker 镜像拉取发生在 Agent Setup 之前。配套 Harbor 仓库显式准备 `task.toml`
+预构建镜像：优先复用本地镜像，正常仓库拉取最多 90 秒，失败后对同一 Docker Hub
+仓库、标签或 digest 尝试官方地址，最多 300 秒。自定义仓库和 Podman 不会被改写。
+Compose 使用已准备好的镜像；取消后保留下载日志并回收子进程。原有外层环境期限仍然
+有效。Dockerfile 基础镜像和显式自定义 Compose 覆盖不属于此恢复范围。
+
+APT 安装要求索引更新成功，绕过 HTTP 缓存，并限制网络重试与超时。软件包下载 404
+会触发一次重新刷新索引再安装；其他安装失败仍然报错。Aegis 在 `/opt/aegis-python`
+准备 Python 3.11，在 `/opt/aegis-venv` 建立独立环境，不替换任务的系统 Python。
+固定版本 uv 在宿主机下载并校验后传入任务，因此不要求容器能访问 GitHub。
+显式 pip 索引、证书配置会转换给 uv，显式 UV 下载配置也会传入。wrapper 同时为
+Agent 安装和 verifier 配置托管 Python 下载镜像。
+
+可先执行只检查安装的命令，不调用模型、不评分：
+
+```bash
+aegis-eval terminal-bench/qemu-startup --install-only
+```
+
+安装检查通过只代表环境和 Agent 安装成功，不代表解题通过。外部仓库或软件源持续
+不可用仍会耗尽有界尝试，日志会保留失败阶段，不会把失败当成成功。仅当镜像下载进度
+表明需要更多预算时，使用 `--environment-build-timeout-multiplier`；Agent 安装和
+模型超时配置不影响镜像拉取。
+
+模型请求默认采用 60 秒无数据超时。长推理模型在流式分块之间可能停顿更久，因此 Harbor
+评测应显式设置 `AEGIS_MODEL_TIMEOUT`；本地 wrapper 默认使用 300 秒。这个设置只调整模型
+传输超时，不会掩盖 Setup 失败，也不会延长 Harbor 自身独立的阶段超时。
+
+[真实样例复核报告](docs/process-evaluator-review-20260918.md) 记录了已观察到的过程评测误报、
+空轨迹评分、基础设施故障，以及建议的评分改进顺序。
 
 适配器会在 Harbor 任务环境中安装当前的 Aegis wheel，并在 `/app` 中运行工具。
+容器标记优先于继承的 WSL 内核特征，因此 system prompt 会描述真实的 Linux 容器，
+不会宣传仅宿主可用的 `/mnt/c` 路径。
 Harbor 的试验 UUID 成为 Aegis 的 `execution_id`；Langfuse trace id 由它
 确定性派生，因此无需时间戳匹配。运行时记录写入试验的 `agent/` 日志之下。
 Harbor 完成其验证器后，终态化单个试验或整个任务：
@@ -411,8 +455,9 @@ Sync POST，它只访问配置好的 Jobs 目录，并使用每次启动随机�
 ## 🔎 过程评测（质量阶段 3）
 
 Process Evaluation 只消费已有 `ExecutionRecord`，不强依赖 Langfuse 或 Harbor，也不改变
-Agent Loop。默认只运行确定性规则，不调用模型。可以评测一个 JSON Record/Execution ID，或批量
-评测本地 Store：
+Agent Loop。失败恢复 LLM Judge 默认启用，Provider 为 `auto`；只有 Record 确实包含 Failure
+Episode 时才发起一次 Side Query。没有可用的真实模型或 Judge 调用失败时，会安全保留确定性规则
+结果。可以评测一个 JSON Record/Execution ID，或批量评测本地 Store：
 
 ```bash
 uv run aegis quality evaluate <execution-id-or-record.json>
@@ -469,15 +514,16 @@ quality:
     record: false
     evaluate: false
   failure_recovery_judge:
-    enabled: true
-    provider: openai       # auto、openai 或 anthropic
-    model: <judge-model>
+    enabled: true          # 默认值；设为 false 可使用纯规则评测
+    provider: auto         # auto、openai 或 anthropic
+    model: null            # 可选的 Judge 专用模型覆盖
     base_url: null         # 可选兼容 Endpoint
 ```
 
 API Key 不写入 YAML。OpenAI-compatible Judge 读取 `AEGIS_API_KEY`，未在上面覆盖时读取
 `AEGIS_MODEL` / `AEGIS_BASE_URL`；Anthropic Judge 读取 `ANTHROPIC_API_KEY`，并可读取
 `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL`。显式 CLI 参数临时覆盖配置的 Provider；
+没有 Quality 配置时，Judge 解析仍默认使用 `enabled: true` 和 `provider: auto`；
 `enabled: false` 会让所有 Process Evaluation 保持纯规则模式。
 
 每个非 Pass Grade 都包含 Severity、Evidence 和可定位的 `step_id`。如果字段不足以可靠判断，
@@ -660,7 +706,8 @@ mcp_servers: { ... }
 可通过上面的 `iterations.max` 持久设置，或单次启动时使用
 `uv run aegis --max-iterations 100`（简写 `-n 100`）覆盖。
 修改后需重启 Aegis 并恢复会话才能生效；已经运行的会话保留启动时的上限。
-子代理显式配置的上限不变。
+内置 typed 子代理（`explore` 和 `general-purpose`）每轮允许 25 次迭代；
+自定义 `AgentDefinition` 仍使用其显式设置的 `max_iterations`。
 
 可从文件配置：memory（`enabled` / `recall` / `extract` / `project`）、
 context（`compress` / `max_tokens`）、iterations（`max`）、
@@ -722,8 +769,11 @@ skill_manage
 
 更多工具可以通过 MCP 暴露。
 
-`terminal` 前台超时返回 `exit_code: 124`，并保留进程被杀死前捕获的
-stdout/stderr，因此代理可以用替代命令恢复，而不是丢失部分诊断信息。
+`terminal` 将每个非零命令状态标记为错误，同时保留数值 `exit_code`、输出和供诊断的
+命令感知解释。POSIX 下，如果 Bash 可用，前台与托管后台管道都启用 `pipefail`，
+因此末端过滤器成功不会掩盖上游失败；Windows 继续使用 `cmd /c`。长运行提示只检查
+真实命令/可执行程序位置，不扫描路径或参数中的任意子串。前台超时返回
+`exit_code: 124`，并保留进程被杀死前捕获的 stdout/stderr。
 
 ---
 

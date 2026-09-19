@@ -31,6 +31,7 @@ from __future__ import annotations
 import datetime
 import os
 import sys
+from pathlib import Path
 from typing import Protocol
 
 # ── Behaviour text (adapted from Hermes, de-branded) ────────────────────────
@@ -42,6 +43,12 @@ TASK_COMPLETION_GUIDANCE = (
     "one. Do not stop after writing a stub, a plan, or a single command. Keep "
     "working until you have actually exercised the code or produced the "
     "requested result, then report what real execution returned.\n"
+    "At the start of the work, identify every acceptance criterion the user "
+    "stated explicitly. Before finishing, verify each one against current, "
+    "real tool output. If any test or acceptance criterion the user did not "
+    "explicitly allow to fail is still failing, the task is not complete and "
+    "you must not claim completion. Never dismiss such a failure as historical, "
+    "pre-existing, or unrelated on your own.\n"
     "If a tool, install, or network call fails and blocks the real path, say so "
     "directly and try an alternative (different package manager, different "
     "approach, ask the user). NEVER substitute plausible-looking fabricated "
@@ -86,6 +93,37 @@ class _ToolCountable(Protocol):
 
 
 _wsl_detected: bool | None = None
+_container_detected: bool | None = None
+
+
+def _is_container() -> bool:
+    """Return True for common Linux container runtimes, cached per process.
+
+    Docker Desktop containers inherit the WSL2 kernel release string, so WSL
+    detection alone describes the outer kernel rather than the agent's actual
+    execution environment.  Container markers therefore take precedence.
+    """
+    global _container_detected
+    if _container_detected is not None:
+        return _container_detected
+    if not sys.platform.startswith("linux"):
+        _container_detected = False
+        return False
+    if os.environ.get("container"):
+        _container_detected = True
+        return True
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        _container_detected = True
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8").lower()
+    except OSError:
+        cgroup = ""
+    _container_detected = any(
+        marker in cgroup
+        for marker in ("docker", "containerd", "kubepods", "libpod", "lxc")
+    )
+    return _container_detected
 
 
 def _is_wsl() -> bool:
@@ -174,7 +212,12 @@ class EnvironmentContributor:
 
     def render(self) -> str | None:
         lines: list[str] = []
-        if _is_wsl():
+        in_container = _is_container()
+        if in_container:
+            import platform
+
+            lines.append(f"Host: Linux container ({platform.release()})")
+        elif _is_wsl():
             lines.append("Host: WSL (Windows Subsystem for Linux)")
         elif sys.platform == "win32":
             import platform
@@ -195,7 +238,7 @@ class EnvironmentContributor:
         lines.append(f"Current working directory: {cwd}")
 
         section = "\n".join(lines)
-        if _is_wsl():
+        if not in_container and _is_wsl():
             section = f"{section}\n\n{_WSL_ENVIRONMENT_HINT}"
         return section
 

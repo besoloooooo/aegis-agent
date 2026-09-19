@@ -112,7 +112,10 @@ def test_reconstruct_session_creates_stable_records_and_tool_failures(tmp_path):
             role=Role.TOOL,
             name="terminal",
             tool_call_id="call-1",
-            content='{"error":"command failed","exit_code":1}',
+            content=(
+                '{"error":null,"exit_code":1,'
+                '"exit_code_meaning":"command-specific explanation"}'
+            ),
         ),
     )
     repository.append_message(
@@ -276,6 +279,32 @@ def test_judge_provider_model_can_be_selected_from_config(monkeypatch):
     assert provider is not None
     assert provider.name == "openai-compatible"
     assert provider.model == "judge-model"
+    assert warnings == []
+
+
+def test_judge_is_auto_enabled_by_default(monkeypatch):
+    monkeypatch.setenv("AEGIS_API_KEY", "test-key")
+    monkeypatch.setenv("AEGIS_MODEL", "default-judge-model")
+    warnings: list[str] = []
+
+    provider = _resolve_failure_recovery_judge(None, {}, warn=warnings.append)
+
+    assert provider is not None
+    assert provider.name == "openai-compatible"
+    assert provider.model == "default-judge-model"
+    assert warnings == []
+
+
+def test_implicit_judge_without_real_model_falls_back_quietly(monkeypatch):
+    monkeypatch.setattr(
+        "aegis_agent.cli._select_provider",
+        lambda _backend: (FakeModelProvider(), "fake"),
+    )
+    warnings: list[str] = []
+
+    provider = _resolve_failure_recovery_judge(None, {}, warn=warnings.append)
+
+    assert provider is None
     assert warnings == []
 
 

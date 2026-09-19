@@ -47,7 +47,7 @@ Example::
         record: false             # --record-conversations
         evaluate: false           # --process-evaluate-conversations
       failure_recovery_judge:
-        enabled: false
+        enabled: true                # default ON; fail-open when unavailable
         provider: auto            # auto / openai / anthropic
         model: null               # provider model override
         base_url: null            # optional provider endpoint override

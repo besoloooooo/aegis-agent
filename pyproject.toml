@@ -46,6 +46,11 @@ markers = [
     "integration: opt-in tests that hit a real model endpoint (need AEGIS_RUN_INTEGRATION + AEGIS_* config)",
 ]
 
+[tool.ruff]
+# These are vendored evaluation-task inputs, not Aegis source code. Keep them
+# byte-for-byte compatible with their upstream benchmark definitions.
+extend-exclude = ["benchmarks/terminal-bench-sample"]
+
 [dependency-groups]
 dev = [
     "mypy>=2.3.0",

@@ -32,12 +32,12 @@ def sanitize_title(raw: str) -> str:
     """
     cleaned = "".join(ch for ch in raw if ch.isprintable())
     cleaned = " ".join(cleaned.split())
-    cleaned = cleaned.strip(" \t\r\n'\"“”‘’.。.!！")
+    cleaned = cleaned.strip(" \t\r\n'\"“”‘’.。.!！")  # noqa: B005 - intentional char set
     for prefix in ("Title:", "title:", "标题：", "标题:"):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
             break
-    cleaned = cleaned.strip(" \t\r\n'\"“”‘’.。.!！")
+    cleaned = cleaned.strip(" \t\r\n'\"“”‘’.。.!！")  # noqa: B005 - intentional char set
     return cleaned[:MAX_TITLE_LENGTH]
 
 

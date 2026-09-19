@@ -5,7 +5,10 @@ import time
 from aegis_agent.models.base import Message, Role
 from aegis_agent.models.fake import FakeModelProvider, FakeReply
 from aegis_agent.sessions.memory_store import InMemorySessionRepository
-from aegis_agent.sessions.title_generator import SessionTitleService, generate_llm_session_title
+from aegis_agent.sessions.title_generator import (
+    SessionTitleService,
+    generate_llm_session_title,
+)
 from aegis_agent.sessions.titles import (
     fallback_session_title,
     heuristic_title_from_messages,

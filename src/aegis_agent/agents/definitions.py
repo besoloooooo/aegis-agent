@@ -103,6 +103,7 @@ _EXPLORE = AgentDefinition(
         "self-contained."
     ),
     tool_names=READ_ONLY_TOOL_NAMES,
+    max_iterations=25,
 )
 
 _GENERAL_PURPOSE = AgentDefinition(
@@ -123,6 +124,7 @@ _GENERAL_PURPOSE = AgentDefinition(
         "entire value you return, so make it self-contained."
     ),
     tool_names=None,  # all parent tools except the Agent tool
+    max_iterations=25,
 )
 
 

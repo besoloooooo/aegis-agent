@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+
+import pytest
 
 from aegis_agent.tools.builtin import ProcessTool, TerminalTool
 from aegis_agent.tools.process_registry import ProcessRegistry
@@ -41,6 +45,24 @@ def test_process_poll_and_wait(tmp_path):
     poll = json.loads(process.run({"action": "poll", "session_id": sid}, ctx).content)
     assert poll["status"] == "exited"
     assert poll["exit_code"] == 0
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="POSIX Bash pipefail is unavailable",
+)
+def test_background_pipeline_preserves_upstream_failure(tmp_path):
+    terminal, process, ctx = _make(tmp_path)
+    sid = _spawn(
+        terminal,
+        ctx,
+        command='python -c "raise SystemExit(7)" 2>&1 | head -100',
+    )
+    wait = json.loads(
+        process.run({"action": "wait", "session_id": sid, "timeout": 10}, ctx).content
+    )
+    assert wait["status"] == "exited"
+    assert wait["exit_code"] == 7
 
 
 def test_process_log(tmp_path):

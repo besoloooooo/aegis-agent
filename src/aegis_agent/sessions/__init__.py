@@ -24,9 +24,9 @@ from aegis_agent.sessions.titles import (
 )
 
 __all__ = [
+    "MAX_TITLE_LENGTH",
     "InMemorySessionRepository",
     "LeaseHandle",
-    "MAX_TITLE_LENGTH",
     "SQLiteSessionRepository",
     "Session",
     "SessionLeaseBackend",

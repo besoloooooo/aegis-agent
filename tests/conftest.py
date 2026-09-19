@@ -11,12 +11,16 @@ from aegis_agent.sessions.memory_store import InMemorySessionRepository
 
 @pytest.fixture(autouse=True)
 def disable_external_langfuse(monkeypatch):
-    """Keep unit tests from inheriting real Langfuse credentials from .env."""
+    """Keep unit tests from inheriting real external credentials from .env."""
     # python-dotenv does not overwrite existing environment variables by
     # default, so empty values remain authoritative even when production code
     # loads the repository or user dotenv files during a test.
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "")
+    monkeypatch.setenv("AEGIS_API_KEY", "")
+    monkeypatch.setenv("AEGIS_MODEL", "")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "")
 
 
 @pytest.fixture

@@ -8,6 +8,7 @@ provider-neutral :class:`ModelEvent` objects.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
@@ -23,6 +24,7 @@ from aegis_agent.models.usage import parse_anthropic_usage
 ENV_API_KEY = "ANTHROPIC_API_KEY"
 ENV_BASE_URL = "ANTHROPIC_BASE_URL"
 ENV_MODEL = "ANTHROPIC_MODEL"
+ENV_TIMEOUT = "AEGIS_MODEL_TIMEOUT"
 
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_TIMEOUT = 60.0
@@ -57,7 +59,7 @@ class AnthropicProvider:
         cls,
         *,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         stream: bool = True,
         temperature: float | None = None,
     ) -> AnthropicProvider:
@@ -71,6 +73,7 @@ class AnthropicProvider:
             raise ModelProviderError(f"{ENV_API_KEY} is not set; export it to use Anthropic.")
         if not model:
             raise ModelProviderError(f"{ENV_MODEL} is not set; export an Anthropic model name.")
+        timeout = _resolve_timeout(timeout)
         return cls(
             api_key=api_key,
             base_url=os.environ.get(ENV_BASE_URL),
@@ -155,6 +158,22 @@ class AnthropicProvider:
             client_kwargs["base_url"] = self._base_url
         self._client = Anthropic(**client_kwargs)
         return self._client
+
+
+def _resolve_timeout(explicit: float | None) -> float:
+    """Resolve the shared Aegis model timeout for the Anthropic transport."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(ENV_TIMEOUT)
+    if raw is None:
+        return DEFAULT_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ModelProviderError(f"{ENV_TIMEOUT} must be a positive number of seconds.") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ModelProviderError(f"{ENV_TIMEOUT} must be a positive number of seconds.")
+    return timeout
 
 
 def _to_wire_messages(messages: Sequence[Message]) -> tuple[str, list[dict[str, Any]]]:

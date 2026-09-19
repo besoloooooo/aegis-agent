@@ -25,6 +25,17 @@ class _Messages:
         return self.response
 
 
+def test_from_env_reads_shared_model_timeout(monkeypatch) -> None:
+    monkeypatch.setattr("aegis_agent.env.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-test")
+    monkeypatch.setenv("AEGIS_MODEL_TIMEOUT", "240")
+
+    provider = AnthropicProvider.from_env()
+
+    assert provider._timeout == 240.0
+
+
 def _client(response):
     messages = _Messages(response)
     return SimpleNamespace(messages=messages), messages

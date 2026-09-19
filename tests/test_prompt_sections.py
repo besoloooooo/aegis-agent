@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import datetime
 
+import pytest
+
+from aegis_agent.context import prompt_sections
 from aegis_agent.context.prompt_sections import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -61,6 +64,14 @@ class TestBehaviourContributors:
         c = ToolUseEnforcementContributor(_FakeRegistry(0))
         assert c.render() is None
 
+    def test_task_completion_requires_explicit_acceptance_verification(self):
+        rendered = TaskCompletionContributor(_FakeRegistry(1)).render()
+        assert rendered is not None
+        assert "identify every acceptance criterion" in rendered
+        assert "verify each one against current, real tool output" in rendered
+        assert "the task is not complete" in rendered
+        assert "pre-existing, or unrelated" in rendered
+
 
 class TestModelIdentityContributor:
     def test_rendered_when_model_known(self):
@@ -96,6 +107,20 @@ class TestEnvironmentContributor:
         assert rendered is not None
         assert os.getcwd() in rendered
 
+    def test_container_takes_precedence_over_wsl_kernel_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(prompt_sections, "_is_container", lambda: True)
+        monkeypatch.setattr(prompt_sections, "_is_wsl", lambda: True)
+
+        rendered = EnvironmentContributor(cwd="/app").render()
+
+        assert rendered is not None
+        assert "Host: Linux container" in rendered
+        assert "Current working directory: /app" in rendered
+        assert "Windows Subsystem for Linux" not in rendered
+        assert "/mnt/c/" not in rendered
+
 
 class TestTimestampContributor:
     def test_renders_todays_date(self):
@@ -125,6 +150,12 @@ class TestIntegrationOrdering:
         host_i = prompt.index("Host:")
         started_i = prompt.index("Conversation started:")
         assert identity_i < finishing_i < enforcement_i < host_i < started_i
+
+    def test_prompt_contains_acceptance_criteria_rules(self):
+        prompt = self._prompt()
+        assert "identify every acceptance criterion" in prompt
+        assert "verify each one against current, real tool output" in prompt
+        assert "must not claim completion" in prompt
 
     def test_excluded_subsystems_absent(self):
         prompt = self._prompt()

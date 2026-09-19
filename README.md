@@ -18,7 +18,8 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 4. Skills subsystem — `SKILL.md` discovery / loading / routing
 5. Lightweight MCP client — stdio + Streamable HTTP
 6. File-editing tools — write_file / patch / search_files
-7. Terminal & background-process tools
+7. Terminal & background-process tools — strict non-zero status and POSIX
+   pipeline-failure preservation
 8. Web tools — web_search / web_extract with SSRF gate
 9. Skill management — `skill_manage`
 
@@ -28,7 +29,8 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 12. SQLite persistence + snapshot fast-resume + cross-process leases
 
 **Prompt / memory / search**
-13. Dynamic system-prompt sections
+13. Dynamic system-prompt sections — acceptance gates and container-aware
+    environment hints
 14. Personal long-term memory (Auto Memory) — `USER.md` + `MEMORY.md` index
 15. Memory recall + background extraction
 16. Session history search — FTS5 `session_search`
@@ -44,11 +46,13 @@ Nineteen milestones, from a minimal skeleton to the full runtime:
 19. Multi-agent orchestration — `Agent`, `team_create`, `send_message`, `/agents`
 
 **Agent quality foundation**
+- Harbor setup reliability — bounded Docker Hub recovery, strict APT refresh with one package-404 recovery, and isolated compatible Python provisioning.
 - Quality Stage 0 — optional Langfuse end-to-end traces for Agent runs, model
   calls, tool calls, subagents, and final results
 - Quality Phase 1–2 — Harbor custom-agent integration plus a provider-neutral
   `ExecutionRecord` joining runtime steps, usage, Harbor verifier results, and artifacts,
-  with container-safe opt-in proxy forwarding
+  with explicit setup/runtime/verifier proxies, an opt-in Docker host alias,
+  and configurable model request timeouts
 - Quality Phase 3 — rule-first, explainable Process Evaluation with an optional
   failure-recovery LLM Judge, opt-in live/historical conversation records, CLI
   batch evaluation, and trace-addressable Viewer issues
@@ -347,7 +351,8 @@ directly return a total or cost are passed through; Aegis has no price table.
 
 Aegis exposes a non-interactive runner and a Harbor custom installed agent.
 Harbor remains responsible for tasks, environments, trials, retry/concurrency,
-verifiers, and rewards; the Harbor repository does not need to be modified.
+verifiers, and rewards. Proxy-enabled setup uses the sibling Harbor checkout's
+`ensure_system_dependencies(..., env=...)` extension added with this integration.
 
 Run one Aegis task directly (this uses the selected real provider unless
 `--model-backend fake` is explicitly requested):
@@ -369,6 +374,7 @@ PYTHONPATH=../aegis-agent/src uv run harbor run \
   --model openai/qwen-model \
   --ae AEGIS_API_KEY="$AEGIS_API_KEY" \
   --ae AEGIS_BASE_URL="$AEGIS_BASE_URL" \
+  --ae AEGIS_MODEL_TIMEOUT=300 \
   --ae LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
   --ae LANGFUSE_SECRET_KEY="$LANGFUSE_SECRET_KEY" \
   --ae LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL"
@@ -376,12 +382,65 @@ PYTHONPATH=../aegis-agent/src uv run harbor run \
 
 Host proxy variables are not copied into the task container implicitly. A
 loopback proxy such as `127.0.0.1:10808` would refer to the container itself and
-cause model `APIConnectionError`s. If a provider really requires a proxy, pass
-`HTTP_PROXY` / `HTTPS_PROXY` with `--ae` only after using an address that the
-container can reach.
+is rejected when supplied explicitly. If setup or the model endpoint requires a
+proxy, expose it on an address the container can reach and pass `HTTP_PROXY` /
+`HTTPS_PROXY` with `--ae`. On native Linux/WSL Docker, prefer a proxy URL using
+`host.docker.internal`; when that hostname is explicitly requested, the adapter
+maps it to the task container's current Docker gateway. This remains stable if
+the WSL LAN address changes during a trial. Explicit proxies now cover system-package setup,
+Aegis wheel installation, and runtime. Explicit `PIP_INDEX_URL`,
+`PIP_DEFAULT_TIMEOUT`, `PIP_RETRIES`, and related pip settings also apply during
+wheel installation. The local `scripts/aegis-eval.sh` wrapper maps
+`AEGIS_HARBOR_PROXY` to upper/lowercase HTTP(S) proxy variables for both agent
+and verifier, plus `AEGIS_HARBOR_NO_PROXY` to their bypass settings. The proxy
+must listen on an interface reachable from Docker; the hostname mapping does
+not start a proxy or expose a localhost-only listener.
+
+Docker image pulls happen before Agent setup. The companion Harbor checkout
+prepares `task.toml` prebuilt images explicitly: reuse a local image, try the
+configured registry for up to 90 seconds, then retry the same Docker Hub
+repository/tag/digest at its canonical endpoint for up to 300 seconds. Custom
+registries and Podman are not redirected. Compose uses the prepared image;
+progress survives cancellation and subprocesses are reaped. The existing
+outer environment deadline still applies. Dockerfile base images and explicit
+custom Compose overrides are outside this recovery path.
+
+APT setup now requires a successful index refresh, bypasses HTTP caches, and
+bounds transport retries/timeouts. A package-download 404 gets one fresh-index
+retry; other installation failures remain errors. Aegis provisions Python 3.11
+under `/opt/aegis-python` and a venv under `/opt/aegis-venv`, leaving the task's
+system Python untouched. The pinned uv bootstrap is checksum-verified on the
+host and transferred into the task, so container GitHub access is not required.
+Explicit pip index/certificate settings are translated for uv, and explicit
+UV download settings are forwarded. The local wrapper supplies the managed
+Python download mirror for Agent setup as well as the verifier.
+
+For an inexpensive setup-only check (no model request or task scoring):
+
+```bash
+aegis-eval terminal-bench/qemu-startup --install-only
+```
+
+A setup-only pass confirms environment and Agent installation, not task success.
+External registry/package outages can still exhaust the bounded attempts; logs
+identify the failing phase rather than silently reporting success. Use
+`--environment-build-timeout-multiplier` only when image progress justifies a
+larger budget; Agent setup/model timeout options do not affect image pulls.
+
+Model requests default to a 60-second inactivity timeout. Long-reasoning models
+can pause between streamed chunks for longer than that, so Harbor evaluations
+should set `AEGIS_MODEL_TIMEOUT` explicitly; the local wrapper defaults it to
+300 seconds. This changes the model transport timeout only and does not hide
+setup failures or extend Harbor's independent phase deadlines.
+
+The [sample-based evaluator review](docs/process-evaluator-review-20260918.md)
+documents observed false positives, empty-trace scoring, infrastructure failures,
+and the proposed order of scoring improvements.
 
 The adapter installs the current Aegis wheel inside the Harbor task environment
-and runs tools in `/app`. The Harbor trial UUID becomes Aegis `execution_id`;
+and runs tools in `/app`. Container markers take precedence over an inherited
+WSL kernel signature, so the system prompt describes the Linux container and
+does not advertise host-only `/mnt/c` paths. The Harbor trial UUID becomes Aegis `execution_id`;
 the Langfuse trace id is deterministically derived from it, so no timestamp
 matching is needed. A runtime record is written under the trial's `agent/` logs.
 After Harbor finishes its verifier, finalize one trial or an entire job:
@@ -456,9 +515,11 @@ binds to loopback by default; use `--no-open`, `--port`, `--records-dir`, or
 ## 🔎 Process Evaluation (Quality Phase 3)
 
 Process Evaluation consumes an existing `ExecutionRecord`; it does not require
-Langfuse or Harbor and does not alter the Agent Loop. By default it runs only
-deterministic rules and makes no model call. Run it for one JSON record/path or
-every record in the local store:
+Langfuse or Harbor and does not alter the Agent Loop. The failure-recovery LLM
+Judge is enabled by default with provider `auto`; it makes one side query only
+when the record contains a Failure Episode. If no real model is configured or
+the Judge fails, evaluation safely keeps the deterministic rule result. Run it
+for one JSON record/path or every record in the local store:
 
 ```bash
 uv run aegis quality evaluate <execution-id-or-record.json>
@@ -530,9 +591,9 @@ quality:
     record: false
     evaluate: false
   failure_recovery_judge:
-    enabled: true
-    provider: openai       # auto, openai, or anthropic
-    model: <judge-model>
+    enabled: true          # default; set false for rule-only evaluation
+    provider: auto         # auto, openai, or anthropic
+    model: null            # optional Judge-specific model override
     base_url: null         # optional compatible endpoint
 ```
 
@@ -540,7 +601,9 @@ Keep API keys out of YAML. OpenAI-compatible Judges read `AEGIS_API_KEY` and,
 when not overridden above, `AEGIS_MODEL` / `AEGIS_BASE_URL`; Anthropic Judges
 read `ANTHROPIC_API_KEY` and optionally `ANTHROPIC_MODEL` /
 `ANTHROPIC_BASE_URL`. Explicit CLI options temporarily override the configured
-provider. `enabled: false` keeps all Process Evaluation rule-only.
+provider. With no Quality config, Judge resolution still defaults to `enabled:
+true` and `provider: auto`; `enabled: false` keeps all Process Evaluation
+rule-only.
 
 Missing fields produce `insufficient_data` where a reliable judgment cannot be
 made. Per-task overrides can be supplied in
@@ -735,7 +798,9 @@ The built-in limit is **50 model/tool iterations per turn**, not 50 individual
 tool calls. Override it with `iterations.max` above or, for one launch,
 `uv run aegis --max-iterations 100` (`-n 100`). Restart Aegis and resume the
 session for a changed limit to take effect; an already-running session keeps
-its startup limit. Explicit subagent limits are unchanged.
+its startup limit. Built-in typed subagents (`explore` and `general-purpose`)
+allow 25 iterations per turn; custom `AgentDefinition` values continue to use
+their explicit `max_iterations` setting.
 
 Configurable from the file: memory (`enabled` / `recall` / `extract` / `project`),
 context (`compress` / `max_tokens`), iterations (`max`), session (`db_path` /
@@ -797,7 +862,14 @@ skill_manage
 
 Additional tools can be exposed through MCP.
 
-`terminal` foreground timeouts return `exit_code: 124` and preserve any stdout/stderr captured before the process is killed, so agents can recover with alternate commands instead of losing partial diagnostics.
+`terminal` treats every non-zero command status as an error while preserving
+the numeric `exit_code`, output, and command-aware explanation for diagnosis.
+On POSIX, foreground and managed background pipelines use Bash `pipefail` when
+Bash is available, so a successful final filter cannot hide an upstream
+failure; Windows retains `cmd /c`. Long-running hints inspect actual
+command/executable positions rather than arbitrary path or argument substrings.
+Foreground timeouts return `exit_code: 124` and preserve stdout/stderr captured
+before the process is killed.
 
 ---
 

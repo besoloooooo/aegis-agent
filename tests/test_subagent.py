@@ -47,6 +47,13 @@ def _agent_tool(provider, agents=None, *, allow_fork=False, parent=None, history
     return AgentTool(manager, allow_fork=allow_fork, history_provider=history)
 
 
+def test_builtin_subagent_iteration_budgets_are_explicit():
+    agents = builtin_agents()
+
+    assert agents["explore"].max_iterations == 25
+    assert agents["general-purpose"].max_iterations == 25
+
+
 def test_runner_returns_final_output():
     provider = FakeModelProvider(script=[FakeReply(text="analysis complete")])
     runner, _ = _runner(provider)
