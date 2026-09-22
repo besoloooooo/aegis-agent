@@ -8,7 +8,7 @@ from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel, Field
 
 RunKind: TypeAlias = Literal["conversation", "task", "evaluation"]
-ProcessStatus: TypeAlias = Literal["pass", "warning", "fail", "insufficient_data"]
+ProcessStatus: TypeAlias = Literal["pass", "warning", "fail", "insufficient_data", "not_scored"]
 ProcessSeverity: TypeAlias = Literal["info", "low", "medium", "high", "critical"]
 
 

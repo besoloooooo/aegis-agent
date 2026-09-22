@@ -252,13 +252,13 @@ provider), and both are strictly best-effort.
 | `src/aegis_agent/memory/scan.py` | **ADAPT** | `src/memdir/memoryScan.ts:scanMemoryFiles` / `formatMemoryManifest` | Metadata-only scan (filename/name/description/type/mtime), reads just the leading ~40 lines (never bodies), excludes `MEMORY.md`, caps at 200 newest-first. A bad/missing file is skipped, never fatal. |
 | `src/aegis_agent/memory/retriever.py` | **ADAPT** | `src/memdir/findRelevantMemories.ts`; `utils/attachments.ts:getRelevantMemoryAttachments`/`collectSurfacedMemories` | Manifest → side query (JSON `{"files":[…]}` ≤5, unsure→skip) → keep only filenames present in the manifest (rejects invention/`../`) → read selected bodies under 4 KB/file + 12 KB/total caps → `render_recall_block` (`## Relevant memories`, per-file `file=`/`type=` tags). |
 | `src/aegis_agent/memory/sidequery.py` | **original** | — | Shared one-shot helper: `provider.stream()` folded via `collect_response`, then tolerant JSON-object extraction (bare / fenced / embedded). Any failure → `None`. |
-| `src/aegis_agent/memory/prompt.py` (`RelevantMemoriesContributor`) | **ADAPT** | `utils/attachments.ts` attachment injection (behaviour) | Stateful contributor; `set_block`/`clear` per turn. Injection is via the system-prompt rebuild (Aegis has no attachment message), so `run_turn`'s loop body is unchanged and source history is untouched. |
+| `src/aegis_agent/runtime.py` (transient recall attachment) | **COMBINED ADAPTATION** | Claude Code `utils/attachments.ts` / `query.ts` fixed-position `relevant_memories` attachment; Hermes `conversation_loop.py` user-message memory context | `collect_recall` returns one rendered block. Runtime anchors one `role=user` transient message after the persisted history boundary present when recall completes and replays it at that exact position during later tool iterations. It never becomes a tool result or persisted history, while the system/history prefix stays stable for prompt caching. |
 | `src/aegis_agent/memory/extractor.py` | **ADAPT** | `services/extractMemories/extractMemories.ts` + `prompts.ts` | Cursor over `client_msg_id` (unknown cursor → last-12 fallback, never "nothing" or "everything"); side query returns `{"actions":[{action,filename,type,name,description,content}]}`; `_coerce_action` validates filename + personal-only type (rejects `project`/unknown) + non-empty content. `apply_actions` routes every write through the path-safe store and rebuilds the index once. No forked sub-agent (structured action → store, no Write tool granted to the extractor). |
 | `src/aegis_agent/memory/store.py` (write side) | **ADAPT** | `extractMemories` write path + index sync; `FileWriteTool.ts` mtime staleness check | `render_memory_file` (frontmatter + body), `is_valid_memory_filename` (bare `*.md`, no `..`/sep/`MEMORY.md`/dotfile), `write_memory_file` (atomic + resolved-path-inside-dir check + mtime staleness check — refuse overwrite when the file changed since this process last read it), `rebuild_index` (derive `MEMORY.md` from files: sorted, deduped, idempotent; removes empty index). `record_read`/`get_last_read` maintain the process-local read-state cache. |
-| `src/aegis_agent/memory/manager.py` | **ADAPT** | `query.ts:301/1599` (recall prefetch/collect), `stopHooks.ts:149` (post-final-reply) | `before_turn` *starts* a background recall (pool thread → `Future`, non-blocking); `collect_recall` is the non-blocking collect point (skip if not done → Claude's "didn't make it in time"); `after_turn` enqueues extraction onto a single serial worker thread (fire-and-forget, mirrors Claude's stash queue — no file lock, serialised writes); `drain` waits for in-flight work. Emits `memory.recall`/`memory.extract` `MemoryEvent`s. |
-| `src/aegis_agent/runtime.py` (wiring) | **original** | — | `__init__` gains `memory_manager`; `run_turn` calls `before_turn` after persisting the user message, a non-blocking `collect_recall` before each `build(context)` inside the loop (so recall lands after a tool round, not on the first), and `after_turn` after a `FINAL_ANSWER`; `shutdown()` drains background work. `with_defaults` builds the manager when `enable_memory_recall`/`enable_memory_extract` are set. `startup_info` gains `memory_recall`/`memory_extract`. |
+| `src/aegis_agent/memory/manager.py` | **ADAPT** | `query.ts:301/1599` (recall prefetch/collect), `stopHooks.ts:149` (post-final-reply) | `before_turn` *starts* a background recall (pool thread → `Future`, non-blocking); `collect_recall` consumes the future and returns one rendered block exactly once (skip if not done → Claude's "didn't make it in time"); `after_turn` enqueues extraction onto a single serial worker thread; `drain` waits for in-flight work. Emits `memory.recall`/`memory.extract` `MemoryEvent`s. |
+| `src/aegis_agent/runtime.py` (wiring) | **COMBINED ADAPTATION** | Claude Code attachment collection/anchoring + Hermes cache-stable user-context injection | `run_turn` calls `before_turn` after persisting the user message, collects before each model request, anchors a returned block at the current persisted-message count, and re-inserts that same transient user message at the fixed boundary on subsequent iterations. `after_turn` runs after a `FINAL_ANSWER`; `shutdown()` drains background work. Original history and the system prompt remain untouched. |
 | `src/aegis_agent/cli.py` (updated) | **original** | — | `--memory-recall` / `--memory-extract` opt-in flags; `runtime.shutdown()` in the exit path drains in-flight recall/extract. |
-| `tests/test_memory_recall.py` | **original** | — | 17 tests: empty/missing dir no-op, frontmatter scan, bad-file tolerance, 200-cap, 0..5 selection, invalid/`../` rejection, render block, context injection, history-not-modified, already-surfaced dedup, main-agent-write→skip. |
+| `tests/test_memory_recall.py` | **original** | — | Recall tests cover empty/missing dirs, scan bounds, selection/path validation, one-shot collection, system-prompt exclusion, history non-mutation, dedup, and a two-tool integration proving the transient attachment remains at one fixed causal position. |
 | `tests/test_memory_extract.py` | **original** | — | 14 tests: cursor new-messages/fallback, noop, create, update-over-duplicate, project-type rejection, unsafe-filename rejection, index rebuild + idempotency, no-outside-root write, extractor-failure isolation, mutex skip, filename validation. |
 
 ## Stage 16 — session_search (SQLite FTS5 historical recall)
@@ -353,12 +353,13 @@ Claude Code harness.
 | `tests/test_subagent.py`, `tests/test_subagent_v2.py` | **original** | — | Foreground/background/fork subagent behaviour, tool filtering, private transcript, failures as tool errors, notification drain, concurrency/depth guards, kill, runtime wiring, and `/agents`. |
 | `tests/test_team.py` | **original** | — | Team creation, persistent teammate identity/context, idle wakeup, lead ↔ teammate and teammate ↔ teammate `send_message`, broadcast, team boundary, parallel teammates, runtime wiring, and failure isolation. |
 
-## Stage 21 — automatic session titles (heuristic fallback + async LLM enhancement)
+## Stage 20 addendum — automatic session titles (heuristic fallback + async LLM enhancement)
 
-Session titles are now derived metadata for the interactive REPL and session
-lists. The Aegis implementation combines Hermes' first-response async title
-generation with Claude Code's manual-vs-auto priority split, but rewrites the
-logic in Python and keeps the source message log as the only truth source.
+Session titles are a lightweight derived-metadata increment on top of Stage 20
+(not a separate milestone). The Aegis implementation combines Hermes'
+first-response async title generation with Claude Code's manual-vs-auto priority
+split, but rewrites the logic in Python and keeps the source message log as the
+only truth source.
 
 | Aegis file | Relationship | Hermes / Claude Code reference → symbol | Notes |
 |---|---|---|---|
@@ -508,16 +509,16 @@ evaluates immutable `ExecutionRecord` data after execution. Claude Code was
 searched for a matching reusable offline process-grader unit; none suitable to
 this milestone and schema was found. Neither reference repository was modified.
 
-The later failure-recovery hybrid increment is also independently implemented
-in Aegis. It reuses Aegis's provider-neutral `ModelProvider`/`collect_response`
-boundary and the existing fail-open side-query pattern already used by Memory;
-no grader or prompt code was copied from Hermes or Claude Code. The original
-five deterministic graders remain unchanged, while rules now extract grounded
-Failure Episodes before an optional LLM judges only recovery semantics.
+The later recovery and verification hybrid increments are also independently
+implemented in Aegis. They reuse Aegis's provider-neutral
+`ModelProvider`/`collect_response` boundary and the existing fail-open side-query
+pattern already used by Memory; no grader or prompt code was copied from Hermes
+or Claude Code. Rules extract grounded Failure Episodes and verification chains
+before an optional LLM judges the remaining recovery or verification semantics.
 
 | Aegis file | Relationship | Reference source | Notes |
 |---|---|---|---|
-| `src/aegis_agent/quality/process.py` | **original implementation informed by behavior** | Hermes `agent/tool_guardrails.py`, related guardrail tests; Aegis `memory/sidequery.py` architecture | Defines the ProcessGrader protocol, rule-first configuration/evaluator, five unchanged deterministic graders, Failure Episode extraction, and the optional `FailureRecoveryLLMGrader`. The LLM path uses one provider-neutral, grounded JSON side query only when failures exist and falls back to the unchanged rule score/status on every setup/call/validation failure. The algorithms and prompt are independently written for Aegis; no live warning/block logic was copied. |
+| `src/aegis_agent/quality/process.py` | **original implementation informed by behavior** | Hermes `agent/tool_guardrails.py`, related guardrail tests; Aegis `memory/sidequery.py` architecture | Defines the ProcessGrader protocol, evidence gate, rule-first configuration/evaluator, Failure Episode extraction, recovery-opportunity attribution, and optional grounded Judges. Provider/setup failures retain rule results or explicit uncertainty. The algorithms and prompts are independently written for Aegis; no live warning/block logic was copied. |
 | `src/aegis_agent/quality/conversation.py` | **original additive code** | Aegis Observability and SessionRepository boundaries | Adds an opt-in per-root-Turn observability backend over the existing single-record recorder, plus deterministic reconstruction of historical SQLite sessions. Reconstruction uses only persisted message/tool evidence, treats every non-zero integer exit code as failed even when an explanatory field is present, keeps sanitized inferred errors string-typed, marks unavailable telemetry, and is idempotent per user Turn. |
 | `src/aegis_agent/quality/models.py`, `quality/__init__.py` | **original additive code** | — | Adds optional `quality.process_evaluation`, versioned aggregate/grade models, `insufficient_data`, and public evaluator exports without changing ExecutionRecord 1.0 source fields. |
 | `src/aegis_agent/cli.py` (conversation Quality options, `quality record-session`, `quality evaluate`) | **original** | — | Opt-in live conversation capture and per-Turn auto-evaluation, historical session reconstruction, and offline record evaluation. Failure-recovery Judge resolution defaults to enabled/auto, calls a model only for actual Failure Episodes, and remains fail-open when no real model is available; app YAML can disable it or persist provider/model/base URL preferences while keys stay in environment, and CLI flags remain temporary overrides. |
@@ -564,3 +565,31 @@ Independent Harbor fix, with neither Hermes nor Claude Code used as references: 
   `src/harbor/agents/installed/base.py`, `scripts/aegis-eval.sh`; Aegis
   `src/aegis_agent/integrations/harbor.py`. No attribution change is required for
   independently written behavior; existing third-party notices remain intact.
+
+
+### Process evidence review corrections (2026-09-19)
+
+This increment is independently implemented in Aegis from the reviewed Harbor
+traces. Hermes `agent/tool_guardrails.py` was read for the existing distinction
+between observations and live guardrail actions; its permissive terminal
+mutation classification is not copied into the offline verification grader.
+Harbor `src/harbor/models/trial/result.py` provides lifecycle field semantics.
+No code is copied or adapted from either reference repository, and no new
+third-party notices or dependencies are needed. Claude Code was not used as an
+implementation source for this increment.
+
+| Aegis files | Relationship | Decision |
+|---|---|---|
+| `quality/process.py` | Independent extension | Gate missing/partial evidence, attribute recovery opportunity, record Judge telemetry, and mark uncalibrated efficiency without inventing thresholds. |
+| `quality/verification.py` | Independent implementation | Parse shell/Python mutation evidence and require grounded artifact/order/output chains for semantic judgments. Preserve unknown and partial coverage instead of equating command names with correctness. |
+| `quality/adapters/harbor.py` | Independent compatibility fix | Preserve Runtime success through Verifier interruption; retain failure phase and infrastructure provenance. |
+| `quality/calibration.py`, `tests/fixtures/process_review_labels.json` | Independent implementation and reviewed labels | Repeated read-only per-grader comparison, abstention/mismatch/overclaim counts, missing-source disclosure. The small selected corpus is not statistical validation. |
+| `cli.py`, `quality/viewer.py`, `quality/viewer_ui.py` | Independent presentation changes | Expose evidence status, phase, runtime/outcome distinction, grader modes and Judge evidence/telemetry. |
+| Process evidence, verification, provenance, calibration and Viewer tests | Independent regression coverage | Deterministic fake providers and source-preservation checks; no real paid-model requirement. |
+
+### Trace Viewer recovered-error status and refresh feedback (2026-09-21)
+
+This small UI correctness fix is independently implemented in Aegis; neither
+Hermes nor Claude Code was consulted. Final run status no longer derives from
+the presence of an intermediate error observation, ancestor trace nodes no
+longer inherit a child's error badge, and only the Refresh glyph animates.

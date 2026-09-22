@@ -30,7 +30,6 @@ from aegis_agent.memory.extractor import (
 )
 from aegis_agent.memory.manager import MemoryManager
 from aegis_agent.memory.paths import memory_dir, memory_index_path
-from aegis_agent.memory.prompt import RelevantMemoriesContributor
 from aegis_agent.memory.store import (
     is_valid_memory_filename,
     load_memory_index,
@@ -176,7 +175,6 @@ class TestManagerFailureIsolation:
         # A create action that targets a file the main agent already wrote → skip.
         events = []
         manager = MemoryManager(
-            RelevantMemoriesContributor(),
             recall_provider=None,
             extract_provider=_json_actions_provider([_action()]),
             home=str(tmp_path),

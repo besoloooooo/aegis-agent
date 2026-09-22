@@ -18,7 +18,8 @@ Stage 1 (storage + injection + behaviour):
 Stage 2/3 (recall + extraction):
 
 4. **Relevance recall** — scan → manifest → side-query LLM (≤5 files) → read
-   selected bodies → inject as ``relevant memories``; see
+   selected bodies → inject as a fixed-position, transient user-context
+   attachment (never a tool result or persisted message); see
    :mod:`aegis_agent.memory.scan`, :mod:`aegis_agent.memory.retriever`.
 5. **Background extraction** — after the final reply, review new messages and
    propose create/update memory actions, applied through the path-safe store;
@@ -59,7 +60,6 @@ from aegis_agent.memory.prompt import (
     MEMORY_BEHAVIOR_GUIDANCE_PROJECT,
     MemoryBehaviorContributor,
     MemoryIndexContributor,
-    RelevantMemoriesContributor,
     UserProfileContributor,
     default_memory_index_contributor,
     default_user_profile_contributor,
@@ -112,7 +112,6 @@ __all__ = [
     "MemoryType",
     "RecallResult",
     "RecalledMemory",
-    "RelevantMemoriesContributor",
     "UserProfileContributor",
     "aegis_home",
     "apply_actions",

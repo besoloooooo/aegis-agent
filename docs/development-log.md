@@ -5,7 +5,7 @@
 > 代码名称保留英文，叙述用中文。
 >
 > 当前版本：`0.1.0`（`src/aegis_agent/__init__.py`）
-> 最近提交：`b1c6ca0` / `e75c0e6`（master）
+> 文档基线：当前工作树；提交与分支信息以 Git 为准，不在本文固化。
 
 ---
 
@@ -25,7 +25,7 @@ Aegis Agent 是一个**轻量、可恢复、可扩展的 Agent Runtime**，通�
 
 ### 当前进度
 
-本文档记录到 Stage 20。Aegis 当前已从单 Agent Runtime 扩展到可恢复会话、上下文压缩、记忆、搜索、slash commands 和 multi-agent orchestration：
+本文档已记录 Milestone 1-20 及其增量，并将质量、可观测性与评测统一记录为 Milestone 21；同时继续记录后续修复与增量。
 
 | 分组 | 已完成能力 |
 |---|---|
@@ -33,8 +33,10 @@ Aegis Agent 是一个**轻量、可恢复、可扩展的 Agent Runtime**，通�
 | Tools / skills / MCP | Stage 4-9：`SKILL.md` 技能、轻量 MCP、文件编辑、terminal/process、web tools、`skill_manage`。 |
 | Context / recovery | Stage 10-13：三阶段上下文压缩、reasoning_content、SQLite 持久化、快恢复快照、SQLite/Redis leases、动态系统提示。 |
 | Memory / search | Stage 14-16、19：personal/project long-term memory、relevance recall、background extraction、SQLite FTS5 `session_search`。 |
-| Interactive UX | Stage 17-18：REPL slash-command suite 与相关交互修复。 |
-| Multi-agent orchestration | Stage 20：`Agent` one-shot/fork/background subagents、`team_create` persistent teammates、`send_message` inter-agent messaging、`/agents` task introspection。 |
+| Interactive UX | Stage 17-18：REPL slash-command suite，以及固定输入框、历史滚动、实时 Markdown、视口裁剪等 TTY/TUI 修复。 |
+| Multi-agent orchestration | Stage 20：`Agent` one-shot/fork/background subagents、`team_create` persistent teammates、`send_message` inter-agent messaging、`/agents` task introspection，以及后续 subagent 状态/预算与自动会话标题增量。 |
+| Provider / usage | 原生 Anthropic Provider；Token Usage、Cache Tokens 与 Cost 数据链（Milestone 21.1）。 |
+| Quality / observability | **Milestone 21：质量、可观测性与评测**——21.1 Langfuse 可观测性与 Usage/Cost、21.2 Harbor 离线评测与 `ExecutionRecord`、21.3 本地 Trace Viewer、21.4 Process Evaluation 与 Failure-Recovery Judge、21.5 效率校准与 Judge 证据解析、21.6 Harbor / Terminal-Bench 验收可靠性。 |
 
 ### 后续计划（尚未做）
 
@@ -319,318 +321,881 @@ TURN_END，且 `DONE` 不产生虚假 TURN_END）、CLI 流式输出（`list_dir
 
 ---
 
-## Test status
+### Milestone 4 — Stage 4：Skills 子系统 & 动态系统提示注入
 
-### 运行方式
+#### Problem and goal
 
-```bash
-uv run pytest -q          # 默认全离线，不碰付费 API
-uv run ruff check .
-uv run mypy src           # 可选
-```
+此前 `ContextBuilder` 只用**一条静态字符串**作为系统提示——没有子系统的扩展点。
+需要建立一个技能（Skills）子系统，支持：
+1. 按 `SKILL.md`（YAML frontmatter + markdown body）格式发现和加载技能；
+2. 用 progressive disclosure 模式（紧凑索引进系统提示，完整内容按需取）；
+3. 模型通过 `skills_list`/`skill_view` 工具获取技能，用户可以 `/skill-name` 调用。
 
-### 本次文档整理的直接验证范围
+同时需要先把"静态字符串系统提示"升级为"可组合的动态构建器"，
+作为技能（和未来 MCP 等）的注入缝。
 
-本次是 docs-only 更新，最小相关测试集是 multi-agent 的直接覆盖：
+#### Relevant Hermes behavior
 
-```bash
-uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_team.py
-```
+Hermes skills 是 agentskills.io / Anthropic Claude Skills 兼容格式：
+目录含 `SKILL.md`（YAML frontmatter: `name`/`description` + markdown body），
+可选 `references/`、`templates/`、`scripts/`。
 
-本节的具体执行结果以本文末尾 Stage 20 的 `Tests and evidence` 记录为准；未重新执行的全量命令不得写成通过。
+三个激活路径：
+- 系统提示里的**紧凑索引**（`<available_skills>`，按 category 分组）→ 模型按需调用 `skill_view`
+- 显式 `/skill-name` slash 命令 → `build_skill_invocation_message` 注入
+- CLI preload `--skills`。
 
-### 测试策略与覆盖
+关键源文件：`agent/skill_utils.py`（解析 + 发现）、`tools/skills_tool.py`
+（`skills_list`/`skill_view`）、`agent/skill_commands.py`（路由 + 调用消息）、
+`agent/prompt_builder.py:build_skills_system_prompt`（索引注入）、
+`agent/system_prompt.py:build_system_prompt_parts`（分层系统提示组装）。
 
-- **确定性 fake**：核心 Agent Loop、subagents、teams 和 memory side queries 使用 `FakeModelProvider` / fake clients，全程离线，不要求真实付费模型 API。
-- **不变量测试**（`CLAUDE.md` §9）：一个 `client_msg_id` 只持久化一条逻辑消息、单调 `seq`、无重复模型请求、无跨会话历史、checkpoint recovery 等于全量重放、context compression 不改原始消息。
-- **守卫测试**：runtime/provider 解耦、dangerous shell operator-only、context source-of-truth、subagent transcript isolation、team boundary enforcement。
-- **Multi-agent 覆盖**：`tests/test_subagent.py`、`tests/test_subagent_v2.py`、`tests/test_team.py` 覆盖 `Agent`、fresh/fork/background、notification drain、concurrency/depth guards、kill、`team_create`、`send_message`、persistent teammate idle/wake、broadcast、team boundary 和 `/agents`。
+#### Migration decision: ADAPT port
 
-### 边界情况已覆盖
+技能子系统是 self-contained 的，且与当前 Aegis 架构兼容——
+`skills_list`/`skill_view` 按现有 `Tool` Protocol 实现就能插入 `ToolRegistry`。
+选择 **ADAPT**（不是 PORT 全局单例、不是全 REWRITE）：
+- 保留 Hermes 的前端格式（SKILL.md）、progressive disclosure 设计、slug 路由、
+  调用消息格式、紧凑索引格式。
+- 适配 Aegis 的显式 DI + Protocol 架构（不使用 Hermes 的全局单例 + AST 发现）。
+- 砍掉：prompt injection 扫描器、credential/setup 检查、Curator 遥测、
+  plugin 命名空间、prompt-snapshot 磁盘缓存、template-var 替换、
+  inline-shell 展开、config 解析、platform-keyed 命令缓存。
 
-工具异常转 `{"error":...}`、未知工具、畸形参数 JSON 修复、孤立代理项清洗、流式中途取消丢弃半成品、max-iterations 停止、危险命令默认拦截且模型不可绕过、`on_event` 事件顺序、subagent 中间历史不污染主会话、team 内消息不跨 team。
+同时，系统提示的动态性通过**新的** `SystemPromptBuilder` + `PromptContributor` 缝实现——
+这不是 Hermes 的直接移植，而是引用其"分层组装"思想的最小化实现。
 
-### 真实端点
+#### Aegis design and data flow
 
-`test_real_endpoint_smoke` 是 opt-in 集成测试，需 `AEGIS_RUN_INTEGRATION=1` + `AEGIS_*` 配置；默认测试不运行真实端点。
+**动态系统提示** (`context/system_prompt.py`)：
+- `PromptContributor` Protocol：`render() -> str | None`
+- `SystemPromptBuilder`：identity 头 + 有序 contributor 列表 → `build()` 每次渲染。
+  空/None contributor 被移除，所以"无技能"的 prompt 与原来的静态默认 prompt 字节相同。
+- 原有的 `DEFAULT_SYSTEM_PROMPT` 保持身份为 `DEFAULT_IDENTITY`。
+
+**技能数据结构** (`skills/models.py`)：
+- `Skill`：fully-parsed（frontmatter dict + body + 目录路径）
+- `SkillMeta`：name/description/category（紧凑索引用）
+
+**技能发现** (`skills/loader.py`)：
+- `SkillLoader(dirs)`（默认 `~/.aegis/skills` 或 `$AEGIS_SKILLS_DIR`）
+- `discover()` 有缓存（`force=True` 重扫）；按 name dedupe（先到的赢）。
+- 验证：name/description 必填、长度上限（64 / 1024）、平台门控（macos→darwin 映射）。
+- Category 从 parent 文件夹名派生（只当 parent 非 search root 时）。
+
+**路由** (`skills/router.py`)：
+- `SkillRouter` Protocol（CLAUDE.md §6 要求）
+- `DefaultSkillRouter`：slug 归一化（`/My_Skill` → `my-skill`），先精确名匹配再 slug 匹配。
+- `invocation_message(skill, instruction)`：`[The "X" skill was invoked ...]` +
+  body + `[Skill directory: ...]` + supporting files 列表 + 用户指令。
+
+**渐进式工具** (`skills/tools.py`)：
+- `SkillsListTool` (`skills_list`)：返回 `{"skills": [...], "count": N}`，可按 category 过滤。
+- `SkillViewTool` (`skill_view`)：`{name, file_path?}` → 完整 body 或指定引用文件（路径遍历守卫）。
+
+**提示注入** (`skills/prompt.py`)：
+- `SkillsIndexContributor(loader)` 实现 `PromptContributor`：render `<available_skills>` 块，
+  按 category 分组，加上调用 `skill_view` 的指令。无技能时返回 None。
+
+**接线**：
+- `AgentRuntime.with_defaults(enable_skills=True, skills_dir=...)` 在 `build_default_registry` 后
+  发现并注册技能工具，构造 `SystemPromptBuilder` + `SkillsIndexContributor`，
+  传入 `ContextBuilder`，暴露 `SkillRouter`。
+- CLI `--skills-dir` / `--no-skills`；`/skill-name instruction` 行经 `_maybe_route_skill` 解析
+  → `invocation_message` 代替原始输入传给 `run_turn`。
+
+**关键不变式**：
+- 原始消息 unchanged：技能索引只进入 `ContextBuilder` 的**派生视图**，原始会话历史不变。
+- `ContextBuilder` 的 `system_prompt` 属性仍是 `str`（从 builder 实时渲染）。
+
+#### Key files, classes, and functions
+
+- `context/system_prompt.py`：`PromptContributor` (Protocol), `SystemPromptBuilder.build/add`, `DEFAULT_IDENTITY`
+- `context/builder.py`：`ContextBuilder(..., system_prompt: str | SystemPromptBuilder | None)`，backward-compat
+- `skills/models.py`：`Skill(name, description, category, directory, skill_md_path, frontmatter, body)`, `SkillMeta`
+- `skills/frontmatter.py`：`parse_frontmatter(content) -> (dict, body)`
+- `skills/loader.py`：`SkillLoader(discover/get/metas)`, `default_skills_dirs()`, `_matches_platform`, `MAX_NAME_LENGTH=64`, `MAX_DESCRIPTION_LENGTH=1024`
+- `skills/router.py`：`SkillRouter` Protocol, `DefaultSkillRouter`, `normalize_skill_key`
+- `skills/prompt.py`：`SkillsIndexContributor.render() -> str | None`
+- `skills/tools.py`：`SkillsListTool`, `SkillViewTool`, `SKILLS_LIST`/`SKILL_VIEW` schemas
+- `runtime.py`：`with_defaults(enable_skills, skills_dir)`, `skill_router` property
+- `cli.py`：`_maybe_route_skill`, `--skills-dir`/`--no-skills`
+
+#### Reliability invariants, edge cases, and failure handling
+
+- 缺失目录 → 空列表，不抛异常。
+- 一个技能格式错误 → 跳过，不影响其他。
+- 平台不匹配 → 跳过（debug 日志）。
+- `skill_view` 路径遍历：`../etc/passwd` → error result（路径跑出技能目录被拒绝）。
+- `skill_view` 文件不存在/技能不存在/cwd 外 → error result（永不抛异常）。
+- Name 空/无 → 跳过；collision → 先赢后报警告。
+- 工具注册后即使零技能存在，索引 contributor 返回 None，prompt 不变。
+
+#### Tests
+
+- `tests/test_skills_frontmatter.py`（9）：正当/缺 fence/YAML 错误回退/非 mapping/CRLF/列表/tags/markdown body
+- `tests/test_skills_loader.py`（18）：发现、category 派生、metas、空 dir、name/description 必填/截断、
+  名称碰撞、get_by_name、缓存/force、unreadable skip、排除 dir（.git）、platform gate 4 个、
+  默认 dir（env/no env）
+- `tests/test_skills_prompt.py`（10）：builder 行为（6：identity-only/custom/none drop/empty drop/
+  multiple join/strip/empty identity）、skills index（4：render/when none/group by category/general fallback）
+- `tests/test_skills_tools.py`（12）：skills_list（5：返回所有/过滤/null category/case-insensitive/空）、
+  skill_view（7：body/unknown/missing name/引用文件/绝对路径拒绝/traversal 拒绝/文件缺失/error永不抛）
+- `tests/test_skills_router.py`（9）：slug 归一化（5）、resolve（3）、invocation message（3：
+  activation note/supporting files/instruction append）
+- `tests/test_context_invariants.py`（6）：source unchanged 3路径（string/builder/skills）、
+  backward-compat string/None/空
+- `tests/test_cli.py` 既有用例通过（非 TTY fallback 路径）
+
+#### Source relationship
+
+所有技能模块都是 **ADAPT** 自 Hermes，保留了 Hermes MIT 署名头。
+`SystemPromptBuilder` + `PromptContributor` 是**参考 Hermes 分层思想的新实现**。
+`cli.py` / `runtime.py` 的接线是 **original**。
+详见 `docs/source-map.md` Stage 4 表。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- **Skills 只从 user dir 加载**（不 bundled，不 external dir config）→ 极简。
+- **Prompt 缓存**：Hermes 有 disk snapshot 缓存避免每次都 rebuild prompt index；
+  Aegis 无，每次都 render（代价低，因索引很小）。
+- **Prompt 注入扫描**：Hermes 有 `_INJECTION_PATTERNS` 检查 skill 内容是否含不安全注入；
+  Aegis 已砍（轻量面）。
+- **Plugin/命名空间**：不支持 `plugin:skill` 限定名（Hermes 有）。
+- **Reload**：无 `/reload-skills` 命令；只有 force=True 的 API（CLI 不暴露）。
+- **MCP 技能**：下一阶段（Milestone B）是轻量 MCP client，复用的缝已就绪——
+  `PromptContributor` 用于工具使用指导，`Tool` Protocol 用于 MCP 工具注册。
+
+#### Interview summary
+
+"Stage 4 实现了 Hermes 的 Skills 子系统，但适配到 Aegis 的显式 DI 架构里。
+核心设计是 **progressive disclosure**：技能的全部 body 不放进 prompt，只在系统提示里注入
+一个紧凑的 `<available_skills>` 索引（名字+描述，按category分组），模型看到相关技能后调用
+`skill_view` 工具获取完整指令——这叫 tier 1→tier 2 的两级展开，Hermes 也是这样做的。
+
+用户可以通过 `/skill-name instruction` 显式调用，`_maybe_route_skill` 把斜杠命令解析成
+`SkillRouter.invocation_message` 注入到当前轮次的用户输入里。
+
+整个技能的 discover→register→index→view 流程都是通过现有的 `Tool` Protocol 和显式构造的
+`ToolRegistry`，Hermes 那种全局单例 + AST 发现模式没搬过来。
+
+另外，为了同时支持技能索引注入和后来的 MCP 工具指导，我先把 `ContextBuilder` 从"一条静态字
+符串"升级成了 `SystemPromptBuilder` + `PromptContributor` 缝：`ContextBuilder` 构造时接受
+一个 `SystemPromptBuilder`（或普通 str 保持向后兼容），每轮 `build()` 实时调用
+`prompt_builder.build()` 渲染系统提示——所以技能索引会随加载的技能集合变化，但原始的会话
+消息列表完全不碰，source-of-truth 不变式不改。"
+
+### Milestone 5 — Stage 5：轻量 MCP 客户端
+
+#### Problem and goal
+
+Milestone A 建立了 `SystemPromptBuilder` + `PromptContributor` 和 `Tool` Protocol
+两条扩展缝。现在用这两条缝接入外部 MCP（Model Context Protocol）服务器，
+让 Aegis 能把任何 MCP 服务器的工具当作原生工具使用。
+
+这是 `CLAUDE.md` §5 "除非明确要求才做"的功能——用户显式要求。范围是轻量级：
+**stdio + Streamable HTTP 传输，无可选功能**（无 SSE/OAuth/sampling/断路器）。
+
+#### Relevant Hermes behavior
+
+Hermes 的 MCP 实现是一整个 `tools/mcp_tool.py` 模块（~3900 行）。核心架构：
+- 一个后台 daemon 线程 event loop，所有 MCP 会话跑在上面
+- 跨线程协程调度：`run_coroutine_threadsafe` + 100ms 轮询 `Future`
+- 连接：`StdioServerParameters` + `stdio_client`（stdio），`streamable_http_client` + `httpx.AsyncClient`（HTTP）
+- Schema 适配：`_normalize_mcp_input_schema` 三阶段 pipeline（local refs / nullable union / object shape repair）+ `strip_nullable_unions`
+- 工具注册：`registry.register(schema=..., handler=..., toolset=..., check_fn=...)` 直接用 Hermes 全局单例
+- 高级功能：OAuth 2.1 PKCE、SSE、断路器、`tools/list_changed` 动态刷新、sampling
+
+#### Migration decision: ADAPT
+
+选择 **ADAPT**：保留 Hermes 的两块最干净复用逻辑（schema 适配器 + 连接/调度），
+但适配到 Aegis 的显式 DI + Protocol 架构（MCP 工具包装成 `Tool` Protocol 对象，
+而不是直接调 `registry.register` 全局单例），并大幅砍掉高级功能。
+
+#### Aegis design and data flow
+
+**依赖**：`mcp` SDK 是 `pyproject.toml` 的可选依赖（`[project.optional-dependencies] mcp`）。
+运行时 guarded import：SDK 没装时 `is_available()` 返回 `False`，MCP 功能静默跳过。
+
+**配置** (`mcp/config.py`)：
+- `load_mcp_config(path) -> dict[str, dict]` — 读 `~/.aegis/config.yaml` 的 `mcp_servers:` 键
+- 递归 `${ENV_VAR}` 插值，merge 默认值（timeout=120, connect_timeout=60, enabled=True）
+
+**Schema 适配** (`mcp/schema_adapter.py`)：
+- `sanitize_mcp_name_component` — `[^A-Za-z0-9_]` → `_`
+- `normalize_mcp_input_schema` — 三阶段：`_rewrite_local_refs`（definitions→$defs）
+  → `_strip_nullable_union`（anyOf [{T}, {null}] → {T, nullable:true}）
+  → `_repair_object_shape`（补 type/poperties/修剪 required）
+- `convert_mcp_tool(server_name, mcp_tool) -> dict` — 产出 `{name: "mcp_{s}_{t}", description, parameters}`
+- `strip_nullable_unions` 从 Hermes `tools/schema_sanitizer.py` **内联**（~50行），避免跨模块依赖
+
+**连接** (`mcp/client.py`)：
+- 模块级状态：一个 daemon 线程 + asyncio event loop + `dict[str, _MD]` 服务器表 + `threading.Lock`
+- `_ensure_loop()` + `_run_on_loop(coro, timeout)`：跨线程协程调度
+- `connect_stdio_server` / `connect_http_server`：建 session → initialize → list_tools
+- `call_tool(server_name, tool_name, args, timeout) -> str`：调 `session.call_tool`，收集 text blocks，返回 JSON
+- 凭证清洗：`_CREDENTIAL_PATTERNS` 正则 scrub 所有 error text
+- `disconnect_all()`：优雅关闭
+
+**工具包装** (`mcp/tools.py`)：
+- `MCPToolWrapper` 实现 `Tool` Protocol：存 `definition: ToolDefinition` + 服务器名 + 工具名 + timeout
+- `run(arguments, ctx)` → `call_tool` → `ToolResult`
+- 永远不抛异常（MCP 调用错误 → `is_error=True` 结果）
+
+**提示注入** (`mcp/guidance.py`)：
+- `MCPToolsGuidance` 实现 `PromptContributor`：有服务器连接时 render "MCP tools from N servers are available"
+
+**接线**：
+- `with_defaults(enable_mcp=True, mcp_config_path=None)`：读配置 → 连服务器 → 转换 schema →
+  `MCPToolWrapper` → `registry.register(wrapper)` → `prompt_builder.add(MCPToolsGuidance)`
+- CLI `--mcp-config` / `--no-mcp` flags
+
+#### Key files, classes, and functions
+
+- `mcp/config.py`：`load_mcp_config`, `_interpolate_env_vars`, `DEFAULT_MCP_SERVER_CONFIG`
+- `mcp/schema_adapter.py`：`sanitize_mcp_name_component`, `normalize_mcp_input_schema`, `convert_mcp_tool`, `_rewrite_local_refs`, `_strip_nullable_union`, `_repair_object_shape`
+- `mcp/client.py`：`connect_server`, `call_tool`, `get_server_tools`, `disconnect_all`, `_ensure_loop`, `_run_on_loop`
+- `mcp/tools.py`：`MCPToolWrapper(definition, run)`, `build_wrappers`
+- `mcp/guidance.py`：`MCPToolsGuidance(render)`
+
+#### Reliability invariants, edge cases, and failure handling
+
+- SDK 没装 → `is_available()` = False，MCP 功能静默跳过
+- 配置文件缺失 → `load_mcp_config` 返回 `{}`，不抛异常
+- 单个服务器连接失败 → 记日志，跳过去，不阻止 Aegis 启动
+- MCP 工具调用超时 → `TimeoutError` → `{"error": "MCP call failed: ..."}`
+- MCP 服务器崩溃 → `session.call_tool` 抛异常 → 被 `call_tool` 的 except 捕获，返回 error JSON
+- MCP 工具返回值含凭证 → `_sanitize_error` regex scrub `[REDACTED]` 代替
+- `MCPToolWrapper.run(None)` → `dict(None)` 不抛 → 防御 `if arguments is None: arguments = {}`
+
+#### Tests
+
+- `test_mcp_schema_adapter`（20）：名称清洗(3) / 空 schema / 合法 schema /
+  definitions→$defs / $ref 重写 / nullable union collapse(4) / object repair(5) / 工具转换(4)
+- `test_mcp_config`（8）：文件缺失/无键/非dict/servers加载/非dict条目/skip/默认值merge/ENV插值/未匹配ENV保留/数组插值
+- `test_mcp_tools`（5）：前缀/描述/parameters/run error返回/run 不抛
+- `test_mcp_guidance`（4）：无服务器 → None / 2 服务器 / 1 服务器单数 / reset
+
+#### Source relationship
+
+Schema adapter + config loader + client 为 **ADAPT**；
+tools (wrapper) 为 **REWRITE**（Aegis 特有 pipeline）；guidance 为 **original**。
+见 `docs/source-map.md` Stage 5 表。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- **只支持 stdio + Streamable HTTP**（无 SSE，无 OAuth）——极轻量，但限制可连接的服务器类型
+- **无重连**——connect失败即跳过，server之后断开不自动恢复
+- **无断路器**——连续失败的 server 不会自动降级
+- **无 dynamic tool refresh**——连接后 tools 列表固定，不支持 `list_changed` 通知
+- **无 sampling**——不支持服务器发起 LLM 请求
+- **无 utility tools**——不注册 `list_resources` / `read_resource` / `list_prompts` / `get_prompt`
+
+#### Interview summary
+
+"Stage 5 做了 MCP 客户端，范围精打细算到最小可用面：stdio + Streamable HTTP 两个传输，
+schema adapter 从 Hermes 搬了关键的三阶段归一化 pipeline（`definitions→$defs` /
+nullable union 折叠 / object 形状修复），保证同一个 MCP 工具的 inputSchema 在 OpenAI、
+Anthropic、Gemini 上都能通过验证。
+
+每个发现的 MCP 工具包装成 Aegis 的 `Tool` Protocol —— 一个 `MCPToolWrapper` 存着
+`ToolDefinition` 和 `call_tool` 调度逻辑，这样它可以和内置工具、技能工具一样注册进
+`ToolRegistry`，模型无差别调用。
+
+后台是一个 daemon 线程 event loop，`asyncio.run_coroutine_threadsafe` + Future 轮询
+做跨线程阻塞调用。显式砍掉了 SSE、OAuth、sampling、断路器等 Hermes 级功能，
+保持 Aegis 的轻量身份。"
+
+#### 对已有 milestone 的改动
+
+- `docs/development-log.md`：更新测试计数（105→221）、进度表加 Stage 5、模块表加 mcp、溯源表加 mcp 条目、"计划实现"移除 MCP、面试索引加第 13 条
+- `docs/source-map.md`：新增 Stage 5 表
+
+*本 milestone 由用户显式要求，不在原始 §4 范围内（§5 "unless explicitly requested"）。*
 
 ---
 
-## Source relationship
+### Milestone 6 — Stage 6：文件编辑工具（write_file / patch / search_files）
 
-完整对照见 [`docs/source-map.md`](source-map.md)。关系图例：
+#### Problem and goal
 
-- **PORT**：几乎照搬 reference source，保留适用版权。
-- **ADAPT**：派生但解耦/简化，保留适用 attribution。
-- **REWRITE**：参考 reference source 的**可观测行为或架构**重写，Aegis 原创实现，但记录行为来源。
-- **original**：Aegis 原创 wiring / implementation，无复制或实质派生代码。
+Aegis 此前只有 3 个极简内置工具（`read_file` / `list_directory` / `run_shell`）。用户要求从
+Hermes 迁入一批"尽量不做阉割版"的工具。这是其中第一个里程碑——**文件操作三件套**：
+`write_file`（写文件）、`patch`（精确/模糊替换）、`search_files`（文件内容/名搜索）。
+目标是在 Aegis 的显式 DI + `Tool` Protocol 架构下，复刻 Hermes 编辑器的核心健壮性
+（原子写、BOM/行尾保留、模糊匹配、写后校验），而不是抄一个只会 `open().write()` 的简陋版。
 
-### 汇总
+#### Relevant Hermes behavior
 
-| Aegis 模块 | 关系 | Hermes 来源 |
-|---|---|---|
-| `runtime.IterationBudget` | PORT | `agent/iteration_budget.py` |
-| `runtime.AgentRuntime.run_turn` | REWRITE | `agent/conversation_loop.py:run_conversation` |
-| `runtime.TurnEvent` / `on_event` | REWRITE | `conversation_loop` 的 `_vprint`/`_buffer_vprint` 实时反馈 |
-| `events.collect_response`（含 `is_cancelled`/`on_event`） | ADAPT | `agent/chat_completion_helpers.py`（流→统一响应） |
-| `models.stream.StreamAssembler` | ADAPT | `agent/chat_completion_helpers.py`（流式工具调用组装） |
-| `models.openai_compat` | REWRITE | `interruptible_api_call`/`interruptible_streaming_api_call` |
-| `models.sanitize` | ADAPT | `agent/message_sanitization.py` |
-| `tools.executor` | ADAPT | `agent/tool_executor.py` 等 |
-| `tools.danger` | ADAPT | `tools/approval.py` |
-| `context.builder` | ADAPT | `conversation_loop.py`（每轮 `api_messages` 构建） |
-| `sessions.memory_store` | REWRITE | `hermes_state.py:SessionDB.append_message` |
-| `tools/builtin/*` | REWRITE | `tools/file_tools.py`、`tools/terminal_tool.py` 等（行为等价最小面） |
-| `tui._ThinkingRenderable` | ADAPT | `agent/display.py:KawaiiSpinner` |
-| `tui` banner / `Tui` | REWRITE | `hermes_cli/banner.py`、`cli.py`（prompt_toolkit 输入） |
-| `skills.*` | ADAPT | `agent/skill_utils.py`、`agent/skill_commands.py`、`tools/skills_tool.py`、`agent/prompt_builder.py` |
-| `agents.Agent` / subagent lifecycle | ADAPT / REWRITE | Claude Code `Agent` tool、async subagent task、fork/background behavior |
-| `agents.team_*` / teammate messaging | ADAPT / REWRITE | Claude Code `team_create`、`send_message`、persistent teammate / mailbox behavior |
-| `context.system_prompt` | ADAPT | `agent/system_prompt.py:build_system_prompt_parts` |
-| `cli._select_provider`、`exceptions`、`env` 等 | original | — |
+- `tools/fuzzy_match.py`（747 行）：`fuzzy_find_and_replace` 的 9 策略匹配链
+  （exact → line-trimmed → whitespace → indentation → escape → trimmed-boundary →
+  unicode → block-anchor → context-aware），外加 escape-drift 检测、替换区重缩进、
+  `\t`/`\r` 智能反转义、`find_closest_lines` 的 "did you mean?" 提示。**仅依赖 `re`+`difflib`，零 Hermes 耦合。**
+- `tools/file_operations.py`（1973 行）：`ShellFileOperations.write_file` / `patch_replace` / `search`，
+  以及通用小工具 `_detect_line_ending` / `_normalize_line_endings` / `_strip_bom` /
+  `_atomic_write` / `_unified_diff` / `_is_write_denied`。核心行为：自动建父目录、
+  整体覆盖、temp+`mv` 原子写、保留 BOM 与 CRLF、敏感路径拒写、patch 写后重读校验、
+  无匹配时给 "did you mean?" 提示、search 优先 ripgrep 回退 grep。
+- `tools/path_security.py`：`has_traversal_component` / `validate_within_dir`。
 
-适配/派生文件按来源保留适用 attribution；Hermes-derived files use the existing `# Portions adapted from Hermes ...` header where required.
-`THIRD_PARTY_NOTICES.md` 收录 Hermes MIT 全文与运行时依赖许可（openai/typer/rich/pydantic/
-pyfiglet MIT，prompt_toolkit BSD-3，wcwidth MIT）。
+#### Migration decision: 混合（PORT + ADAPT + REWRITE）
 
----
+- `tools/fuzzy_match.py` → **PORT**（几乎原样）：它是自包含纯函数模块，依赖闭包全是 stdlib，
+  是最小完整迁移单元，拆开会徒增工作。只做了 typing import 的整理。
+- `tools/fsutil.py` → **ADAPT**：把 Hermes 散在 `file_operations.py` 里的通用 helper 收敛成一个
+  无后端耦合的模块。**关键改动**：Hermes 一切读写都走 pluggable 终端后端 `execute()`（docker/ssh/modal），
+  此处换成直接 Python I/O（`pathlib`/`os.replace`）；并新增 `read_text_raw`（二进制读取）——
+  因为 Python 文本模式 `read_text`/`write` 会做 universal-newline 转换（`\r\n`→`\n`），
+  会把 CRLF/BOM 信息在读写往返中抹掉，必须绕过。
+- `builtin/write_file.py`、`builtin/search_files.py` → **REWRITE**（对齐行为、按 Aegis `Tool` 协议重写）。
+- `builtin/patch.py` → **ADAPT**（复用 fuzzy_match；对齐 `patch_replace`）。
+- **显式丢弃** Hermes 的 cross-profile 镜像、file_state/staleness 跟踪、连搜熔断、
+  lint/LSP 层、secret redaction、sandbox 后端路由。**V4A 多文件补丁模式不迁**（用户确认只做 replace 模式）。
 
-## Current limitations and TODOs
+#### Aegis design and data flow
 
-### 已知限制（实现层面）
+- `tools/fsutil.py`：`resolve_path`（cwd 感知 + `~` 展开）、`is_write_denied`（`/etc`、`/boot`、
+  `.ssh` 等通用敏感路径拒绝）、`detect_line_ending`/`normalize_line_endings`、`strip_bom`/`has_bom`、
+  `atomic_write`（同目录 temp + `os.replace`，二进制写保证 CRLF 不被翻译）、`read_text_raw`、
+  `unified_diff`、`has_traversal_component`。
+- `builtin/write_file.py`：`{path, content}` → `{path, bytes_written, created, dirs_created}` / `{error}`。
+  存在文件时先读原文探测 BOM 与行尾，写回时保留。
+- `builtin/patch.py`：`{path, old_string, new_string, replace_all}` →
+  `{success, path, replaced, strategy, diff}` / `{success:false, error}`。多匹配且未 `replace_all` 报错；
+  无匹配追加 "did you mean?" 提示；**写后重读校验**内容确实落盘（防静默失败）。
+- `builtin/search_files.py`：`target=content` 用正则搜内容（`rg` 优先，纯 Python `os.walk`+`re` 回退，
+  跳过二进制与隐藏/VCS 目录）；`target=files` 按 glob 找文件名（`rg --files --sortr=modified`，
+  回退 `fnmatch`，新→旧）。`output_mode ∈ content/files_only/count`，`limit`/`offset` 分页。
+- 三者在 `tools/schemas.py` 定义 schema，经 `build_default_registry()` 注册进 `ToolRegistry`。
 
-1. **Team durability**：Stage 20 的 team / teammate transport 是 in-process；team roster、mailbox、teammate transcript 不具备跨进程或重启后的 durable recovery。
-2. **Custom agents**：当前只有内置 `explore` / `general-purpose` 和 implicit fork；还没有 `.aegis/agents/*.md` 这类自定义 agent definition loader。
-3. **Agent inspection UI**：`/agents` 只列 subagent task 状态，不是完整 team roster、teammate transcript 或 mailbox 管理界面。
-4. **多 provider**：无 failover / rate-guard / 凭证池（Stage 2 有意砍掉）。
-5. **工具执行**：顺序执行，无并发；无 guardrails 链。
-6. **MCP**：无 reconnect / circuit breaker / per-tool progress policy；慢 upstream 只返回配置 timeout 的错误结果。
-7. **TUI**：逐字符流式在**管道/重定向**下因 stdout 缓冲看不出渐进（真 TTY 才可见）；banner 在 <120 列的窄终端会被 figlet 折行或由终端自行折行。
-8. **真实端点**：默认测试不跑真 OpenAI-compatible e2e；`test_real_endpoint_smoke` 仍是 opt-in integration。
+#### Key files, classes, and functions
 
-### 已知缺陷 / 风险
+- `tools/fuzzy_match.py`：`fuzzy_find_and_replace`、`format_no_match_hint`、`find_closest_lines`、9 个 `_strategy_*`
+- `tools/fsutil.py`：`atomic_write`、`read_text_raw`、`detect_line_ending`、`normalize_line_endings`、
+  `is_write_denied`、`resolve_path`、`unified_diff`
+- `builtin/write_file.py`：`WriteFileTool`
+- `builtin/patch.py`：`PatchTool`
+- `builtin/search_files.py`：`SearchFilesTool`、`_walk_files`、`_parse_rg_content`
 
-- `uv run ruff check .` 的最近记录仍有 2 个既有告警（`src/aegis_agent/cli.py:431` `DTZ005`、`src/aegis_agent/mcp/client.py:457` `SIM115`），与 multi-agent 文档更新无关。
-- `aegis-agent.png` 仅作项目品牌图（README/文档），终端不可靠显示 PNG，故 CLI 用 ASCII banner。
+#### Reliability invariants, edge cases, and failure handling
 
-### 计划的后续里程碑（未实现）
+- **原子写**：temp 文件 + `os.replace`，崩溃不留半截文件；任何失败清理 temp。
+- **CRLF/BOM 保留**：二进制读写往返，CRLF 文件改完仍是 CRLF（有测试断言字节级保留）。
+- **patch 写后校验**：写回后重读比对，落盘不符即报错。
+- **敏感路径拒写**：`/etc`、`/boot`、`.ssh/credentials` 等拒绝写入。
+- **无匹配兜底**：patch 找不到 old_string 时给最相近行提示，帮助模型自纠。
+- **工具永不抛异常**：一切失败（文件不存在/是目录/无匹配/非法正则）都返回 `{error}` 结果。
 
-- 自定义 agent definition discovery / loading；
-- durable / cross-process team mailbox、remote A2A transport、teammate restart recovery；
-- `/teams` 或增强 `/agents`，展示 team roster、teammate 状态、mailbox 与 transcript 摘要；
-- MCP reconnect / circuit breaker；
-- guardrail circuit breaker；
-- 并发工具执行。
+#### Tests
 
----
+- `tests/test_write_file.py`（7）：新建/覆盖/建父目录/CRLF 保留/敏感路径拒绝/缺字段/拒绝目录。
+- `tests/test_patch.py`（10）：精确替换/模糊缩进匹配/空串删除/多匹配需 replace_all/replace_all/
+  无匹配给提示/文件缺失/缺字段/CRLF 保留。
+- `tests/test_search_files.py`（12）：内容匹配/glob 过滤/无匹配/files_only/count/非法正则/
+  分页/文件名 glob/裸模式/路径缺失/排除隐藏与 VCS。
 
-## Interview review index
+#### Source relationship
 
-按"一句话能复述"组织，快速复习用。
+`fuzzy_match.py` 为 **PORT**；`fsutil.py`、`patch.py` 为 **ADAPT**；`write_file.py`、`search_files.py`
+为 **REWRITE**（行为等价）。PORT/ADAPT 文件保留 Hermes MIT 归属头。详见 `docs/source-map.md` Stage 6。
 
-1. **项目定位**：从 Hermes 与 Claude Code reference sources 抽取/适配/重写核心 runtime 行为做的轻量 Agent Runtime，只保留 CLI + Loop + provider 抽象 +
-   工具 + 上下文 + 会话 + 记忆 + multi-agent orchestration；明确砍掉消息网关、品牌 UI 和远程 A2A 产品能力。
-2. **架构**：单向依赖 `cli → runtime → {models, tools, context, sessions}`；runtime 只依赖四个
-   Protocol（`ModelProvider`/`SessionRepository`/`Tool`/`ContextBuilder`），不碰 Typer/SQL/Redis/具体 provider。
-3. **Agent Loop**：guard（interrupt + IterationBudget）→ build 派生上下文 → `provider.stream`
-   → `collect_response` → 持久化助手消息 → 有工具则执行回填再循环，无工具则 `FINAL_ANSWER`。
-4. **原始消息为 source of truth**：发给模型的上下文是每轮重建的副本，清掉 `client_msg_id`/`seq`；
-   压缩/恢复未来只改派生视图，原文不动。
-5. **流式契约**：provider 产 `ModelEvent`，`collect_response` 折叠成 `ChatResponse`，流式与非流式同形；
-   `StreamAssembler` 处理工具调用分片（name 赋值、arguments 拼接、按 index 槽位）。
-6. **健壮性**：wire 前清洗孤立代理项、执行前修复畸形参数 JSON（解决 DashScope/Qwen 历史污染崩溃）；
-   工具异常统一转 `{"error":...}` 不击穿循环；流式中途取消丢弃半成品。
-7. **安全**：`run_shell` 危险命令默认拦截，开关是操作员-only（非工具参数），模型无法绕过。
-8. **会话不变量**：幂等于 `client_msg_id`、单调 `seq`、会话隔离；内存版线程安全。
-9. **流式 UI**：`on_event` 观察者缝把 `TurnEvent` 回调给 UI，runtime 零改动；prompt_toolkit 输入
-   （光标移动/历史）+ rich 输出 + `pyfiglet` banner + `Live` 颜文字 spinner；`DONE` 不转发以免双发 `TURN_END`。
-10. **测试**：默认测试全离线确定性 fake；multi-agent 直接覆盖在 `tests/test_subagent.py`、`tests/test_subagent_v2.py`、`tests/test_team.py`；integration 真端点 opt-in。
-11. **与 reference sources 的关系**：PORT / ADAPT / REWRITE / original 四档；Hermes / Claude Code 关系在 `docs/source-map.md` 逐项可查，不把派生代码当完全原创。
-12. **Skills 与动态 prompt**：`SystemPromptBuilder` + `PromptContributor` 缝 → `ContextBuilder` 每轮
-    实时渲染系统提示；技能用 progressive disclosure（紧凑索引进 prompt、`skills_list`/`skill_view`
-    工具按需取完整内容）；`/skill-name` 斜杠命令经 `SkillRouter.invocation_message` 注入；
-    所有技能工具实现现有 `Tool` Protocol 插入 `ToolRegistry`，不搬 Hermes 的全局单例模式；
-    原始会话消息全程不碰（source-of-truth 不变式）。
-13. **Multi-agent orchestration**：`Agent` 工具把一次性 subagent 跑在复用的 `AgentRuntime` 上，支持 typed fresh、implicit fork、foreground/background；team 则用 `team_create` / `send_message` 把 persistent teammate、in-process mailbox 和 idle wakeup 接进同一 runtime，不引入第二套 loop。
+#### Trade-offs, remaining limitations, and TODOs
 
----
+- patch 只做 replace 模式，不含 V4A 多文件补丁（用户确认）。
+- search 的纯 Python 回退有 20000 文件扫描上限与每行 500 字符截断；`rg` 可用时更快且尊重 .gitignore。
+- 未做 Hermes 的 lint/LSP 诊断、secret redaction、跨进程 file-state 跟踪。
 
-*本文档由 `CLAUDE.md` 规定的开发流程产出；每个任务的实际改动范围以对应完成报告为准。
-Hermes / Claude Code reference repositories are read-only references and must not be modified.*
+#### Interview summary
 
----
+"这个里程碑把 Hermes 编辑器三件套的**健壮性内核**迁进了 Aegis 的 `Tool` Protocol 架构。
+最关键的是 `fuzzy_match.py` 几乎原样整体迁移——它是零依赖纯函数，9 策略匹配链能容忍 LLM
+生成代码常见的空白/缩进/转义漂移。配套地我把 Hermes 散落的原子写、BOM/CRLF 保留、统一 diff、
+敏感路径守卫收敛成一个无后端耦合的 `fsutil` 模块——这里有个坑：Python 文本模式 I/O 会做
+universal-newline 转换，会把 CRLF 在读写往返中抹成 LF，所以我用二进制 `read_text_raw` +
+二进制 `atomic_write` 保住字节级不变式，并用测试断言。patch 写后还会重读校验，杜绝静默失败。
+全部三个工具实现现有 `Tool` Protocol，经显式 `build_default_registry()` 注册，不依赖 Hermes 的
+全局单例或终端后端抽象。"
 
-## Milestone 12 — Stage 12：会话恢复（SQLite 持久化 + 快恢复快照 + 跨进程租约）
+#### 对已有 milestone 的改动
 
-### Problem and goal
-
-Aegis 此前只有内存会话：进程退出即丢，无 `--resume`、崩溃丢全部未落盘历史、两个
-进程可以同时跑同一会话导致重复模型请求与交叉写历史。本里程碑把用户在 Hermes 上
-自行实现的会话恢复功能（三个提交）移植到 Aegis：
-
-- `5a51f55` 消息级增量持久化 + 幂等防重，加固 --resume 崩溃恢复
-- `181e078` 快恢复快照——session_snapshots 表 + resume 增量重放
-- `03e5adc` 可插拔跨进程会话租约（SQLite/Redis），防多进程重复恢复
-
-### Relevant Hermes behavior and source locations
-
-- `hermes_state.py`（~5000 行中的会话持久化部分）：连接配置三要素
-  （`check_same_thread=False` / `timeout=1.0` / `isolation_level=None`）、
-  `apply_wal_with_fallback`、`_execute_write`（BEGIN IMMEDIATE + 随机 jitter 重试 +
-  每 50 写 TRUNCATE checkpoint）、`append_message`（UNIQUE(session_id,
-  client_msg_id) 部分索引 + ON CONFLICT DO NOTHING + 计数同事务累加）、
-  `write_snapshot` / `load_latest_snapshot` / `get_messages_after_seq` /
-  `resume_conversation`、`session_leases` 表方法。
-- `session_lease.py`（573 行自包含文件）：后端接口 + SQLite/Redis 后端 +
-  心跳管理器。
-- 设计文档：`hermes_state_核心机制.md`（用户自写，本里程碑的主要行为依据）。
-
-### Migration decision: ADAPT（存储层）+ 近乎逐字节 PORT（租约层）
-
-- `hermes_state.py` 是一个 5000 行的耦合大文件，且 Aegis 的存储单元是 `Message`
-  dataclass 而非 OpenAI dict——**选择适配性移植**：完整搬走事务机器与恢复算法，
-  schema 裁剪到 Aegis 字段。砍掉：FTS5 搜索、标题/归档、rewind/undo、压缩链
-  （Aegis 压缩不改写源历史、不分叉会话，故 `resolve_resume_session_id` 的
-  parent 链行走逻辑不需要）、token 计费、平台消息 id、codex/多模态附加列。
-- `session_lease.py` 本来就是自包含单元——**近乎逐字节 PORT**，仅改 env 变量名
-  （`AEGIS_SESSION_LEASE_BACKEND` / `AEGIS_REDIS_URL` / TTL / RENEW）、Redis 键前缀
-  （`aegis:session_lease:`）、SQLite 后端改为包装 `SQLiteSessionRepository`。
-
-### Aegis design and data flow
-
-**写路径（每次 `_persist`）**：
-
-```
-runtime._persist(message) → SQLiteSessionRepository.append_message
-  → _execute_write: BEGIN IMMEDIATE → [事务内现算 seq=MAX(seq)+1
-    → INSERT ... ON CONFLICT(session_id, client_msg_id) DO NOTHING
-    → 真插入才 UPDATE sessions.message_count（同事务）] → COMMIT（= fsync 落盘）
-  → 撞锁：20~150ms 随机 jitter 重试（最多 15 次）；每 50 写一次 TRUNCATE checkpoint
-```
-
-**恢复路径（Aegis 架构下天然成立）**：runtime 每次模型调用前都从 repository 读
-历史，所以 `--resume <id>` 不需要任何"预加载"——用同一个 SQLite repo 打开已有
-session 即恢复。`list_messages` 内部走快路径：
-
-```
-resume_messages(session_id)
-  → load_latest_snapshot（history_version 匹配 + zlib 解压 + CRC32 校验）
-  → 有效：快照 dicts + get_messages_after_seq(last_seq) 尾部 → Messages
-  → 任何失效（无快照/版本不符/解压失败/校验失败/JSON 损坏/尾部读取异常）
-    → 全量重放（永远正确的兜底）
-```
-
-快照生成在 CLI 层：每轮结束后 `maybe_write_snapshot(session_id, every_n=20)`
-（per-session 游标控制节奏；快照从**已提交的 DB 行**构建，与全量重放共用同一
-解码器 `_row_to_dict`，保证字节一致）。
-
-**租约（CLI 启动时）**：
-
-```
-_start_lease: get_lease_backend（sqlite=共用会话库 / redis=AEGIS_REDIS_URL，
-              不可达 → 报错退出，绝不静默降级）
-  → SessionLeaseManager.acquire(session_id)（失败 = 另一进程持有 → 拒绝启动）
-  → 心跳线程每 10s 续期（TTL 30s）
-  → 续期失败 → on_lost → 设置 interrupt Event → run_turn 在下一个 guard 停止
-    （不再发模型请求、不再写消息，避免双写者）
-  → REPL 结束 finally：manager.stop()（停心跳 + 释放）→ repo.close()
-```
-
-**CLI 新开关**：`--db`（env `AEGIS_DB_PATH`，默认 `~/.aegis/state.db`）、
-`--ephemeral`（内存存储）、`--resume/-r`、`--no-lease`、`--snapshot-every-n`
-（默认 20，0 关闭）。
-
-### Key files, classes, and functions
-
-- `sessions/sqlite_store.py`：`SQLiteSessionRepository`（SessionRepository Protocol
-  实现）——`_execute_write` / `_apply_wal_with_fallback` / `append_message` /
-  `write_snapshot` / `load_latest_snapshot` / `resume_messages` /
-  `maybe_write_snapshot` / `bump_history_version` / `try_acquire_session_lease` 等
-  租约表方法
-- `sessions/lease.py`：`SessionLeaseBackend` / `SQLiteSessionLeaseBackend` /
-  `RedisSessionLeaseBackend` / `SessionLeaseManager`（心跳 + on_lost 熔断）/
-  `get_lease_backend` / `SessionLeaseUnavailableError`
-- `cli.py`：`_build_repository` / `_start_lease` / `_maybe_snapshot`；REPL 传入
-  `interrupt=lease_lost`
-- `pyproject.toml`：新增 `redis` 可选依赖组
-
-### Reliability invariants, edge cases, and failure handling
-
-- **幂等**：同一 client_msg_id 重复 append → 只落一行、返回既有记录、计数不虚增
-  （断言 sessions.message_count == 实际行数）。
-- **有序**：seq 在写事务内现算；两个写连接交错 append 20 条 → seq 恰好 0..19 无重号。
-- **崩溃耐久**：不 close 直接用第二个连接读 → 已 COMMIT 的行全部可见（WAL）。
-- **快照等价**：snapshot+tail == 全量重放（Message 级相等）；blob 损坏 / checksum
-  错误 / history_version 不符 → 全部安全降级全量重放且结果正确。
-- **恢复后续写不重**：resume 后新消息 seq 接续；把恢复出的消息重新 flush（带原
-  client_msg_id）→ 全部幂等跳过。
-- **租约互斥**：8 个竞争连接抢同一会话 → 恰好 1 个获胜；TTL 过期可回收；过期持有
-  者不能续期/释放/通过 is_owner；心跳保活超过 TTL；on_lost 恰好触发一次；
-  switch_session 先拿新再放旧、失败保留旧；Redis 不可达抛错不降级。
-- **CLI 级**：`--resume` 恢复并显示消息数；不存在的会话报错退出；租约被占时拒绝
-  启动、释放后可再入。
-
-### Tests
-
-- `tests/test_sessions_sqlite.py`（16 个）：协议符合性、幂等、隔离、缺会话异常、
-  跨实例持久化、双写者并发、快照等价/损坏/校验/版本失效/keep-N/节奏、恢复续写
-  不重、runtime 级 resume 集成（新进程 provider 看到上一轮完整历史）。
-- `tests/test_session_lease.py`（19 个）：SQLite 后端全场景 + 管理器心跳/熔断/
-  切换 + 后端选择 + Redis 后端（内存 fake client 实现 set NX/PX + Lua 语义；
-  中途宕机触发熔断）。
-- `tests/test_cli.py`：既有用例改为 hermetic（AEGIS_DB_PATH 指向 tmp）；新增
-  `--resume` 恢复、未知会话报错、租约占用拒绝启动 + 释放后可入。
-- 全量 `uv run pytest -q`：352 passed / 1 skipped / 1 failed（唯一失败仍是
-  Stage 8 遗留的网络用例 test_web_extract_blocks_private_url，与本次无关）。
-- `ruff check` / `mypy`（全部改动文件）：零告警 / 零错误。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- **压缩链解析未移植**：Aegis 压缩不分叉会话，源历史始终在单会话内——若未来引入
-  改写源历史的机制，需带回 `resolve_resume_session_id` 的链行走逻辑。
-- **history_version 暂无 bump 调用方**（Aegis 还没有 /undo 等历史改写）；机制已就绪。
-- **租约丢失后的停止是"下一个 guard"粒度**：正在飞行中的模型请求完成后才停，
-  可能多写一条 assistant 消息——幂等键保证不产生重复行，但可能与其它进程交错
-  一条。Hermes 行为相同（熔断翻转标志位）。
-- **Redis 后端只经 fake client 单测** ~~真 Redis 集成测试未移植~~ → **已补**
-  （后续跟进）：`tests/lease_worker.py` + `tests/test_session_lease_dualprocess.py`
-  移植了双进程子进程测试（单胜者 / 不同会话并行 / 正常退出即刻接管 / kill -9 后
-  TTL 接管 / TTL 前拒绝），`tests/test_session_lease_redis_live.py` +
-  `tests/docker-compose.redis.yml` 提供真 Redis 集成测试（`integration` marker +
-  `AEGIS_TEST_REDIS_URL` 门控，默认不跑）。
-- **内存存储 + 租约** ~~时锁落在默认路径的 SQLite 库上~~ → **已修**（后续跟进）：
-  `--ephemeral` 且未显式设置 `AEGIS_SESSION_LEASE_BACKEND` 时 CLI 直接跳过租约
-  （内存会话无跨进程共享状态，无从冲突），不再触碰默认路径锁库；显式配置后端
-  的操作者意图仍被尊重。
-
-### Interview summary
-
-"这个里程碑把我在 Hermes 上做的会话恢复三件套移植到了 Aegis。存储层是适配性移植：
-搬走了整套事务机器——WAL、BEGIN IMMEDIATE 进事务就抢锁、撞锁后随机 jitter 重试、
-每 50 写 TRUNCATE checkpoint——加上消息级幂等落盘（UNIQUE(session_id,
-client_msg_id) 部分索引 + ON CONFLICT DO NOTHING，计数和 INSERT 同事务），但 schema
-裁剪到 Aegis 的 Message dataclass，FTS/标题/undo/计费这些上游功能全部砍掉。
-恢复在 Aegis 架构下特别干净：runtime 每轮都从 repository 读历史，所以 resume 不需要
-预加载——list_messages 内部直接走「最新有效快照 + 尾部增量」快路径，快照用 zlib 压缩
-加 CRC32 校验，history_version 不符或任何损坏都安全降级全量重放。租约层是近乎逐字节
-移植：SQLite/Redis 双后端、心跳保活、续期失败立即熔断——熔断信号接到 run_turn 的
-interrupt event 上，循环在下一个 guard 停止，避免双写者。测试覆盖了 §9 的核心不变式：
-幂等、单调有序、会话隔离、快照等价于全量重放、损坏快照安全降级、同会话单一租约主。"
-
-### 对已有 milestone 的改动
-
-- `cli.py`：新增会话存储/租约/快照接线与 CLI 开关（Stage 11 的压缩开关之上）。
-- `sessions/__init__.py`：导出 SQLite 存储与租约组件。
-- `tests/test_cli.py`：既有用例改为 hermetic DB 路径。
-- `docs/source-map.md`：新增 Stage 12 表。
+- `docs/source-map.md`：新增 Stage 6 表。
+- `tools/schemas.py`、`tools/builtin/__init__.py`：注册三个新工具。
 
 *Hermes 仓库为只读参考，未修改。*
 
 ---
 
-## Milestone 11 — Stage 11：压缩管线接入 Agent Loop + 遗留风险清零
+### Milestone 7 — Stage 7：终端与后台进程工具（terminal / process）
 
-### Problem and goal
+#### Problem and goal
+
+M1 迁入了文件三件套。本里程碑迁入**终端/进程**两件套：功能更全的 `terminal`（前台一次性执行 +
+后台启动），以及配套的后台进程管理工具 `process`。按用户决策，`terminal` **取代** Stage-1 的
+极简 `run_shell`（后者移除），避免两个语义重叠的执行工具。目标是在 Aegis 显式 DI 架构下复刻
+Hermes 后台进程管理的核心能力（输出缓冲、状态轮询、阻塞等待、树杀、stdin 交互），而非一个
+只会 `subprocess.run` 的版本。
+
+#### Relevant Hermes behavior
+
+- `tools/terminal_tool.py`（2282 行）：`terminal_tool` 支持前台（跑完即返回、timeout→124、
+  输出头尾截断、grep/diff 退出码解释、长驻服务→后台提示）与后台（`background=true` 立即返回
+  `session_id`）。但深度耦合 Hermes 的 sandbox 后端（local/docker/singularity/modal/ssh）、
+  审批/force 护栏、watch_patterns、gateway 通知路由。
+- `tools/process_registry.py`（1432 行）：`ProcessRegistry` 单例 + `ProcessSession`（id、滚动 200KB
+  `output_buffer`、daemon reader 线程、`_running`/`_finished` dict + 锁、TTL+LRU 修剪）、
+  八个生命周期动作、`_reconcile_local_exit`（孤儿管道挂起修复）、psutil/`taskkill /T /F` 树杀。
+
+#### Migration decision: 混合（ADAPT + REWRITE + 删除 run_shell）
+
+- `tools/process_registry.py` → **ADAPT**（本地子集）：保留注册表模型、reader 线程、spawn_local、
+  八个动作、修剪、孤儿管道修复、树杀、ANSI 剥离。**丢弃** sandbox 后端（`spawn_via_env`）、
+  ptyprocess PTY、watch_patterns 限流 + 全局熔断、gateway 通知路由、崩溃恢复 checkpoint 文件、
+  per-profile HOME 隔离、provider-secret env 清洗。shell 包装从 `[shell, -lic, "set +m; cmd"]`
+  简化为 `/bin/sh -c` / `cmd /c`。
+- `builtin/terminal.py`、`builtin/process.py` → **REWRITE**（对齐行为、实现 `Tool` Protocol）。
+- `builtin/run_shell.py` → **删除**（被 terminal 取代）。
+
+#### Aegis design and data flow
+
+- `terminal` `{command, timeout=60(≤600), workdir, background=false, pty=false}`：
+  前台 → `{output, exit_code, error}`（error=null 表成功；timeout→exit_code 124；输出 40%/60%
+  头尾截断；grep/diff 的 exit 1 给 "非错误" 注解；`&`/server 类命令给后台化提示）。
+  后台 → `{session_id, pid, output, exit_code:0, error:null}`，进程进入共享 registry。
+  **沿用危险命令护栏**（`detect_dangerous_command` + operator-only `allow_dangerous_shell`）。
+- `process` `{action, session_id?, data?, timeout?, offset, limit}`，action ∈
+  `list/poll/log/wait/kill/write/submit/close`，薄封装 registry 的同名方法；未知 id → `{status:"not_found"}`。
+- 注册：`build_default_registry()` 构造**单个** `ProcessRegistry`，同时注入 `TerminalTool` 与
+  `ProcessTool`——两者共享同一份后台进程状态。
+
+#### Key files, classes, and functions
+
+- `tools/process_registry.py`：`ProcessRegistry`、`ProcessSession`、`spawn_local`、`_reader_loop`、
+  `_reconcile_local_exit`、`poll/read_log/wait/kill_process/write_stdin/submit_stdin/close_stdin/list_sessions`、
+  `_prune_if_needed`、`_kill_popen_tree`、`_strip_ansi`
+- `builtin/terminal.py`：`TerminalTool`、`_truncate_output`、`_exit_code_meaning`、`_SERVER_HINTS`
+- `builtin/process.py`：`ProcessTool`
+
+#### Reliability invariants, edge cases, and failure handling
+
+- **后台进程不泄漏**：reader 线程 `finally` 里 `wait()` 收割子进程；spawn 后置步骤失败会先杀孤儿再抛。
+- **孤儿管道挂起修复**：直接子进程已退出但后代仍持有 stdout 管道时，`_reconcile_local_exit`
+  非阻塞 drain 并把 session 标记为 exited，避免 poll 永远 "running"。
+- **树杀**：POSIX 用进程组 `killpg`（spawn 时 `os.setsid`），Windows 用 `taskkill /T /F`。
+- **输出有界**：每 session 滚动 200KB 缓冲；前台输出 50KB 头尾截断。
+- **危险命令默认拦截**，模型无法通过参数自开（无 force/allow 参数）。
+- **工具永不抛异常**：一切失败返回 `{error}` / `{status:"error"}` 结果。
+
+#### Tests
+
+- `tests/test_terminal.py`（12）：前台输出/退出码、非零退出、timeout(124)、缺 command、workdir、
+  后台返回 session_id 且入 registry、危险命令默认拦截/git reset --hard/安全命令不拦/operator override/
+  模型参数不可开。
+- `tests/test_process.py`（8）：list 可见、poll+wait（exit 0 + 输出）、log 分页、kill（killed→already_exited）、
+  stdin write/submit/close（cat 回显）、not_found（7 动作）、缺 session_id、非法 action。
+- `tests/test_tools.py` 精简为 read_file/list_directory（run_shell 用例迁入 test_terminal.py）。
+
+#### Source relationship
+
+`process_registry.py` 为 **ADAPT**；`terminal.py`、`process.py` 为 **REWRITE**；`run_shell.py` 删除。
+PORT/ADAPT 文件保留 Hermes MIT 归属头。详见 `docs/source-map.md` Stage 7。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- PTY：`pty=true` 目前退化为普通 pipe 并附注（未引入 ptyprocess 依赖）；后续如需真交互式 TUI 可加。
+- 后台进程**无崩溃恢复**（Hermes 有 checkpoint 文件）——Aegis 重启后丢失，符合轻量定位。
+- `notify_on_complete` 仅记录标志，无 gateway/chat 通知（Hermes 的通知路由不迁）。
+- wait 的 `interrupted` 语义（用户发新消息打断）未迁——Aegis 无对应 gateway 概念。
+
+#### Interview summary
+
+"这个里程碑把 Hermes 的后台进程管理迁进 Aegis，并用功能更全的 `terminal` 取代了极简 `run_shell`。
+`terminal` 前台跑完即返回（timeout→124、输出头尾截断、grep/diff 退出码解释），`background=true`
+则立即返回 `session_id`。配套的 `process` 工具驱动一个**本地版** `ProcessRegistry`——每进程一个
+滚动 200KB 输出缓冲 + daemon reader 线程，支持 list/poll/log/wait/kill/write/submit/close 八个动作。
+两个工具共享同一个 registry 实例（在 `build_default_registry` 里构造注入），后台进程因此可被发现、
+轮询、阻塞等待、树杀（POSIX 进程组 / Windows taskkill）、以及向 stdin 写入/送 EOF。我保留了 Hermes
+一个关键修复：直接子进程退出但后代持有管道时，reconcile 逻辑非阻塞 drain 并标记退出，避免状态永远
+卡在 running。Hermes 的 sandbox 后端、PTY、watch 限流熔断、gateway 通知路由、checkpoint 持久化
+都显式砍掉，保持 Aegis 的轻量定位。"
+
+#### 对已有 milestone 的改动
+
+- 删除 `builtin/run_shell.py` 及其 schema（`terminal` 取代）。
+- `models/fake.py`、`tui.py`、`cli.py`、`tools/danger.py`、`tools/registry.py`：`run_shell` → `terminal` 引用更新。
+- `docs/source-map.md`：新增 Stage 7 表。
+
+*Hermes 仓库为只读参考，未修改。*
+
+---
+
+### Milestone 8 — Stage 8：Web 工具（web_search / web_extract）
+
+#### Problem and goal
+
+迁入 **Web** 两件套：`web_search`（网页搜索）与 `web_extract`（网页正文抓取）。Hermes 的
+实现深度绑定付费 API/自建后端（Firecrawl/Tavily/Exa/Parallel）与插件注册表，默认无 key 不可用。
+按用户决策采用"**免费默认 + 可选付费后端**"策略：搜索默认走 `ddgs`（DuckDuckGo，无需 key），
+抓取默认 `httpx` + `trafilatura`（HTML→markdown）；检测到 `TAVILY_API_KEY`/`EXA_API_KEY`
+时用 httpx 直调其 REST 端点升级。同时把 Hermes 的 SSRF 防护门完整保留下来。
+
+#### Relevant Hermes behavior
+
+- `tools/web_tools.py`（1212 行）：`web_search_tool`/`web_extract_tool` 经 `agent.web_search_registry`
+  插件注册表分发到 7 个后端；extract 另有可选 LLM 摘要、secret-in-URL 拦截、SSRF 门、base64 图片剔除。
+- `tools/url_safety.py`（305 行）：`is_safe_url` SSRF 门——http/https scheme 白名单、
+  云元数据/链路本地 always-blocked 硬底（含 IPv4-mapped IPv6 变体）、私网/环回/保留/组播/CGNAT
+  拦截、DNS 失败默认拒绝。
+
+#### Migration decision: 混合（ADAPT + REWRITE + 原创 backends）
+
+- `tools/web/url_safety.py` → **ADAPT**：SSRF 门实质保留。丢弃 `security.allow_private_urls`
+  config/env 开关及缓存、QQ 白名单、async 包装。Aegis **始终**强制私网拦截（无 opt-out），仅同步版。
+- `tools/web/backends.py` → **原创**：Hermes 用付费 SDK 插件注册表；Aegis 用一个轻量、可 monkeypatch
+  的后端缝。搜索：默认 `ddgs`，有 key 则 httpx 直调 Tavily/Exa REST（不引厂商 SDK）。抓取：httpx +
+  trafilatura。模块级函数便于测试时替换。
+- `builtin/web_search.py`、`builtin/web_extract.py` → **REWRITE**（对齐行为、实现 `Tool` Protocol）。
+- **依赖**：`httpx` 进核心依赖；`ddgs`/`trafilatura` 进可选 `web` extra（仿 `mcp` extra）。未装 extra 时
+  工具返回明确 `{error}`（含安装提示），不崩溃。Hermes 的 LLM 摘要不迁。
+
+#### Aegis design and data flow
+
+- `web_search` `{query, limit=5(1..100)}` → `{results:[{title,url,description,position}], count, backend}` / `{error}`。
+  `backends.web_search` 按 env 选后端：Tavily→Exa→ddgs。
+- `web_extract` `{urls:[...]}（≤5）` → `{results:[{url,title,content,error}], count}`。每个 URL 先过
+  `is_safe_url` SSRF 门（私网/元数据/非 http(s) 直接 Blocked，**不发任何请求**），再 httpx 抓取 +
+  trafilatura 转 markdown，剔 base64 图、截断 20k 字符。单 URL 失败内联报告，永不抛异常。
+- SSRF 门：scheme 白名单 → 元数据 hostname/IP 硬底 → 解析每个 A/AAAA 记录查私网/环回/保留/组播/CGNAT，
+  DNS 失败默认拒绝。
+
+#### Key files, classes, and functions
+
+- `tools/web/url_safety.py`：`is_safe_url`、`_is_blocked_ip`、always-blocked 常量集
+- `tools/web/backends.py`：`web_search`、`web_extract`、`search_backend_name`、`_search_ddgs/_tavily/_exa`、
+  `_strip_html`、`_strip_base64_images`
+- `builtin/web_search.py`：`WebSearchTool`；`builtin/web_extract.py`：`WebExtractTool`
+
+#### Reliability invariants, edge cases, and failure handling
+
+- **SSRF 防护**：`http://169.254.169.254`、`metadata.google.internal`、私网/环回/CGNAT、非 http(s)
+  scheme 全部拒绝；DNS 失败 fail-closed。有专门无网络单元测试（monkeypatch `getaddrinfo`）。
+- **永不抛异常**：后端异常/缺包/单 URL 失败都转为 `{error}` 结果。
+- **优雅降级**：未装 `ddgs`/`trafilatura` 时给安装提示；trafilatura 不可用时退回标签剥离。
+- **上下文保护**：base64 图片剔除、单页 20k 字符截断。
+
+#### Tests
+
+- `tests/test_web_safety.py`（9，**无网络**——monkeypatch `getaddrinfo`）：非法 scheme、元数据字面 IP、
+  元数据 hostname、环回/私网/CGNAT、解析到元数据的域名、公网放行、DNS 失败 fail-closed、空/畸形 URL。
+- `tests/test_web_tools.py`（7，后端 monkeypatch，**无网络**）：search 返回/缺 query/后端错误；
+  extract 内容/多 URL 部分失败/≤5 上限/缺 urls/真实后端下私网 URL 被 SSRF 门拦截。
+
+#### Source relationship
+
+`url_safety.py` 为 **ADAPT**（保留 Hermes MIT 归属头）；`backends.py` 为原创；
+`web_search.py`/`web_extract.py` 为 **REWRITE**。详见 `docs/source-map.md` Stage 8。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- 免费默认（ddgs）稳定性取决于 DuckDuckGo，可能限流/变动；生产建议配 Tavily/Exa key。
+- Hermes 的 LLM 摘要、secret-in-URL 正则、重定向逐跳 SSRF 校验未迁（重定向由 httpx `follow_redirects`
+  一次跟进，目标不再逐跳复查——DNS rebinding/redirect 绕过属已知 SSRF 残余风险，与 Hermes 文档一致）。
+- 未做网站 blocklist 策略（`website_policy.py`）。
+
+#### Interview summary
+
+"这个里程碑把 Web 搜索与抓取迁进 Aegis，但**没有**照搬 Hermes 的付费 SDK 插件注册表——那是它默认
+无 key 不可用的根源。我换成一个轻量、可 monkeypatch 的后端缝：搜索默认用 `ddgs`（DuckDuckGo，零配置
+开箱即用），检测到 Tavily/Exa 的 key 就用 httpx 直调其 REST 升级；抓取用 httpx + trafilatura 把 HTML
+转成 markdown。真正原样保住的是 Hermes 的 **SSRF 防护门**：scheme 白名单、云元数据/链路本地硬底、
+私网/环回/保留/组播/CGNAT 拦截、DNS 失败默认拒绝——每个 URL 在发任何请求前先过这道门。测试完全不打
+真实网络：SSRF 门用 monkeypatch `getaddrinfo` 喂各种 IP 做单元测试，工具层则 monkeypatch 后端函数，
+另加一个用真实后端验证私网 URL 被门拦截的用例。"
+
+#### 对已有 milestone 的改动
+
+- `pyproject.toml`：核心依赖加 `httpx`；新增可选 `web` extra（`ddgs`、`trafilatura`）。
+- `docs/source-map.md`：新增 Stage 8 表。
+
+*Hermes 仓库为只读参考，未修改。*
+
+---
+
+### Milestone 9 — Stage 9：技能管理工具（skill_manage）
+
+#### Problem and goal
+
+迁入最后一个工具 **`skill_manage`**——技能的安装/卸载/更新/列表。Aegis 已有
+`SkillLoader`（发现 `SKILL.md`）和 `skills_list`/`skill_view` 两个展示工具，但缺少
+变写能力。Hermes 的安装/卸载/更新逻辑藏在一个庞大的 `skills_hub.py`（多注册表源 + 隔离 +
+安全扫描 + 审计日志）和一个 `skill_manager_tool.py`（作者工具，非安装工具）里，并且安装
+工具本身不作为 agent tool 暴露——它是 CLI 命令面。Aegis 把它做成一个标准的 `Tool` Protocol
+工具，对接现有 `SkillLoader`。
+
+#### Relevant Hermes behavior
+
+- `tools/skills_hub.py`：`install_from_quarantine`（移入 skills dir 前先隔离+扫描）、
+  `uninstall_skill`（仅卸锁记录中的，锁条目路径受多层防护）、`bundle_content_hash`（排序
+  relpath + 内容 SHA-256）、`_resolve_lock_install_path`（逐分量拒绝符号链接、resolve 后
+  拒绝逃逸与直指 SKILLS_DIR 根）、`HubLockFile`（`{version:1, installed:{name:{source,
+  content_hash, install_path}}}`）
+- `tools/skill_manager_tool.py`：作者端 `skill_manage`（create/edit/patch/delete/write_file/
+  remove_file 六动作，是**写本地 SKILL.md 的作者工具**，非 install/uninstall）
+
+#### Migration decision: 混合（ADAPT + REWRITE）
+
+- `skills/install.py` → **ADAPT**：保留锁文件模型、路径双层安全防护、内容哈希、"只卸锁记录的"
+  守卫、rmtree 前重名校验。**丢弃**隔离阶段、扫描/信任度/标识符、多注册表源路由、审计日志、
+  网站策略、SSRF 重定向链、出处签名。Aegis install 源仅两个：本地目录复制，或直接 URL 下载
+  单个 SKILL.md（httpx，M3 已添加）。更新 = 重新获取 + 哈希比对 + force 重装。
+- `skills/manage_tool.py` → **REWRITE**（实现 `Tool` Protocol，动作 `install/uninstall/update/list`）。
+- 注册在 `runtime.with_defaults` 的 `enable_skills` 分支中，与 `SkillsListTool`/`SkillViewTool` 并列。
+
+#### Aegis design and data flow
+
+- `skill_manage` `{action, source?, name?, force?}`：`install` 把 source（本地目录或 URL）复制/
+  下载到 `skills_dir/<name>/`，锁文件记录，`loader.discover(force=True)` 刷新索引。
+  `uninstall` 查锁→校验路径→rmtree→去锁→重扫。`update` 重新获取源→算哈希→同则 up_to_date、
+  异则 force reinstall。`list` 返回锁条目。
+- 锁文件 `<skills_dir>/.aegis-lock.json`：`{version:1, installed:{name:{source, install_path, content_hash}}}`。
+- 路径安全（Hermes 双层防护）：`_valid_name`（禁 `..`/`/`/超长）；`_resolve_install_path`：
+  ① 逐分量拒绝 `is_symlink()`/`is_junction()`；② `resolve()` 后 `is_relative_to(skills_dir)` +
+  `!= skills_dir`（防 `rmtree` 致灾）。
+
+#### Key files, classes, and functions
+
+- `skills/install.py`：`SkillLock`、`install_skill`、`uninstall_skill`、`update_skill`、`list_installed`、
+  `_valid_name`、`_resolve_install_path`、`_is_redirect`、`_dir_hash`、`_read_skill_name`
+- `skills/manage_tool.py`：`SKILL_MANAGE`（schema）、`SkillManageTool`
+- `runtime.py`：注册于 `with_defaults` 的 `enable_skills` 分支
+
+#### Reliability invariants, edge cases, and failure handling
+
+- **路径安全双层**：源树中符号链接被拒绝；安装目标的分量间符号链接被拒绝；解析后不在
+  skills_dir 内的路径被拒绝；解析后等于 skills_dir 根的被拒绝（防全员删除）。
+- **锁门**：只有经 install 记录在锁中的技能才可卸载/更新；手放的 builtin 技能不被误删。
+- **force 门**：已存在同名技能时默认拒绝（`force=True` 才覆盖）。
+- **加载器刷新**：每次 install/uninstall/update 后调用 `loader.discover(force=True)`，工具
+  立即可见变化。
+- **永不抛异常**：校验失败、fetch 失败、文件操作失败全部转为 `{success:false, error}` 结果。
+
+#### Tests
+
+- `tests/test_skill_manage.py`（12）：本地目录安装/重复拒绝/force 覆写/卸载/卸载未安装/
+  update 无源/update up_to_date/update 检测改动/list 列表/缺 source/URL 安装（monkeypatch
+  httpx 假响应）/非法 action。
+
+#### Source relationship
+
+`skills/install.py` 为 **ADAPT**；`skills/manage_tool.py` 为 **REWRITE**。详见 `docs/source-map.md` Stage 9。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- 仅支持本地目录与直接 URL；无 Git/GitHub 多文件下载、无 registry 概念。
+- 无隔离/安全扫描阶段（Hermes 的 `skills_guard` 未迁）——信任操作者。
+- Update 对本地目录源重新计算源目录哈希后对比，未做 diff 或增量更新。
+- 不能更改已安装技能的 source 重定向（要改只能先卸后装）。
+
+#### Interview summary
+
+"这个里程碑给 Aegis 加上了技能管理——`skill_manage` 工具支持 install/uninstall/update/list。
+它背后是一个从 Hermes `skills_hub.py` 裁剪出来的轻量 install 模块：一个锁文件记录每个技能的
+源、安装路径、内容哈希；安装路径被双层安全防护（拒绝符号链接、必须留在 skills_dir 内且不等于
+根）；卸载必须锁中有记录；更新 = 重新获取源 + 哈希比对 + force 重装。安装源支持本地目录
+（含 SKILL.md）和直接 URL 下载单文件 SKILL.md。每次变更后调用 `loader.discover(force=True)`
+刷新索引，`skills_list`/`skill_view` 立即可见变化。Hermes 的隔离/安全扫描/多注册表/审计日志
+都砍掉了——Aegis 保持了它的轻量定位。"
+
+#### 对已有 milestone 的改动
+
+- `docs/source-map.md`：新增 Stage 9 表。
+
+*Hermes 仓库为只读参考，未修改。*
+
+---
+
+### Milestone 10 — Stage 10：上下文压缩管线（三阶段会话剪裁与按轮摘要）
+
+#### Problem and goal
+
+Aegis 此前没有任何上下文压缩：`ContextBuilder` 每轮把全量历史发给模型，长对话必然顶到
+模型上下文上限（见上文「已知限制」第 2 条）。本里程碑把 Hermes 仓库内
+`ctx-compress-opt/` 原型中的**会话剪裁与压缩实现**整体移植到 Aegis 并适配——注意是
+**移植**（保留算法与行为），不是参考重写。要求的能力：
+
+1. 超大工具结果不硬截断：完整内容转存磁盘，发给模型的只留预览 + 文件路径；
+2. 上下文超限时先做一轮本地渐进式清理（去重/摘要化旧工具结果、瘦身参数、删历史
+   reasoning），尽量不惊动 LLM；
+3. 仍超限时按对话轮次调用 LLM 生成结构化摘要（保留原始 user 问题）；
+4. 只剩一轮或摘要压完仍超限时，有逐级激进的单轮兜底；
+5. 全流程不修改原始消息历史（source of truth），压缩只作用于派生上下文。
+
+#### Relevant Hermes behavior and source locations
+
+源是 `hermes-agent/ctx-compress-opt/` 目录下的四个内聚文件（同一套管线的依赖闭包）：
+
+- `compress.py` —— 主编排：`_compress_context` 三阶段管线 + `_handle_single_round_overflow`
+  单轮兜底 + 阶段 C 的轮次切分/摘要序列化/摘要可用性判断；
+- `compress_config.py` —— 全部阈值、占位符、标记串、可压缩工具名单的唯一来源；
+- `micro_compact.py` —— 阶段 B：阈值触发的渐进式微压缩（本地、无 LLM 调用）；
+- `tool_budget.py` —— 阶段 A：两级工具结果预算（单条阈值 + 单轮聚合预算）+ 转存磁盘
+  + 预览替换 + 跨轮状态（ContentReplacementState）+ read_file 回读防死循环第三级兜底。
+
+#### Migration decision: whole-unit PORT + boundary ADAPT
+
+四个文件是同一行为单元（compress.py 惰性依赖另外两个模块，三者共享 compress_config
+的标记串协议，改一个字符即失配），拆分只会增加风险，因此选择**整体移植**：
+
+- `compress_config.py` / `tool_budget.py`：近乎逐字节 PORT（后者本来就是「只依赖标准库、
+  可整体拷走」的设计）；
+- `micro_compact.py`：PORT，仅把扁平同目录导入改为包内绝对导入；
+- `compress.py`：PORT + 边界 ADAPT（见下）。
+
+砍掉的原型死代码（明确记录）：`_handle_single_round_overflow_v1` / `_v2`（旧版兜底，
+管线中无任何调用方）、`_truncate_oversized_tools`（已被 tool_budget 路径取代，无调用方）、
+`__main__` 自测块。
+
+#### Aegis design and data flow
+
+公开入口（新代码）：`compress_context(messages, llm_provider, max_tokens, *, storage_dir=None)`
+，输入输出都是 Aegis 的 `Message` dataclass 序列。边界转换器 `message_to_dict` /
+`dict_to_message` 是唯一的适配层——**算法核心仍然操作 OpenAI 形状的 dict，与原型逐字节
+一致**，这保证了移植行为不漂移。
+
+数据流：
+
+```
+list[Message] --message_to_dict--> list[dict]
+  → 阶段 A：tool_budget.apply_budget（无条件执行；单条 >20k 字符转存磁盘换预览，
+    同批并行结果合计 >80k 再从大到小转存；read_file 读回缓存的第三级硬截断防死循环）
+  → 已达标则返回
+  → 阶段 B：micro_compact（保护头部 system/运行时标记/已压缩摘要区 + 末尾最近 5 条；
+    区间内去重 → 一行信息化摘要旧工具结果 → JSON 感知截断工具参数 → 清历史 reasoning；
+    每步后重估，达标即返回）
+  → 已达标则返回
+  → 阶段 C：_split_into_rounds 按轮切分，最后一轮永不压缩；从最早完整轮次起逐轮
+    LLM 摘要（原 user 问题 + "[Context Summary]" assistant 替换整轮），直到达标；
+    摘要失败/不可用 → 保留原轮次，绝不用兜底文本替换
+  → 仍超限 → _handle_single_round_overflow 单轮兜底（复用阶段 B 工具摘要 → 清历史
+    reasoning → 缩参数 → 当前轮 reasoning 去重/头尾截断/清空 → 硬截断工具结果 →
+    原子删除最早工具调用组）
+--dict_to_message--> list[Message]
+```
+
+关键适配点（相对原型）：
+
+| 原型依赖 | Aegis 适配 |
+|---|---|
+| `configs.config` / `utils.log_utils` | 标准库 `logging.getLogger(__name__)` |
+| `await llm_provider.chat(messages, model=..., temperature=0.0, max_tokens=...)` | 同步 `ModelProvider.stream()` + `collect_response()`；模型名/采样参数由 provider 自持（Protocol 不含这些参数） |
+| `ROOT_PATH/tool-budget-cache` 硬编码 | `storage_dir` 注入，默认 `~/.aegis/tool-result-cache` |
+| 可选的 `agent.redact` | 砍掉，仅保留正则脱敏兜底（gh token / Bearer / sk-） |
+| `from compress_config import ...` 扁平导入 | 包内绝对导入 |
+| `messages[1]` 直接取下标 | 补了 `len > 1` 与 content 为 None 的守卫（原型在极端短列表下会 IndexError） |
+
+#### Key files, classes, and functions
+
+- `context/compress.py`：`compress_context`（公开入口）、`_compress_context`（三阶段管线）、
+  `_handle_single_round_overflow`、`_split_into_rounds`、`_is_complete_round`、
+  `_serialize_round_for_summary`、`_summarize_round`、`_estimate_tokens`（tiktoken 惰性
+  导入 + 字符/2.5 兜底）、`message_to_dict` / `dict_to_message` / `estimate_tokens`
+- `context/compress_config.py`：全部阈值/标记串/工具名单（`CONTEXT_SUMMARY_TAG`、
+  `PERSISTED_OUTPUT_TAG`、`KEEP_RECENT_MESSAGES=5`、两份 COMPACTABLE_TOOLS 名单等）
+- `context/micro_compact.py`：`micro_compact`、`_clearable_ranges`、`_deduplicate_tool_results`、
+  `_summarize_old_tool_results`（一行信息化摘要）、`_truncate_tool_call_args`（JSON 感知）
+- `context/tool_budget.py`：`apply_budget`、`maybe_persist_large_tool_result`、
+  `enforce_tool_result_budget`、`ContentReplacementState`、`is_readback_of_persisted`、
+  `hard_truncate_readback`
+- `context/__init__.py`：导出 `compress_context` / `estimate_tokens` / `message_to_dict` /
+  `dict_to_message`
+
+#### Reliability invariants, edge cases, and failure handling
+
+- **原始消息绝不被修改**：公开入口先转 dict 副本再压缩；单轮兜底内部 `copy.deepcopy`；
+  测试用深拷贝快照逐一断言输入不变。
+- **工具调用协议合法**：删除只按「assistant tool_calls + 对应 tool 结果」整组原子删除；
+  测试断言结果集中 tool 消息的 `tool_call_id` 与 assistant 发起的调用严格相等（无孤儿）。
+- **宁可超预算也不丢内容**：转存失败原样返回；摘要失败/为空/命中拒答前缀 → 保留原轮次；
+  每个阶段都包在 try/except 中，压缩自身失败绝不中断 Agent 主循环。
+- **转存防死循环**：`read_file` 读回我们自己转存的缓存文件时不再次转存（第三级就地硬截断），
+  测试锁定该行为。
+- **已压缩摘要区受保护**：头部保护识别连续的 `(user, "[Context Summary]" assistant)` 对；
+  二次压缩不重复摘要、不丢弃、不重复搬入（有回归测试）。
+- **最后一轮永不压缩**；不完整轮次（结尾不是无 tool_calls 的非空 assistant）原样保留。
+- **思维链字段**：`reasoning_content` 的清理逻辑完整移植；Aegis 的 `Message` 目前不携带该
+  字段，相关步骤在 Aegis 消息上天然是 no-op（保留以与上游行为一致，未来 provider 支持
+  思维链时自动生效）。
+
+#### Tests
+
+`tests/test_context_compress.py`（17 个用例，全部确定性，fake provider，无需真实 API）：
+
+- token 估算（全字段计数 / 公开入口接受 Message）；
+- Message↔dict 边界：roundtrip、tool 字段、非字符串 content 容错；
+- 轮次切分与完整性判断（5 条规则）；
+- 阶段 A：25k 字符工具结果转存 tmp_path、预览含路径、磁盘文件字节一致、输入不变；
+  read_file 读回缓存 → 不再转存而是就地硬截断（防死循环）；
+- 阶段 B：重复工具结果去重（旧的换回指占位、保护尾部不动）、旧结果信息化一行摘要
+  （`[terminal] ran \`npm test\` -> exit 0, ...`）、输入不变；
+- 阶段 C：5 轮超限对话压缩到达标、摘要数==provider 调用数、原 user 问题保留、最后一轮
+  完整保留、system 在头部；摘要提供者抛异常 / 返回拒答文本 → 原轮次保留、无摘要注入；
+  已有摘要区的二次压缩保护；
+- 单轮兜底：硬截断超大工具结果（结构保留、达标）；最后手段整组删除工具调用组
+  （协议完整性断言）。
+
+结果：`pytest tests/test_context_compress.py` 17/17 通过；全量 `uv run pytest -q`
+303 passed / 1 skipped / 1 failed——唯一失败是 `test_web_tools.py::test_web_extract_blocks_private_url`
+（Stage 8 未提交工作区里的网络相关用例，真实调用 Tavily 返回 400，与本里程碑代码无
+任何共享路径，移植前后的失败与本次改动无关）。`uv run ruff check` 新增文件零告警
+（移植代码中刻意的「catch-all 降级」按项目惯例标注 `# noqa: BLE001 — 理由`）；
+`uv run mypy src/aegis_agent/context/` 零错误。
+
+#### Source relationship
+
+四个压缩模块均为 **PORT**（`micro_compact.py` 与 `compress.py` 含适配），保留 Hermes
+署名头；`compress.py` 中的 `message_to_dict` / `dict_to_message` / `compress_context` /
+`estimate_tokens` 边界层为 **original** 新代码。详见 `docs/source-map.md` Stage 10 表。
+
+#### Trade-offs, remaining limitations, and TODOs
+
+- **尚未接入 Agent Loop**：`runtime.py` 的 `run_turn` 目前仍直接发 `ContextBuilder` 的
+  全量派生视图；把 `compress_context` 挂到每次模型调用前（含 max_tokens 配置项与
+  storage_dir 约定）是下一个里程碑。
+- **跨轮缓存稳定的 state 未接入**：`tool_budget.apply_budget` 支持跨轮
+  `ContentReplacementState`（保证提示缓存前缀逐字节稳定），当前公开入口每次新建一次性
+  state；接入 Loop 时应由会话级持有者传入。
+- **两份可压缩工具名单**（MICRO / FALLBACK）按原型原样保留，含 Aegis 不存在的工具名
+  （浏览器/视觉/高德 MCP）——只是字符串，无副作用；是否裁剪留给后续统一决策。
+- **tiktoken 为可选增强**：未加入依赖；缺失时走字符/2.5 粗估（原型同款兜底）。
+- 摘要调用的 temperature/max_tokens 由 provider 配置决定（Aegis 的 ModelProvider
+  Protocol 不含采样参数），原型中的 `temperature=0.0` 约束需在 provider 层落实。
+
+#### Interview summary
+
+"这个里程碑把 Hermes `ctx-compress-opt` 原型的上下文压缩管线整体移植进了 Aegis。
+它是一个三阶段级联：阶段 A 用 tool_budget 把超大工具结果转存磁盘、只给模型看预览；
+阶段 B 用 micro_compact 做本地渐进清理（去重、一行信息化摘要旧工具结果、JSON 感知
+截断参数、清历史思维链），往往这一步就压回阈值、省掉 LLM 调用；阶段 C 才按轮调用
+LLM 生成结构化摘要，最早的完整轮次先压，最后一轮和已有摘要区受保护；还有单轮兜底
+处理'只剩一轮也超限'的极端情况，最后手段是原子删除整个工具调用组、绝不留孤儿。
+移植策略是保留算法核心逐字节不变——它操作 OpenAI dict——然后只在外面包了一层
+Aegis `Message` 的边界转换器，这样行为不漂移、还能直接复用原型成熟的降级语义：
+摘要失败就保留原轮次，转存失败就原样发送，任何一步出错都不中断主循环。
+适配点主要是四处：同步 ModelProvider Protocol 替代原来的 async chat 接口、
+stdlib logging 替代项目日志器、storage_dir 依赖注入替代硬编码路径、包内绝对导入。
+测试用 fake provider 全覆盖三个阶段和兜底，并锁定核心不变式——原始消息永不被修改。"
+
+#### 对已有 milestone 的改动
+
+- `src/aegis_agent/context/__init__.py`：新增压缩管线的公开导出（不影响既有导出）。
+- `docs/source-map.md`：新增 Stage 10 表。
+
+*Hermes 仓库为只读参考，未修改。*
+
+---
+
+### Milestone 11 — Stage 11：压缩管线接入 Agent Loop + 遗留风险清零
+
+#### Problem and goal
 
 Milestone 10 把三阶段上下文压缩管线移植进了 `context/` 包，但它还是一个"无人调用的
 库"：`run_turn` 仍然每轮把全量派生上下文直接发给模型。本里程碑完成接线并解决
@@ -646,13 +1211,13 @@ Milestone 10 报告中列出的全部 Remaining risks：
 6. **摘要采样参数落地**：`OpenAICompatibleProvider` 支持 `temperature`，CLI 用
    `temperature=0` + `SUMMARY_MAX_TOKENS` 构造独立的确定性摘要 provider。
 
-### Migration decision: new wiring code (original) + small provider/model-layer extensions
+#### Migration decision: new wiring code (original) + small provider/model-layer extensions
 
 本里程碑几乎全是 Aegis 侧的新接线代码；模型层的 `reasoning_content` 捕获参考了
 Hermes 原型中思维链字段的可观察行为（delta.reasoning_content 增量、持久化但不回传
 wire）。
 
-### Aegis design and data flow
+#### Aegis design and data flow
 
 **运行时接线**（`runtime.py`）：
 
@@ -702,7 +1267,7 @@ provider），CLI 永不因摘要器而无法启动。
 **CLI 配置**：`--context-max-tokens`（env `AEGIS_CONTEXT_MAX_TOKENS`，默认
 120_000）、`--no-compress` 全关。
 
-### Key files, classes, and functions
+#### Key files, classes, and functions
 
 - `runtime.py`：`AgentRuntime` 三个新参数、`_budget_states`、`_budget_state_for`、
   `run_turn` 循环内的压缩调用、assistant 消息持久化携带 reasoning_content
@@ -721,7 +1286,7 @@ provider），CLI 永不因摘要器而无法启动。
 - `context/compress_config.py`：MICRO 名单补 `list_directory`
 - `pyproject.toml` / `uv.lock`：`tiktoken` 依赖
 
-### Reliability invariants, edge cases, and failure handling
+#### Reliability invariants, edge cases, and failure handling
 
 - **原始历史不变**：测试断言 run_turn 后持久化历史与压缩前逐条相等（仅新增真实的
   user/assistant 消息），摘要标签绝不进入会话存储。
@@ -736,7 +1301,7 @@ provider），CLI 永不因摘要器而无法启动。
 - **估算器无关性**：全部压缩测试的预算都按 `_estimate_tokens` 实测值动态计算
   （`_budget_for`），tiktoken 精确计数与字符兜底两种路径下同绿。
 
-### Tests
+#### Tests
 
 - `tests/test_runtime_compression.py`（新增 10 个）：默认关闭回归 / run_turn 压缩接线
   （模型看到摘要、历史不变、摘要走 summary_provider）/ 跨轮 state 冻结+字节一致 /
@@ -752,7 +1317,7 @@ provider），CLI 永不因摘要器而无法启动。
 - `uv run ruff check`（全部改动文件）：零告警；`uv run mypy`（全部改动模块）：
   零错误（含修掉的 Stage 2 遗留那 1 个）。
 
-### Trade-offs, remaining limitations, and TODOs
+#### Trade-offs, remaining limitations, and TODOs
 
 - **budget state 随 runtime 存活**：进程退出即丢（与内存会话同级）。未来 SQLite 会话
   存储落地时，`ContentReplacementState` 需要随会话持久化/重建——重建是安全的
@@ -765,7 +1330,7 @@ provider），CLI 永不因摘要器而无法启动。
 - **默认预算 120k** 是保守通用值；不同模型上下文窗口差异大时由
   `--context-max-tokens` 调整。
 
-### Interview summary
+#### Interview summary
 
 "上个里程碑移植的压缩管线这个里程碑正式接进了 Agent Loop：run_turn 每次模型调用前
 对派生上下文跑三阶段压缩，原始历史始终不动。关键设计是 runtime 按 session 持有一本
@@ -778,7 +1343,7 @@ reasoning_content 字段，provider 流式捕获、会话持久化、压缩管�
 --context-max-tokens / --no-compress。所有压缩测试的预算都改成按实测 token 动态计算，
 两种估算路径下同绿；跨轮字节稳定有专门的行为测试锁定。"
 
-### 对已有 milestone 的改动
+#### 对已有 milestone 的改动
 
 - `models/base.py` / `events.py` / `models/stream.py` / `models/fake.py`：
   reasoning_content 贯通（ChatResponse 新增字段，向后兼容默认值）。
@@ -792,881 +1357,177 @@ reasoning_content 字段，provider 流式捕获、会话持久化、压缩管�
 
 ---
 
-## Milestone 10 — Stage 10：上下文压缩管线（三阶段会话剪裁与按轮摘要）
+### Milestone 12 — Stage 12：会话恢复（SQLite 持久化 + 快恢复快照 + 跨进程租约）
 
-### Problem and goal
+#### Problem and goal
 
-Aegis 此前没有任何上下文压缩：`ContextBuilder` 每轮把全量历史发给模型，长对话必然顶到
-模型上下文上限（见上文「已知限制」第 2 条）。本里程碑把 Hermes 仓库内
-`ctx-compress-opt/` 原型中的**会话剪裁与压缩实现**整体移植到 Aegis 并适配——注意是
-**移植**（保留算法与行为），不是参考重写。要求的能力：
+Aegis 此前只有内存会话：进程退出即丢，无 `--resume`、崩溃丢全部未落盘历史、两个
+进程可以同时跑同一会话导致重复模型请求与交叉写历史。本里程碑把用户在 Hermes 上
+自行实现的会话恢复功能（三个提交）移植到 Aegis：
 
-1. 超大工具结果不硬截断：完整内容转存磁盘，发给模型的只留预览 + 文件路径；
-2. 上下文超限时先做一轮本地渐进式清理（去重/摘要化旧工具结果、瘦身参数、删历史
-   reasoning），尽量不惊动 LLM；
-3. 仍超限时按对话轮次调用 LLM 生成结构化摘要（保留原始 user 问题）；
-4. 只剩一轮或摘要压完仍超限时，有逐级激进的单轮兜底；
-5. 全流程不修改原始消息历史（source of truth），压缩只作用于派生上下文。
+- `5a51f55` 消息级增量持久化 + 幂等防重，加固 --resume 崩溃恢复
+- `181e078` 快恢复快照——session_snapshots 表 + resume 增量重放
+- `03e5adc` 可插拔跨进程会话租约（SQLite/Redis），防多进程重复恢复
 
-### Relevant Hermes behavior and source locations
+#### Relevant Hermes behavior and source locations
 
-源是 `hermes-agent/ctx-compress-opt/` 目录下的四个内聚文件（同一套管线的依赖闭包）：
+- `hermes_state.py`（~5000 行中的会话持久化部分）：连接配置三要素
+  （`check_same_thread=False` / `timeout=1.0` / `isolation_level=None`）、
+  `apply_wal_with_fallback`、`_execute_write`（BEGIN IMMEDIATE + 随机 jitter 重试 +
+  每 50 写 TRUNCATE checkpoint）、`append_message`（UNIQUE(session_id,
+  client_msg_id) 部分索引 + ON CONFLICT DO NOTHING + 计数同事务累加）、
+  `write_snapshot` / `load_latest_snapshot` / `get_messages_after_seq` /
+  `resume_conversation`、`session_leases` 表方法。
+- `session_lease.py`（573 行自包含文件）：后端接口 + SQLite/Redis 后端 +
+  心跳管理器。
+- 设计文档：`hermes_state_核心机制.md`（用户自写，本里程碑的主要行为依据）。
 
-- `compress.py` —— 主编排：`_compress_context` 三阶段管线 + `_handle_single_round_overflow`
-  单轮兜底 + 阶段 C 的轮次切分/摘要序列化/摘要可用性判断；
-- `compress_config.py` —— 全部阈值、占位符、标记串、可压缩工具名单的唯一来源；
-- `micro_compact.py` —— 阶段 B：阈值触发的渐进式微压缩（本地、无 LLM 调用）；
-- `tool_budget.py` —— 阶段 A：两级工具结果预算（单条阈值 + 单轮聚合预算）+ 转存磁盘
-  + 预览替换 + 跨轮状态（ContentReplacementState）+ read_file 回读防死循环第三级兜底。
+#### Migration decision: ADAPT（存储层）+ 近乎逐字节 PORT（租约层）
 
-### Migration decision: whole-unit PORT + boundary ADAPT
+- `hermes_state.py` 是一个 5000 行的耦合大文件，且 Aegis 的存储单元是 `Message`
+  dataclass 而非 OpenAI dict——**选择适配性移植**：完整搬走事务机器与恢复算法，
+  schema 裁剪到 Aegis 字段。砍掉：FTS5 搜索、标题/归档、rewind/undo、压缩链
+  （Aegis 压缩不改写源历史、不分叉会话，故 `resolve_resume_session_id` 的
+  parent 链行走逻辑不需要）、token 计费、平台消息 id、codex/多模态附加列。
+- `session_lease.py` 本来就是自包含单元——**近乎逐字节 PORT**，仅改 env 变量名
+  （`AEGIS_SESSION_LEASE_BACKEND` / `AEGIS_REDIS_URL` / TTL / RENEW）、Redis 键前缀
+  （`aegis:session_lease:`）、SQLite 后端改为包装 `SQLiteSessionRepository`。
 
-四个文件是同一行为单元（compress.py 惰性依赖另外两个模块，三者共享 compress_config
-的标记串协议，改一个字符即失配），拆分只会增加风险，因此选择**整体移植**：
+#### Aegis design and data flow
 
-- `compress_config.py` / `tool_budget.py`：近乎逐字节 PORT（后者本来就是「只依赖标准库、
-  可整体拷走」的设计）；
-- `micro_compact.py`：PORT，仅把扁平同目录导入改为包内绝对导入；
-- `compress.py`：PORT + 边界 ADAPT（见下）。
-
-砍掉的原型死代码（明确记录）：`_handle_single_round_overflow_v1` / `_v2`（旧版兜底，
-管线中无任何调用方）、`_truncate_oversized_tools`（已被 tool_budget 路径取代，无调用方）、
-`__main__` 自测块。
-
-### Aegis design and data flow
-
-公开入口（新代码）：`compress_context(messages, llm_provider, max_tokens, *, storage_dir=None)`
-，输入输出都是 Aegis 的 `Message` dataclass 序列。边界转换器 `message_to_dict` /
-`dict_to_message` 是唯一的适配层——**算法核心仍然操作 OpenAI 形状的 dict，与原型逐字节
-一致**，这保证了移植行为不漂移。
-
-数据流：
+**写路径（每次 `_persist`）**：
 
 ```
-list[Message] --message_to_dict--> list[dict]
-  → 阶段 A：tool_budget.apply_budget（无条件执行；单条 >20k 字符转存磁盘换预览，
-    同批并行结果合计 >80k 再从大到小转存；read_file 读回缓存的第三级硬截断防死循环）
-  → 已达标则返回
-  → 阶段 B：micro_compact（保护头部 system/运行时标记/已压缩摘要区 + 末尾最近 5 条；
-    区间内去重 → 一行信息化摘要旧工具结果 → JSON 感知截断工具参数 → 清历史 reasoning；
-    每步后重估，达标即返回）
-  → 已达标则返回
-  → 阶段 C：_split_into_rounds 按轮切分，最后一轮永不压缩；从最早完整轮次起逐轮
-    LLM 摘要（原 user 问题 + "[Context Summary]" assistant 替换整轮），直到达标；
-    摘要失败/不可用 → 保留原轮次，绝不用兜底文本替换
-  → 仍超限 → _handle_single_round_overflow 单轮兜底（复用阶段 B 工具摘要 → 清历史
-    reasoning → 缩参数 → 当前轮 reasoning 去重/头尾截断/清空 → 硬截断工具结果 →
-    原子删除最早工具调用组）
---dict_to_message--> list[Message]
+runtime._persist(message) → SQLiteSessionRepository.append_message
+  → _execute_write: BEGIN IMMEDIATE → [事务内现算 seq=MAX(seq)+1
+    → INSERT ... ON CONFLICT(session_id, client_msg_id) DO NOTHING
+    → 真插入才 UPDATE sessions.message_count（同事务）] → COMMIT（= fsync 落盘）
+  → 撞锁：20~150ms 随机 jitter 重试（最多 15 次）；每 50 写一次 TRUNCATE checkpoint
 ```
 
-关键适配点（相对原型）：
+**恢复路径（Aegis 架构下天然成立）**：runtime 每次模型调用前都从 repository 读
+历史，所以 `--resume <id>` 不需要任何"预加载"——用同一个 SQLite repo 打开已有
+session 即恢复。`list_messages` 内部走快路径：
 
-| 原型依赖 | Aegis 适配 |
-|---|---|
-| `configs.config` / `utils.log_utils` | 标准库 `logging.getLogger(__name__)` |
-| `await llm_provider.chat(messages, model=..., temperature=0.0, max_tokens=...)` | 同步 `ModelProvider.stream()` + `collect_response()`；模型名/采样参数由 provider 自持（Protocol 不含这些参数） |
-| `ROOT_PATH/tool-budget-cache` 硬编码 | `storage_dir` 注入，默认 `~/.aegis/tool-result-cache` |
-| 可选的 `agent.redact` | 砍掉，仅保留正则脱敏兜底（gh token / Bearer / sk-） |
-| `from compress_config import ...` 扁平导入 | 包内绝对导入 |
-| `messages[1]` 直接取下标 | 补了 `len > 1` 与 content 为 None 的守卫（原型在极端短列表下会 IndexError） |
+```
+resume_messages(session_id)
+  → load_latest_snapshot（history_version 匹配 + zlib 解压 + CRC32 校验）
+  → 有效：快照 dicts + get_messages_after_seq(last_seq) 尾部 → Messages
+  → 任何失效（无快照/版本不符/解压失败/校验失败/JSON 损坏/尾部读取异常）
+    → 全量重放（永远正确的兜底）
+```
 
-### Key files, classes, and functions
+快照生成在 CLI 层：每轮结束后 `maybe_write_snapshot(session_id, every_n=20)`
+（per-session 游标控制节奏；快照从**已提交的 DB 行**构建，与全量重放共用同一
+解码器 `_row_to_dict`，保证字节一致）。
 
-- `context/compress.py`：`compress_context`（公开入口）、`_compress_context`（三阶段管线）、
-  `_handle_single_round_overflow`、`_split_into_rounds`、`_is_complete_round`、
-  `_serialize_round_for_summary`、`_summarize_round`、`_estimate_tokens`（tiktoken 惰性
-  导入 + 字符/2.5 兜底）、`message_to_dict` / `dict_to_message` / `estimate_tokens`
-- `context/compress_config.py`：全部阈值/标记串/工具名单（`CONTEXT_SUMMARY_TAG`、
-  `PERSISTED_OUTPUT_TAG`、`KEEP_RECENT_MESSAGES=5`、两份 COMPACTABLE_TOOLS 名单等）
-- `context/micro_compact.py`：`micro_compact`、`_clearable_ranges`、`_deduplicate_tool_results`、
-  `_summarize_old_tool_results`（一行信息化摘要）、`_truncate_tool_call_args`（JSON 感知）
-- `context/tool_budget.py`：`apply_budget`、`maybe_persist_large_tool_result`、
-  `enforce_tool_result_budget`、`ContentReplacementState`、`is_readback_of_persisted`、
-  `hard_truncate_readback`
-- `context/__init__.py`：导出 `compress_context` / `estimate_tokens` / `message_to_dict` /
-  `dict_to_message`
+**租约（CLI 启动时）**：
 
-### Reliability invariants, edge cases, and failure handling
+```
+_start_lease: get_lease_backend（sqlite=共用会话库 / redis=AEGIS_REDIS_URL，
+              不可达 → 报错退出，绝不静默降级）
+  → SessionLeaseManager.acquire(session_id)（失败 = 另一进程持有 → 拒绝启动）
+  → 心跳线程每 10s 续期（TTL 30s）
+  → 续期失败 → on_lost → 设置 interrupt Event → run_turn 在下一个 guard 停止
+    （不再发模型请求、不再写消息，避免双写者）
+  → REPL 结束 finally：manager.stop()（停心跳 + 释放）→ repo.close()
+```
 
-- **原始消息绝不被修改**：公开入口先转 dict 副本再压缩；单轮兜底内部 `copy.deepcopy`；
-  测试用深拷贝快照逐一断言输入不变。
-- **工具调用协议合法**：删除只按「assistant tool_calls + 对应 tool 结果」整组原子删除；
-  测试断言结果集中 tool 消息的 `tool_call_id` 与 assistant 发起的调用严格相等（无孤儿）。
-- **宁可超预算也不丢内容**：转存失败原样返回；摘要失败/为空/命中拒答前缀 → 保留原轮次；
-  每个阶段都包在 try/except 中，压缩自身失败绝不中断 Agent 主循环。
-- **转存防死循环**：`read_file` 读回我们自己转存的缓存文件时不再次转存（第三级就地硬截断），
-  测试锁定该行为。
-- **已压缩摘要区受保护**：头部保护识别连续的 `(user, "[Context Summary]" assistant)` 对；
-  二次压缩不重复摘要、不丢弃、不重复搬入（有回归测试）。
-- **最后一轮永不压缩**；不完整轮次（结尾不是无 tool_calls 的非空 assistant）原样保留。
-- **思维链字段**：`reasoning_content` 的清理逻辑完整移植；Aegis 的 `Message` 目前不携带该
-  字段，相关步骤在 Aegis 消息上天然是 no-op（保留以与上游行为一致，未来 provider 支持
-  思维链时自动生效）。
+**CLI 新开关**：`--db`（env `AEGIS_DB_PATH`，默认 `~/.aegis/state.db`）、
+`--ephemeral`（内存存储）、`--resume/-r`、`--no-lease`、`--snapshot-every-n`
+（默认 20，0 关闭）。
 
-### Tests
+#### Key files, classes, and functions
 
-`tests/test_context_compress.py`（17 个用例，全部确定性，fake provider，无需真实 API）：
+- `sessions/sqlite_store.py`：`SQLiteSessionRepository`（SessionRepository Protocol
+  实现）——`_execute_write` / `_apply_wal_with_fallback` / `append_message` /
+  `write_snapshot` / `load_latest_snapshot` / `resume_messages` /
+  `maybe_write_snapshot` / `bump_history_version` / `try_acquire_session_lease` 等
+  租约表方法
+- `sessions/lease.py`：`SessionLeaseBackend` / `SQLiteSessionLeaseBackend` /
+  `RedisSessionLeaseBackend` / `SessionLeaseManager`（心跳 + on_lost 熔断）/
+  `get_lease_backend` / `SessionLeaseUnavailableError`
+- `cli.py`：`_build_repository` / `_start_lease` / `_maybe_snapshot`；REPL 传入
+  `interrupt=lease_lost`
+- `pyproject.toml`：新增 `redis` 可选依赖组
 
-- token 估算（全字段计数 / 公开入口接受 Message）；
-- Message↔dict 边界：roundtrip、tool 字段、非字符串 content 容错；
-- 轮次切分与完整性判断（5 条规则）；
-- 阶段 A：25k 字符工具结果转存 tmp_path、预览含路径、磁盘文件字节一致、输入不变；
-  read_file 读回缓存 → 不再转存而是就地硬截断（防死循环）；
-- 阶段 B：重复工具结果去重（旧的换回指占位、保护尾部不动）、旧结果信息化一行摘要
-  （`[terminal] ran \`npm test\` -> exit 0, ...`）、输入不变；
-- 阶段 C：5 轮超限对话压缩到达标、摘要数==provider 调用数、原 user 问题保留、最后一轮
-  完整保留、system 在头部；摘要提供者抛异常 / 返回拒答文本 → 原轮次保留、无摘要注入；
-  已有摘要区的二次压缩保护；
-- 单轮兜底：硬截断超大工具结果（结构保留、达标）；最后手段整组删除工具调用组
-  （协议完整性断言）。
+#### Reliability invariants, edge cases, and failure handling
 
-结果：`pytest tests/test_context_compress.py` 17/17 通过；全量 `uv run pytest -q`
-303 passed / 1 skipped / 1 failed——唯一失败是 `test_web_tools.py::test_web_extract_blocks_private_url`
-（Stage 8 未提交工作区里的网络相关用例，真实调用 Tavily 返回 400，与本里程碑代码无
-任何共享路径，移植前后的失败与本次改动无关）。`uv run ruff check` 新增文件零告警
-（移植代码中刻意的「catch-all 降级」按项目惯例标注 `# noqa: BLE001 — 理由`）；
-`uv run mypy src/aegis_agent/context/` 零错误。
+- **幂等**：同一 client_msg_id 重复 append → 只落一行、返回既有记录、计数不虚增
+  （断言 sessions.message_count == 实际行数）。
+- **有序**：seq 在写事务内现算；两个写连接交错 append 20 条 → seq 恰好 0..19 无重号。
+- **崩溃耐久**：不 close 直接用第二个连接读 → 已 COMMIT 的行全部可见（WAL）。
+- **快照等价**：snapshot+tail == 全量重放（Message 级相等）；blob 损坏 / checksum
+  错误 / history_version 不符 → 全部安全降级全量重放且结果正确。
+- **恢复后续写不重**：resume 后新消息 seq 接续；把恢复出的消息重新 flush（带原
+  client_msg_id）→ 全部幂等跳过。
+- **租约互斥**：8 个竞争连接抢同一会话 → 恰好 1 个获胜；TTL 过期可回收；过期持有
+  者不能续期/释放/通过 is_owner；心跳保活超过 TTL；on_lost 恰好触发一次；
+  switch_session 先拿新再放旧、失败保留旧；Redis 不可达抛错不降级。
+- **CLI 级**：`--resume` 恢复并显示消息数；不存在的会话报错退出；租约被占时拒绝
+  启动、释放后可再入。
 
-### Source relationship
+#### Tests
 
-四个压缩模块均为 **PORT**（`micro_compact.py` 与 `compress.py` 含适配），保留 Hermes
-署名头；`compress.py` 中的 `message_to_dict` / `dict_to_message` / `compress_context` /
-`estimate_tokens` 边界层为 **original** 新代码。详见 `docs/source-map.md` Stage 10 表。
+- `tests/test_sessions_sqlite.py`（16 个）：协议符合性、幂等、隔离、缺会话异常、
+  跨实例持久化、双写者并发、快照等价/损坏/校验/版本失效/keep-N/节奏、恢复续写
+  不重、runtime 级 resume 集成（新进程 provider 看到上一轮完整历史）。
+- `tests/test_session_lease.py`（19 个）：SQLite 后端全场景 + 管理器心跳/熔断/
+  切换 + 后端选择 + Redis 后端（内存 fake client 实现 set NX/PX + Lua 语义；
+  中途宕机触发熔断）。
+- `tests/test_cli.py`：既有用例改为 hermetic（AEGIS_DB_PATH 指向 tmp）；新增
+  `--resume` 恢复、未知会话报错、租约占用拒绝启动 + 释放后可入。
+- 全量 `uv run pytest -q`：352 passed / 1 skipped / 1 failed（唯一失败仍是
+  Stage 8 遗留的网络用例 test_web_extract_blocks_private_url，与本次无关）。
+- `ruff check` / `mypy`（全部改动文件）：零告警 / 零错误。
 
-### Trade-offs, remaining limitations, and TODOs
+#### Trade-offs, remaining limitations, and TODOs
 
-- **尚未接入 Agent Loop**：`runtime.py` 的 `run_turn` 目前仍直接发 `ContextBuilder` 的
-  全量派生视图；把 `compress_context` 挂到每次模型调用前（含 max_tokens 配置项与
-  storage_dir 约定）是下一个里程碑。
-- **跨轮缓存稳定的 state 未接入**：`tool_budget.apply_budget` 支持跨轮
-  `ContentReplacementState`（保证提示缓存前缀逐字节稳定），当前公开入口每次新建一次性
-  state；接入 Loop 时应由会话级持有者传入。
-- **两份可压缩工具名单**（MICRO / FALLBACK）按原型原样保留，含 Aegis 不存在的工具名
-  （浏览器/视觉/高德 MCP）——只是字符串，无副作用；是否裁剪留给后续统一决策。
-- **tiktoken 为可选增强**：未加入依赖；缺失时走字符/2.5 粗估（原型同款兜底）。
-- 摘要调用的 temperature/max_tokens 由 provider 配置决定（Aegis 的 ModelProvider
-  Protocol 不含采样参数），原型中的 `temperature=0.0` 约束需在 provider 层落实。
+- **压缩链解析未移植**：Aegis 压缩不分叉会话，源历史始终在单会话内——若未来引入
+  改写源历史的机制，需带回 `resolve_resume_session_id` 的链行走逻辑。
+- **history_version 暂无 bump 调用方**（Aegis 还没有 /undo 等历史改写）；机制已就绪。
+- **租约丢失后的停止是"下一个 guard"粒度**：正在飞行中的模型请求完成后才停，
+  可能多写一条 assistant 消息——幂等键保证不产生重复行，但可能与其它进程交错
+  一条。Hermes 行为相同（熔断翻转标志位）。
+- **Redis 后端只经 fake client 单测** ~~真 Redis 集成测试未移植~~ → **已补**
+  （后续跟进）：`tests/lease_worker.py` + `tests/test_session_lease_dualprocess.py`
+  移植了双进程子进程测试（单胜者 / 不同会话并行 / 正常退出即刻接管 / kill -9 后
+  TTL 接管 / TTL 前拒绝），`tests/test_session_lease_redis_live.py` +
+  `tests/docker-compose.redis.yml` 提供真 Redis 集成测试（`integration` marker +
+  `AEGIS_TEST_REDIS_URL` 门控，默认不跑）。
+- **内存存储 + 租约** ~~时锁落在默认路径的 SQLite 库上~~ → **已修**（后续跟进）：
+  `--ephemeral` 且未显式设置 `AEGIS_SESSION_LEASE_BACKEND` 时 CLI 直接跳过租约
+  （内存会话无跨进程共享状态，无从冲突），不再触碰默认路径锁库；显式配置后端
+  的操作者意图仍被尊重。
 
-### Interview summary
+#### Interview summary
 
-"这个里程碑把 Hermes `ctx-compress-opt` 原型的上下文压缩管线整体移植进了 Aegis。
-它是一个三阶段级联：阶段 A 用 tool_budget 把超大工具结果转存磁盘、只给模型看预览；
-阶段 B 用 micro_compact 做本地渐进清理（去重、一行信息化摘要旧工具结果、JSON 感知
-截断参数、清历史思维链），往往这一步就压回阈值、省掉 LLM 调用；阶段 C 才按轮调用
-LLM 生成结构化摘要，最早的完整轮次先压，最后一轮和已有摘要区受保护；还有单轮兜底
-处理'只剩一轮也超限'的极端情况，最后手段是原子删除整个工具调用组、绝不留孤儿。
-移植策略是保留算法核心逐字节不变——它操作 OpenAI dict——然后只在外面包了一层
-Aegis `Message` 的边界转换器，这样行为不漂移、还能直接复用原型成熟的降级语义：
-摘要失败就保留原轮次，转存失败就原样发送，任何一步出错都不中断主循环。
-适配点主要是四处：同步 ModelProvider Protocol 替代原来的 async chat 接口、
-stdlib logging 替代项目日志器、storage_dir 依赖注入替代硬编码路径、包内绝对导入。
-测试用 fake provider 全覆盖三个阶段和兜底，并锁定核心不变式——原始消息永不被修改。"
+"这个里程碑把我在 Hermes 上做的会话恢复三件套移植到了 Aegis。存储层是适配性移植：
+搬走了整套事务机器——WAL、BEGIN IMMEDIATE 进事务就抢锁、撞锁后随机 jitter 重试、
+每 50 写 TRUNCATE checkpoint——加上消息级幂等落盘（UNIQUE(session_id,
+client_msg_id) 部分索引 + ON CONFLICT DO NOTHING，计数和 INSERT 同事务），但 schema
+裁剪到 Aegis 的 Message dataclass，FTS/标题/undo/计费这些上游功能全部砍掉。
+恢复在 Aegis 架构下特别干净：runtime 每轮都从 repository 读历史，所以 resume 不需要
+预加载——list_messages 内部直接走「最新有效快照 + 尾部增量」快路径，快照用 zlib 压缩
+加 CRC32 校验，history_version 不符或任何损坏都安全降级全量重放。租约层是近乎逐字节
+移植：SQLite/Redis 双后端、心跳保活、续期失败立即熔断——熔断信号接到 run_turn 的
+interrupt event 上，循环在下一个 guard 停止，避免双写者。测试覆盖了 §9 的核心不变式：
+幂等、单调有序、会话隔离、快照等价于全量重放、损坏快照安全降级、同会话单一租约主。"
 
-### 对已有 milestone 的改动
+#### 对已有 milestone 的改动
 
-- `src/aegis_agent/context/__init__.py`：新增压缩管线的公开导出（不影响既有导出）。
-- `docs/source-map.md`：新增 Stage 10 表。
-
-*Hermes 仓库为只读参考，未修改。*
-
----
-
-## Milestone 9 — Stage 9：技能管理工具（skill_manage）
-
-### Problem and goal
-
-迁入最后一个工具 **`skill_manage`**——技能的安装/卸载/更新/列表。Aegis 已有
-`SkillLoader`（发现 `SKILL.md`）和 `skills_list`/`skill_view` 两个展示工具，但缺少
-变写能力。Hermes 的安装/卸载/更新逻辑藏在一个庞大的 `skills_hub.py`（多注册表源 + 隔离 +
-安全扫描 + 审计日志）和一个 `skill_manager_tool.py`（作者工具，非安装工具）里，并且安装
-工具本身不作为 agent tool 暴露——它是 CLI 命令面。Aegis 把它做成一个标准的 `Tool` Protocol
-工具，对接现有 `SkillLoader`。
-
-### Relevant Hermes behavior
-
-- `tools/skills_hub.py`：`install_from_quarantine`（移入 skills dir 前先隔离+扫描）、
-  `uninstall_skill`（仅卸锁记录中的，锁条目路径受多层防护）、`bundle_content_hash`（排序
-  relpath + 内容 SHA-256）、`_resolve_lock_install_path`（逐分量拒绝符号链接、resolve 后
-  拒绝逃逸与直指 SKILLS_DIR 根）、`HubLockFile`（`{version:1, installed:{name:{source,
-  content_hash, install_path}}}`）
-- `tools/skill_manager_tool.py`：作者端 `skill_manage`（create/edit/patch/delete/write_file/
-  remove_file 六动作，是**写本地 SKILL.md 的作者工具**，非 install/uninstall）
-
-### Migration decision: 混合（ADAPT + REWRITE）
-
-- `skills/install.py` → **ADAPT**：保留锁文件模型、路径双层安全防护、内容哈希、"只卸锁记录的"
-  守卫、rmtree 前重名校验。**丢弃**隔离阶段、扫描/信任度/标识符、多注册表源路由、审计日志、
-  网站策略、SSRF 重定向链、出处签名。Aegis install 源仅两个：本地目录复制，或直接 URL 下载
-  单个 SKILL.md（httpx，M3 已添加）。更新 = 重新获取 + 哈希比对 + force 重装。
-- `skills/manage_tool.py` → **REWRITE**（实现 `Tool` Protocol，动作 `install/uninstall/update/list`）。
-- 注册在 `runtime.with_defaults` 的 `enable_skills` 分支中，与 `SkillsListTool`/`SkillViewTool` 并列。
-
-### Aegis design and data flow
-
-- `skill_manage` `{action, source?, name?, force?}`：`install` 把 source（本地目录或 URL）复制/
-  下载到 `skills_dir/<name>/`，锁文件记录，`loader.discover(force=True)` 刷新索引。
-  `uninstall` 查锁→校验路径→rmtree→去锁→重扫。`update` 重新获取源→算哈希→同则 up_to_date、
-  异则 force reinstall。`list` 返回锁条目。
-- 锁文件 `<skills_dir>/.aegis-lock.json`：`{version:1, installed:{name:{source, install_path, content_hash}}}`。
-- 路径安全（Hermes 双层防护）：`_valid_name`（禁 `..`/`/`/超长）；`_resolve_install_path`：
-  ① 逐分量拒绝 `is_symlink()`/`is_junction()`；② `resolve()` 后 `is_relative_to(skills_dir)` +
-  `!= skills_dir`（防 `rmtree` 致灾）。
-
-### Key files, classes, and functions
-
-- `skills/install.py`：`SkillLock`、`install_skill`、`uninstall_skill`、`update_skill`、`list_installed`、
-  `_valid_name`、`_resolve_install_path`、`_is_redirect`、`_dir_hash`、`_read_skill_name`
-- `skills/manage_tool.py`：`SKILL_MANAGE`（schema）、`SkillManageTool`
-- `runtime.py`：注册于 `with_defaults` 的 `enable_skills` 分支
-
-### Reliability invariants, edge cases, and failure handling
-
-- **路径安全双层**：源树中符号链接被拒绝；安装目标的分量间符号链接被拒绝；解析后不在
-  skills_dir 内的路径被拒绝；解析后等于 skills_dir 根的被拒绝（防全员删除）。
-- **锁门**：只有经 install 记录在锁中的技能才可卸载/更新；手放的 builtin 技能不被误删。
-- **force 门**：已存在同名技能时默认拒绝（`force=True` 才覆盖）。
-- **加载器刷新**：每次 install/uninstall/update 后调用 `loader.discover(force=True)`，工具
-  立即可见变化。
-- **永不抛异常**：校验失败、fetch 失败、文件操作失败全部转为 `{success:false, error}` 结果。
-
-### Tests
-
-- `tests/test_skill_manage.py`（12）：本地目录安装/重复拒绝/force 覆写/卸载/卸载未安装/
-  update 无源/update up_to_date/update 检测改动/list 列表/缺 source/URL 安装（monkeypatch
-  httpx 假响应）/非法 action。
-
-### Source relationship
-
-`skills/install.py` 为 **ADAPT**；`skills/manage_tool.py` 为 **REWRITE**。详见 `docs/source-map.md` Stage 9。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- 仅支持本地目录与直接 URL；无 Git/GitHub 多文件下载、无 registry 概念。
-- 无隔离/安全扫描阶段（Hermes 的 `skills_guard` 未迁）——信任操作者。
-- Update 对本地目录源重新计算源目录哈希后对比，未做 diff 或增量更新。
-- 不能更改已安装技能的 source 重定向（要改只能先卸后装）。
-
-### Interview summary
-
-"这个里程碑给 Aegis 加上了技能管理——`skill_manage` 工具支持 install/uninstall/update/list。
-它背后是一个从 Hermes `skills_hub.py` 裁剪出来的轻量 install 模块：一个锁文件记录每个技能的
-源、安装路径、内容哈希；安装路径被双层安全防护（拒绝符号链接、必须留在 skills_dir 内且不等于
-根）；卸载必须锁中有记录；更新 = 重新获取源 + 哈希比对 + force 重装。安装源支持本地目录
-（含 SKILL.md）和直接 URL 下载单文件 SKILL.md。每次变更后调用 `loader.discover(force=True)`
-刷新索引，`skills_list`/`skill_view` 立即可见变化。Hermes 的隔离/安全扫描/多注册表/审计日志
-都砍掉了——Aegis 保持了它的轻量定位。"
-
-### 对已有 milestone 的改动
-
-- `docs/source-map.md`：新增 Stage 9 表。
+- `cli.py`：新增会话存储/租约/快照接线与 CLI 开关（Stage 11 的压缩开关之上）。
+- `sessions/__init__.py`：导出 SQLite 存储与租约组件。
+- `tests/test_cli.py`：既有用例改为 hermetic DB 路径。
+- `docs/source-map.md`：新增 Stage 12 表。
 
 *Hermes 仓库为只读参考，未修改。*
 
 ---
 
-## Milestone 8 — Stage 8：Web 工具（web_search / web_extract）
+### Milestone 13 — Stage 13：动态系统提示词的实际内容（identity / behaviour / model / environment）
 
-### Problem and goal
-
-迁入 **Web** 两件套：`web_search`（网页搜索）与 `web_extract`（网页正文抓取）。Hermes 的
-实现深度绑定付费 API/自建后端（Firecrawl/Tavily/Exa/Parallel）与插件注册表，默认无 key 不可用。
-按用户决策采用"**免费默认 + 可选付费后端**"策略：搜索默认走 `ddgs`（DuckDuckGo，无需 key），
-抓取默认 `httpx` + `trafilatura`（HTML→markdown）；检测到 `TAVILY_API_KEY`/`EXA_API_KEY`
-时用 httpx 直调其 REST 端点升级。同时把 Hermes 的 SSRF 防护门完整保留下来。
-
-### Relevant Hermes behavior
-
-- `tools/web_tools.py`（1212 行）：`web_search_tool`/`web_extract_tool` 经 `agent.web_search_registry`
-  插件注册表分发到 7 个后端；extract 另有可选 LLM 摘要、secret-in-URL 拦截、SSRF 门、base64 图片剔除。
-- `tools/url_safety.py`（305 行）：`is_safe_url` SSRF 门——http/https scheme 白名单、
-  云元数据/链路本地 always-blocked 硬底（含 IPv4-mapped IPv6 变体）、私网/环回/保留/组播/CGNAT
-  拦截、DNS 失败默认拒绝。
-
-### Migration decision: 混合（ADAPT + REWRITE + 原创 backends）
-
-- `tools/web/url_safety.py` → **ADAPT**：SSRF 门实质保留。丢弃 `security.allow_private_urls`
-  config/env 开关及缓存、QQ 白名单、async 包装。Aegis **始终**强制私网拦截（无 opt-out），仅同步版。
-- `tools/web/backends.py` → **原创**：Hermes 用付费 SDK 插件注册表；Aegis 用一个轻量、可 monkeypatch
-  的后端缝。搜索：默认 `ddgs`，有 key 则 httpx 直调 Tavily/Exa REST（不引厂商 SDK）。抓取：httpx +
-  trafilatura。模块级函数便于测试时替换。
-- `builtin/web_search.py`、`builtin/web_extract.py` → **REWRITE**（对齐行为、实现 `Tool` Protocol）。
-- **依赖**：`httpx` 进核心依赖；`ddgs`/`trafilatura` 进可选 `web` extra（仿 `mcp` extra）。未装 extra 时
-  工具返回明确 `{error}`（含安装提示），不崩溃。Hermes 的 LLM 摘要不迁。
-
-### Aegis design and data flow
-
-- `web_search` `{query, limit=5(1..100)}` → `{results:[{title,url,description,position}], count, backend}` / `{error}`。
-  `backends.web_search` 按 env 选后端：Tavily→Exa→ddgs。
-- `web_extract` `{urls:[...]}（≤5）` → `{results:[{url,title,content,error}], count}`。每个 URL 先过
-  `is_safe_url` SSRF 门（私网/元数据/非 http(s) 直接 Blocked，**不发任何请求**），再 httpx 抓取 +
-  trafilatura 转 markdown，剔 base64 图、截断 20k 字符。单 URL 失败内联报告，永不抛异常。
-- SSRF 门：scheme 白名单 → 元数据 hostname/IP 硬底 → 解析每个 A/AAAA 记录查私网/环回/保留/组播/CGNAT，
-  DNS 失败默认拒绝。
-
-### Key files, classes, and functions
-
-- `tools/web/url_safety.py`：`is_safe_url`、`_is_blocked_ip`、always-blocked 常量集
-- `tools/web/backends.py`：`web_search`、`web_extract`、`search_backend_name`、`_search_ddgs/_tavily/_exa`、
-  `_strip_html`、`_strip_base64_images`
-- `builtin/web_search.py`：`WebSearchTool`；`builtin/web_extract.py`：`WebExtractTool`
-
-### Reliability invariants, edge cases, and failure handling
-
-- **SSRF 防护**：`http://169.254.169.254`、`metadata.google.internal`、私网/环回/CGNAT、非 http(s)
-  scheme 全部拒绝；DNS 失败 fail-closed。有专门无网络单元测试（monkeypatch `getaddrinfo`）。
-- **永不抛异常**：后端异常/缺包/单 URL 失败都转为 `{error}` 结果。
-- **优雅降级**：未装 `ddgs`/`trafilatura` 时给安装提示；trafilatura 不可用时退回标签剥离。
-- **上下文保护**：base64 图片剔除、单页 20k 字符截断。
-
-### Tests
-
-- `tests/test_web_safety.py`（9，**无网络**——monkeypatch `getaddrinfo`）：非法 scheme、元数据字面 IP、
-  元数据 hostname、环回/私网/CGNAT、解析到元数据的域名、公网放行、DNS 失败 fail-closed、空/畸形 URL。
-- `tests/test_web_tools.py`（7，后端 monkeypatch，**无网络**）：search 返回/缺 query/后端错误；
-  extract 内容/多 URL 部分失败/≤5 上限/缺 urls/真实后端下私网 URL 被 SSRF 门拦截。
-
-### Source relationship
-
-`url_safety.py` 为 **ADAPT**（保留 Hermes MIT 归属头）；`backends.py` 为原创；
-`web_search.py`/`web_extract.py` 为 **REWRITE**。详见 `docs/source-map.md` Stage 8。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- 免费默认（ddgs）稳定性取决于 DuckDuckGo，可能限流/变动；生产建议配 Tavily/Exa key。
-- Hermes 的 LLM 摘要、secret-in-URL 正则、重定向逐跳 SSRF 校验未迁（重定向由 httpx `follow_redirects`
-  一次跟进，目标不再逐跳复查——DNS rebinding/redirect 绕过属已知 SSRF 残余风险，与 Hermes 文档一致）。
-- 未做网站 blocklist 策略（`website_policy.py`）。
-
-### Interview summary
-
-"这个里程碑把 Web 搜索与抓取迁进 Aegis，但**没有**照搬 Hermes 的付费 SDK 插件注册表——那是它默认
-无 key 不可用的根源。我换成一个轻量、可 monkeypatch 的后端缝：搜索默认用 `ddgs`（DuckDuckGo，零配置
-开箱即用），检测到 Tavily/Exa 的 key 就用 httpx 直调其 REST 升级；抓取用 httpx + trafilatura 把 HTML
-转成 markdown。真正原样保住的是 Hermes 的 **SSRF 防护门**：scheme 白名单、云元数据/链路本地硬底、
-私网/环回/保留/组播/CGNAT 拦截、DNS 失败默认拒绝——每个 URL 在发任何请求前先过这道门。测试完全不打
-真实网络：SSRF 门用 monkeypatch `getaddrinfo` 喂各种 IP 做单元测试，工具层则 monkeypatch 后端函数，
-另加一个用真实后端验证私网 URL 被门拦截的用例。"
-
-### 对已有 milestone 的改动
-
-- `pyproject.toml`：核心依赖加 `httpx`；新增可选 `web` extra（`ddgs`、`trafilatura`）。
-- `docs/source-map.md`：新增 Stage 8 表。
-
-*Hermes 仓库为只读参考，未修改。*
-
----
-
-## Milestone 7 — Stage 7：终端与后台进程工具（terminal / process）
-
-### Problem and goal
-
-M1 迁入了文件三件套。本里程碑迁入**终端/进程**两件套：功能更全的 `terminal`（前台一次性执行 +
-后台启动），以及配套的后台进程管理工具 `process`。按用户决策，`terminal` **取代** Stage-1 的
-极简 `run_shell`（后者移除），避免两个语义重叠的执行工具。目标是在 Aegis 显式 DI 架构下复刻
-Hermes 后台进程管理的核心能力（输出缓冲、状态轮询、阻塞等待、树杀、stdin 交互），而非一个
-只会 `subprocess.run` 的版本。
-
-### Relevant Hermes behavior
-
-- `tools/terminal_tool.py`（2282 行）：`terminal_tool` 支持前台（跑完即返回、timeout→124、
-  输出头尾截断、grep/diff 退出码解释、长驻服务→后台提示）与后台（`background=true` 立即返回
-  `session_id`）。但深度耦合 Hermes 的 sandbox 后端（local/docker/singularity/modal/ssh）、
-  审批/force 护栏、watch_patterns、gateway 通知路由。
-- `tools/process_registry.py`（1432 行）：`ProcessRegistry` 单例 + `ProcessSession`（id、滚动 200KB
-  `output_buffer`、daemon reader 线程、`_running`/`_finished` dict + 锁、TTL+LRU 修剪）、
-  八个生命周期动作、`_reconcile_local_exit`（孤儿管道挂起修复）、psutil/`taskkill /T /F` 树杀。
-
-### Migration decision: 混合（ADAPT + REWRITE + 删除 run_shell）
-
-- `tools/process_registry.py` → **ADAPT**（本地子集）：保留注册表模型、reader 线程、spawn_local、
-  八个动作、修剪、孤儿管道修复、树杀、ANSI 剥离。**丢弃** sandbox 后端（`spawn_via_env`）、
-  ptyprocess PTY、watch_patterns 限流 + 全局熔断、gateway 通知路由、崩溃恢复 checkpoint 文件、
-  per-profile HOME 隔离、provider-secret env 清洗。shell 包装从 `[shell, -lic, "set +m; cmd"]`
-  简化为 `/bin/sh -c` / `cmd /c`。
-- `builtin/terminal.py`、`builtin/process.py` → **REWRITE**（对齐行为、实现 `Tool` Protocol）。
-- `builtin/run_shell.py` → **删除**（被 terminal 取代）。
-
-### Aegis design and data flow
-
-- `terminal` `{command, timeout=60(≤600), workdir, background=false, pty=false}`：
-  前台 → `{output, exit_code, error}`（error=null 表成功；timeout→exit_code 124；输出 40%/60%
-  头尾截断；grep/diff 的 exit 1 给 "非错误" 注解；`&`/server 类命令给后台化提示）。
-  后台 → `{session_id, pid, output, exit_code:0, error:null}`，进程进入共享 registry。
-  **沿用危险命令护栏**（`detect_dangerous_command` + operator-only `allow_dangerous_shell`）。
-- `process` `{action, session_id?, data?, timeout?, offset, limit}`，action ∈
-  `list/poll/log/wait/kill/write/submit/close`，薄封装 registry 的同名方法；未知 id → `{status:"not_found"}`。
-- 注册：`build_default_registry()` 构造**单个** `ProcessRegistry`，同时注入 `TerminalTool` 与
-  `ProcessTool`——两者共享同一份后台进程状态。
-
-### Key files, classes, and functions
-
-- `tools/process_registry.py`：`ProcessRegistry`、`ProcessSession`、`spawn_local`、`_reader_loop`、
-  `_reconcile_local_exit`、`poll/read_log/wait/kill_process/write_stdin/submit_stdin/close_stdin/list_sessions`、
-  `_prune_if_needed`、`_kill_popen_tree`、`_strip_ansi`
-- `builtin/terminal.py`：`TerminalTool`、`_truncate_output`、`_exit_code_meaning`、`_SERVER_HINTS`
-- `builtin/process.py`：`ProcessTool`
-
-### Reliability invariants, edge cases, and failure handling
-
-- **后台进程不泄漏**：reader 线程 `finally` 里 `wait()` 收割子进程；spawn 后置步骤失败会先杀孤儿再抛。
-- **孤儿管道挂起修复**：直接子进程已退出但后代仍持有 stdout 管道时，`_reconcile_local_exit`
-  非阻塞 drain 并把 session 标记为 exited，避免 poll 永远 "running"。
-- **树杀**：POSIX 用进程组 `killpg`（spawn 时 `os.setsid`），Windows 用 `taskkill /T /F`。
-- **输出有界**：每 session 滚动 200KB 缓冲；前台输出 50KB 头尾截断。
-- **危险命令默认拦截**，模型无法通过参数自开（无 force/allow 参数）。
-- **工具永不抛异常**：一切失败返回 `{error}` / `{status:"error"}` 结果。
-
-### Tests
-
-- `tests/test_terminal.py`（12）：前台输出/退出码、非零退出、timeout(124)、缺 command、workdir、
-  后台返回 session_id 且入 registry、危险命令默认拦截/git reset --hard/安全命令不拦/operator override/
-  模型参数不可开。
-- `tests/test_process.py`（8）：list 可见、poll+wait（exit 0 + 输出）、log 分页、kill（killed→already_exited）、
-  stdin write/submit/close（cat 回显）、not_found（7 动作）、缺 session_id、非法 action。
-- `tests/test_tools.py` 精简为 read_file/list_directory（run_shell 用例迁入 test_terminal.py）。
-
-### Source relationship
-
-`process_registry.py` 为 **ADAPT**；`terminal.py`、`process.py` 为 **REWRITE**；`run_shell.py` 删除。
-PORT/ADAPT 文件保留 Hermes MIT 归属头。详见 `docs/source-map.md` Stage 7。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- PTY：`pty=true` 目前退化为普通 pipe 并附注（未引入 ptyprocess 依赖）；后续如需真交互式 TUI 可加。
-- 后台进程**无崩溃恢复**（Hermes 有 checkpoint 文件）——Aegis 重启后丢失，符合轻量定位。
-- `notify_on_complete` 仅记录标志，无 gateway/chat 通知（Hermes 的通知路由不迁）。
-- wait 的 `interrupted` 语义（用户发新消息打断）未迁——Aegis 无对应 gateway 概念。
-
-### Interview summary
-
-"这个里程碑把 Hermes 的后台进程管理迁进 Aegis，并用功能更全的 `terminal` 取代了极简 `run_shell`。
-`terminal` 前台跑完即返回（timeout→124、输出头尾截断、grep/diff 退出码解释），`background=true`
-则立即返回 `session_id`。配套的 `process` 工具驱动一个**本地版** `ProcessRegistry`——每进程一个
-滚动 200KB 输出缓冲 + daemon reader 线程，支持 list/poll/log/wait/kill/write/submit/close 八个动作。
-两个工具共享同一个 registry 实例（在 `build_default_registry` 里构造注入），后台进程因此可被发现、
-轮询、阻塞等待、树杀（POSIX 进程组 / Windows taskkill）、以及向 stdin 写入/送 EOF。我保留了 Hermes
-一个关键修复：直接子进程退出但后代持有管道时，reconcile 逻辑非阻塞 drain 并标记退出，避免状态永远
-卡在 running。Hermes 的 sandbox 后端、PTY、watch 限流熔断、gateway 通知路由、checkpoint 持久化
-都显式砍掉，保持 Aegis 的轻量定位。"
-
-### 对已有 milestone 的改动
-
-- 删除 `builtin/run_shell.py` 及其 schema（`terminal` 取代）。
-- `models/fake.py`、`tui.py`、`cli.py`、`tools/danger.py`、`tools/registry.py`：`run_shell` → `terminal` 引用更新。
-- `docs/source-map.md`：新增 Stage 7 表。
-
-*Hermes 仓库为只读参考，未修改。*
-
----
-
-## Milestone 6 — Stage 6：文件编辑工具（write_file / patch / search_files）
-
-### Problem and goal
-
-Aegis 此前只有 3 个极简内置工具（`read_file` / `list_directory` / `run_shell`）。用户要求从
-Hermes 迁入一批"尽量不做阉割版"的工具。这是其中第一个里程碑——**文件操作三件套**：
-`write_file`（写文件）、`patch`（精确/模糊替换）、`search_files`（文件内容/名搜索）。
-目标是在 Aegis 的显式 DI + `Tool` Protocol 架构下，复刻 Hermes 编辑器的核心健壮性
-（原子写、BOM/行尾保留、模糊匹配、写后校验），而不是抄一个只会 `open().write()` 的简陋版。
-
-### Relevant Hermes behavior
-
-- `tools/fuzzy_match.py`（747 行）：`fuzzy_find_and_replace` 的 9 策略匹配链
-  （exact → line-trimmed → whitespace → indentation → escape → trimmed-boundary →
-  unicode → block-anchor → context-aware），外加 escape-drift 检测、替换区重缩进、
-  `\t`/`\r` 智能反转义、`find_closest_lines` 的 "did you mean?" 提示。**仅依赖 `re`+`difflib`，零 Hermes 耦合。**
-- `tools/file_operations.py`（1973 行）：`ShellFileOperations.write_file` / `patch_replace` / `search`，
-  以及通用小工具 `_detect_line_ending` / `_normalize_line_endings` / `_strip_bom` /
-  `_atomic_write` / `_unified_diff` / `_is_write_denied`。核心行为：自动建父目录、
-  整体覆盖、temp+`mv` 原子写、保留 BOM 与 CRLF、敏感路径拒写、patch 写后重读校验、
-  无匹配时给 "did you mean?" 提示、search 优先 ripgrep 回退 grep。
-- `tools/path_security.py`：`has_traversal_component` / `validate_within_dir`。
-
-### Migration decision: 混合（PORT + ADAPT + REWRITE）
-
-- `tools/fuzzy_match.py` → **PORT**（几乎原样）：它是自包含纯函数模块，依赖闭包全是 stdlib，
-  是最小完整迁移单元，拆开会徒增工作。只做了 typing import 的整理。
-- `tools/fsutil.py` → **ADAPT**：把 Hermes 散在 `file_operations.py` 里的通用 helper 收敛成一个
-  无后端耦合的模块。**关键改动**：Hermes 一切读写都走 pluggable 终端后端 `execute()`（docker/ssh/modal），
-  此处换成直接 Python I/O（`pathlib`/`os.replace`）；并新增 `read_text_raw`（二进制读取）——
-  因为 Python 文本模式 `read_text`/`write` 会做 universal-newline 转换（`\r\n`→`\n`），
-  会把 CRLF/BOM 信息在读写往返中抹掉，必须绕过。
-- `builtin/write_file.py`、`builtin/search_files.py` → **REWRITE**（对齐行为、按 Aegis `Tool` 协议重写）。
-- `builtin/patch.py` → **ADAPT**（复用 fuzzy_match；对齐 `patch_replace`）。
-- **显式丢弃** Hermes 的 cross-profile 镜像、file_state/staleness 跟踪、连搜熔断、
-  lint/LSP 层、secret redaction、sandbox 后端路由。**V4A 多文件补丁模式不迁**（用户确认只做 replace 模式）。
-
-### Aegis design and data flow
-
-- `tools/fsutil.py`：`resolve_path`（cwd 感知 + `~` 展开）、`is_write_denied`（`/etc`、`/boot`、
-  `.ssh` 等通用敏感路径拒绝）、`detect_line_ending`/`normalize_line_endings`、`strip_bom`/`has_bom`、
-  `atomic_write`（同目录 temp + `os.replace`，二进制写保证 CRLF 不被翻译）、`read_text_raw`、
-  `unified_diff`、`has_traversal_component`。
-- `builtin/write_file.py`：`{path, content}` → `{path, bytes_written, created, dirs_created}` / `{error}`。
-  存在文件时先读原文探测 BOM 与行尾，写回时保留。
-- `builtin/patch.py`：`{path, old_string, new_string, replace_all}` →
-  `{success, path, replaced, strategy, diff}` / `{success:false, error}`。多匹配且未 `replace_all` 报错；
-  无匹配追加 "did you mean?" 提示；**写后重读校验**内容确实落盘（防静默失败）。
-- `builtin/search_files.py`：`target=content` 用正则搜内容（`rg` 优先，纯 Python `os.walk`+`re` 回退，
-  跳过二进制与隐藏/VCS 目录）；`target=files` 按 glob 找文件名（`rg --files --sortr=modified`，
-  回退 `fnmatch`，新→旧）。`output_mode ∈ content/files_only/count`，`limit`/`offset` 分页。
-- 三者在 `tools/schemas.py` 定义 schema，经 `build_default_registry()` 注册进 `ToolRegistry`。
-
-### Key files, classes, and functions
-
-- `tools/fuzzy_match.py`：`fuzzy_find_and_replace`、`format_no_match_hint`、`find_closest_lines`、9 个 `_strategy_*`
-- `tools/fsutil.py`：`atomic_write`、`read_text_raw`、`detect_line_ending`、`normalize_line_endings`、
-  `is_write_denied`、`resolve_path`、`unified_diff`
-- `builtin/write_file.py`：`WriteFileTool`
-- `builtin/patch.py`：`PatchTool`
-- `builtin/search_files.py`：`SearchFilesTool`、`_walk_files`、`_parse_rg_content`
-
-### Reliability invariants, edge cases, and failure handling
-
-- **原子写**：temp 文件 + `os.replace`，崩溃不留半截文件；任何失败清理 temp。
-- **CRLF/BOM 保留**：二进制读写往返，CRLF 文件改完仍是 CRLF（有测试断言字节级保留）。
-- **patch 写后校验**：写回后重读比对，落盘不符即报错。
-- **敏感路径拒写**：`/etc`、`/boot`、`.ssh/credentials` 等拒绝写入。
-- **无匹配兜底**：patch 找不到 old_string 时给最相近行提示，帮助模型自纠。
-- **工具永不抛异常**：一切失败（文件不存在/是目录/无匹配/非法正则）都返回 `{error}` 结果。
-
-### Tests
-
-- `tests/test_write_file.py`（7）：新建/覆盖/建父目录/CRLF 保留/敏感路径拒绝/缺字段/拒绝目录。
-- `tests/test_patch.py`（10）：精确替换/模糊缩进匹配/空串删除/多匹配需 replace_all/replace_all/
-  无匹配给提示/文件缺失/缺字段/CRLF 保留。
-- `tests/test_search_files.py`（12）：内容匹配/glob 过滤/无匹配/files_only/count/非法正则/
-  分页/文件名 glob/裸模式/路径缺失/排除隐藏与 VCS。
-
-### Source relationship
-
-`fuzzy_match.py` 为 **PORT**；`fsutil.py`、`patch.py` 为 **ADAPT**；`write_file.py`、`search_files.py`
-为 **REWRITE**（行为等价）。PORT/ADAPT 文件保留 Hermes MIT 归属头。详见 `docs/source-map.md` Stage 6。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- patch 只做 replace 模式，不含 V4A 多文件补丁（用户确认）。
-- search 的纯 Python 回退有 20000 文件扫描上限与每行 500 字符截断；`rg` 可用时更快且尊重 .gitignore。
-- 未做 Hermes 的 lint/LSP 诊断、secret redaction、跨进程 file-state 跟踪。
-
-### Interview summary
-
-"这个里程碑把 Hermes 编辑器三件套的**健壮性内核**迁进了 Aegis 的 `Tool` Protocol 架构。
-最关键的是 `fuzzy_match.py` 几乎原样整体迁移——它是零依赖纯函数，9 策略匹配链能容忍 LLM
-生成代码常见的空白/缩进/转义漂移。配套地我把 Hermes 散落的原子写、BOM/CRLF 保留、统一 diff、
-敏感路径守卫收敛成一个无后端耦合的 `fsutil` 模块——这里有个坑：Python 文本模式 I/O 会做
-universal-newline 转换，会把 CRLF 在读写往返中抹成 LF，所以我用二进制 `read_text_raw` +
-二进制 `atomic_write` 保住字节级不变式，并用测试断言。patch 写后还会重读校验，杜绝静默失败。
-全部三个工具实现现有 `Tool` Protocol，经显式 `build_default_registry()` 注册，不依赖 Hermes 的
-全局单例或终端后端抽象。"
-
-### 对已有 milestone 的改动
-
-- `docs/source-map.md`：新增 Stage 6 表。
-- `tools/schemas.py`、`tools/builtin/__init__.py`：注册三个新工具。
-
-*Hermes 仓库为只读参考，未修改。*
-
----
-
-## Milestone 5 — Stage 5：轻量 MCP 客户端
-
-### Problem and goal
-
-Milestone A 建立了 `SystemPromptBuilder` + `PromptContributor` 和 `Tool` Protocol
-两条扩展缝。现在用这两条缝接入外部 MCP（Model Context Protocol）服务器，
-让 Aegis 能把任何 MCP 服务器的工具当作原生工具使用。
-
-这是 `CLAUDE.md` §5 "除非明确要求才做"的功能——用户显式要求。范围是轻量级：
-**stdio + Streamable HTTP 传输，无可选功能**（无 SSE/OAuth/sampling/断路器）。
-
-### Relevant Hermes behavior
-
-Hermes 的 MCP 实现是一整个 `tools/mcp_tool.py` 模块（~3900 行）。核心架构：
-- 一个后台 daemon 线程 event loop，所有 MCP 会话跑在上面
-- 跨线程协程调度：`run_coroutine_threadsafe` + 100ms 轮询 `Future`
-- 连接：`StdioServerParameters` + `stdio_client`（stdio），`streamable_http_client` + `httpx.AsyncClient`（HTTP）
-- Schema 适配：`_normalize_mcp_input_schema` 三阶段 pipeline（local refs / nullable union / object shape repair）+ `strip_nullable_unions`
-- 工具注册：`registry.register(schema=..., handler=..., toolset=..., check_fn=...)` 直接用 Hermes 全局单例
-- 高级功能：OAuth 2.1 PKCE、SSE、断路器、`tools/list_changed` 动态刷新、sampling
-
-### Migration decision: ADAPT
-
-选择 **ADAPT**：保留 Hermes 的两块最干净复用逻辑（schema 适配器 + 连接/调度），
-但适配到 Aegis 的显式 DI + Protocol 架构（MCP 工具包装成 `Tool` Protocol 对象，
-而不是直接调 `registry.register` 全局单例），并大幅砍掉高级功能。
-
-### Aegis design and data flow
-
-**依赖**：`mcp` SDK 是 `pyproject.toml` 的可选依赖（`[project.optional-dependencies] mcp`）。
-运行时 guarded import：SDK 没装时 `is_available()` 返回 `False`，MCP 功能静默跳过。
-
-**配置** (`mcp/config.py`)：
-- `load_mcp_config(path) -> dict[str, dict]` — 读 `~/.aegis/config.yaml` 的 `mcp_servers:` 键
-- 递归 `${ENV_VAR}` 插值，merge 默认值（timeout=120, connect_timeout=60, enabled=True）
-
-**Schema 适配** (`mcp/schema_adapter.py`)：
-- `sanitize_mcp_name_component` — `[^A-Za-z0-9_]` → `_`
-- `normalize_mcp_input_schema` — 三阶段：`_rewrite_local_refs`（definitions→$defs）
-  → `_strip_nullable_union`（anyOf [{T}, {null}] → {T, nullable:true}）
-  → `_repair_object_shape`（补 type/poperties/修剪 required）
-- `convert_mcp_tool(server_name, mcp_tool) -> dict` — 产出 `{name: "mcp_{s}_{t}", description, parameters}`
-- `strip_nullable_unions` 从 Hermes `tools/schema_sanitizer.py` **内联**（~50行），避免跨模块依赖
-
-**连接** (`mcp/client.py`)：
-- 模块级状态：一个 daemon 线程 + asyncio event loop + `dict[str, _MD]` 服务器表 + `threading.Lock`
-- `_ensure_loop()` + `_run_on_loop(coro, timeout)`：跨线程协程调度
-- `connect_stdio_server` / `connect_http_server`：建 session → initialize → list_tools
-- `call_tool(server_name, tool_name, args, timeout) -> str`：调 `session.call_tool`，收集 text blocks，返回 JSON
-- 凭证清洗：`_CREDENTIAL_PATTERNS` 正则 scrub 所有 error text
-- `disconnect_all()`：优雅关闭
-
-**工具包装** (`mcp/tools.py`)：
-- `MCPToolWrapper` 实现 `Tool` Protocol：存 `definition: ToolDefinition` + 服务器名 + 工具名 + timeout
-- `run(arguments, ctx)` → `call_tool` → `ToolResult`
-- 永远不抛异常（MCP 调用错误 → `is_error=True` 结果）
-
-**提示注入** (`mcp/guidance.py`)：
-- `MCPToolsGuidance` 实现 `PromptContributor`：有服务器连接时 render "MCP tools from N servers are available"
-
-**接线**：
-- `with_defaults(enable_mcp=True, mcp_config_path=None)`：读配置 → 连服务器 → 转换 schema →
-  `MCPToolWrapper` → `registry.register(wrapper)` → `prompt_builder.add(MCPToolsGuidance)`
-- CLI `--mcp-config` / `--no-mcp` flags
-
-### Key files, classes, and functions
-
-- `mcp/config.py`：`load_mcp_config`, `_interpolate_env_vars`, `DEFAULT_MCP_SERVER_CONFIG`
-- `mcp/schema_adapter.py`：`sanitize_mcp_name_component`, `normalize_mcp_input_schema`, `convert_mcp_tool`, `_rewrite_local_refs`, `_strip_nullable_union`, `_repair_object_shape`
-- `mcp/client.py`：`connect_server`, `call_tool`, `get_server_tools`, `disconnect_all`, `_ensure_loop`, `_run_on_loop`
-- `mcp/tools.py`：`MCPToolWrapper(definition, run)`, `build_wrappers`
-- `mcp/guidance.py`：`MCPToolsGuidance(render)`
-
-### Reliability invariants, edge cases, and failure handling
-
-- SDK 没装 → `is_available()` = False，MCP 功能静默跳过
-- 配置文件缺失 → `load_mcp_config` 返回 `{}`，不抛异常
-- 单个服务器连接失败 → 记日志，跳过去，不阻止 Aegis 启动
-- MCP 工具调用超时 → `TimeoutError` → `{"error": "MCP call failed: ..."}`
-- MCP 服务器崩溃 → `session.call_tool` 抛异常 → 被 `call_tool` 的 except 捕获，返回 error JSON
-- MCP 工具返回值含凭证 → `_sanitize_error` regex scrub `[REDACTED]` 代替
-- `MCPToolWrapper.run(None)` → `dict(None)` 不抛 → 防御 `if arguments is None: arguments = {}`
-
-### Tests
-
-- `test_mcp_schema_adapter`（20）：名称清洗(3) / 空 schema / 合法 schema /
-  definitions→$defs / $ref 重写 / nullable union collapse(4) / object repair(5) / 工具转换(4)
-- `test_mcp_config`（8）：文件缺失/无键/非dict/servers加载/非dict条目/skip/默认值merge/ENV插值/未匹配ENV保留/数组插值
-- `test_mcp_tools`（5）：前缀/描述/parameters/run error返回/run 不抛
-- `test_mcp_guidance`（4）：无服务器 → None / 2 服务器 / 1 服务器单数 / reset
-
-### Source relationship
-
-Schema adapter + config loader + client 为 **ADAPT**；
-tools (wrapper) 为 **REWRITE**（Aegis 特有 pipeline）；guidance 为 **original**。
-见 `docs/source-map.md` Stage 5 表。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- **只支持 stdio + Streamable HTTP**（无 SSE，无 OAuth）——极轻量，但限制可连接的服务器类型
-- **无重连**——connect失败即跳过，server之后断开不自动恢复
-- **无断路器**——连续失败的 server 不会自动降级
-- **无 dynamic tool refresh**——连接后 tools 列表固定，不支持 `list_changed` 通知
-- **无 sampling**——不支持服务器发起 LLM 请求
-- **无 utility tools**——不注册 `list_resources` / `read_resource` / `list_prompts` / `get_prompt`
-
-### Interview summary
-
-"Stage 5 做了 MCP 客户端，范围精打细算到最小可用面：stdio + Streamable HTTP 两个传输，
-schema adapter 从 Hermes 搬了关键的三阶段归一化 pipeline（`definitions→$defs` /
-nullable union 折叠 / object 形状修复），保证同一个 MCP 工具的 inputSchema 在 OpenAI、
-Anthropic、Gemini 上都能通过验证。
-
-每个发现的 MCP 工具包装成 Aegis 的 `Tool` Protocol —— 一个 `MCPToolWrapper` 存着
-`ToolDefinition` 和 `call_tool` 调度逻辑，这样它可以和内置工具、技能工具一样注册进
-`ToolRegistry`，模型无差别调用。
-
-后台是一个 daemon 线程 event loop，`asyncio.run_coroutine_threadsafe` + Future 轮询
-做跨线程阻塞调用。显式砍掉了 SSE、OAuth、sampling、断路器等 Hermes 级功能，
-保持 Aegis 的轻量身份。"
-
-### 对已有 milestone 的改动
-
-- `docs/development-log.md`：更新测试计数（105→221）、进度表加 Stage 5、模块表加 mcp、溯源表加 mcp 条目、"计划实现"移除 MCP、面试索引加第 13 条
-- `docs/source-map.md`：新增 Stage 5 表
-
-*本 milestone 由用户显式要求，不在原始 §4 范围内（§5 "unless explicitly requested"）。*
-
----
-
-## Milestone 4 — Stage 4：Skills 子系统 & 动态系统提示注入
-
-### Problem and goal
-
-此前 `ContextBuilder` 只用**一条静态字符串**作为系统提示——没有子系统的扩展点。
-需要建立一个技能（Skills）子系统，支持：
-1. 按 `SKILL.md`（YAML frontmatter + markdown body）格式发现和加载技能；
-2. 用 progressive disclosure 模式（紧凑索引进系统提示，完整内容按需取）；
-3. 模型通过 `skills_list`/`skill_view` 工具获取技能，用户可以 `/skill-name` 调用。
-
-同时需要先把"静态字符串系统提示"升级为"可组合的动态构建器"，
-作为技能（和未来 MCP 等）的注入缝。
-
-### Relevant Hermes behavior
-
-Hermes skills 是 agentskills.io / Anthropic Claude Skills 兼容格式：
-目录含 `SKILL.md`（YAML frontmatter: `name`/`description` + markdown body），
-可选 `references/`、`templates/`、`scripts/`。
-
-三个激活路径：
-- 系统提示里的**紧凑索引**（`<available_skills>`，按 category 分组）→ 模型按需调用 `skill_view`
-- 显式 `/skill-name` slash 命令 → `build_skill_invocation_message` 注入
-- CLI preload `--skills`。
-
-关键源文件：`agent/skill_utils.py`（解析 + 发现）、`tools/skills_tool.py`
-（`skills_list`/`skill_view`）、`agent/skill_commands.py`（路由 + 调用消息）、
-`agent/prompt_builder.py:build_skills_system_prompt`（索引注入）、
-`agent/system_prompt.py:build_system_prompt_parts`（分层系统提示组装）。
-
-### Migration decision: ADAPT port
-
-技能子系统是 self-contained 的，且与当前 Aegis 架构兼容——
-`skills_list`/`skill_view` 按现有 `Tool` Protocol 实现就能插入 `ToolRegistry`。
-选择 **ADAPT**（不是 PORT 全局单例、不是全 REWRITE）：
-- 保留 Hermes 的前端格式（SKILL.md）、progressive disclosure 设计、slug 路由、
-  调用消息格式、紧凑索引格式。
-- 适配 Aegis 的显式 DI + Protocol 架构（不使用 Hermes 的全局单例 + AST 发现）。
-- 砍掉：prompt injection 扫描器、credential/setup 检查、Curator 遥测、
-  plugin 命名空间、prompt-snapshot 磁盘缓存、template-var 替换、
-  inline-shell 展开、config 解析、platform-keyed 命令缓存。
-
-同时，系统提示的动态性通过**新的** `SystemPromptBuilder` + `PromptContributor` 缝实现——
-这不是 Hermes 的直接移植，而是引用其"分层组装"思想的最小化实现。
-
-### Aegis design and data flow
-
-**动态系统提示** (`context/system_prompt.py`)：
-- `PromptContributor` Protocol：`render() -> str | None`
-- `SystemPromptBuilder`：identity 头 + 有序 contributor 列表 → `build()` 每次渲染。
-  空/None contributor 被移除，所以"无技能"的 prompt 与原来的静态默认 prompt 字节相同。
-- 原有的 `DEFAULT_SYSTEM_PROMPT` 保持身份为 `DEFAULT_IDENTITY`。
-
-**技能数据结构** (`skills/models.py`)：
-- `Skill`：fully-parsed（frontmatter dict + body + 目录路径）
-- `SkillMeta`：name/description/category（紧凑索引用）
-
-**技能发现** (`skills/loader.py`)：
-- `SkillLoader(dirs)`（默认 `~/.aegis/skills` 或 `$AEGIS_SKILLS_DIR`）
-- `discover()` 有缓存（`force=True` 重扫）；按 name dedupe（先到的赢）。
-- 验证：name/description 必填、长度上限（64 / 1024）、平台门控（macos→darwin 映射）。
-- Category 从 parent 文件夹名派生（只当 parent 非 search root 时）。
-
-**路由** (`skills/router.py`)：
-- `SkillRouter` Protocol（CLAUDE.md §6 要求）
-- `DefaultSkillRouter`：slug 归一化（`/My_Skill` → `my-skill`），先精确名匹配再 slug 匹配。
-- `invocation_message(skill, instruction)`：`[The "X" skill was invoked ...]` +
-  body + `[Skill directory: ...]` + supporting files 列表 + 用户指令。
-
-**渐进式工具** (`skills/tools.py`)：
-- `SkillsListTool` (`skills_list`)：返回 `{"skills": [...], "count": N}`，可按 category 过滤。
-- `SkillViewTool` (`skill_view`)：`{name, file_path?}` → 完整 body 或指定引用文件（路径遍历守卫）。
-
-**提示注入** (`skills/prompt.py`)：
-- `SkillsIndexContributor(loader)` 实现 `PromptContributor`：render `<available_skills>` 块，
-  按 category 分组，加上调用 `skill_view` 的指令。无技能时返回 None。
-
-**接线**：
-- `AgentRuntime.with_defaults(enable_skills=True, skills_dir=...)` 在 `build_default_registry` 后
-  发现并注册技能工具，构造 `SystemPromptBuilder` + `SkillsIndexContributor`，
-  传入 `ContextBuilder`，暴露 `SkillRouter`。
-- CLI `--skills-dir` / `--no-skills`；`/skill-name instruction` 行经 `_maybe_route_skill` 解析
-  → `invocation_message` 代替原始输入传给 `run_turn`。
-
-**关键不变式**：
-- 原始消息 unchanged：技能索引只进入 `ContextBuilder` 的**派生视图**，原始会话历史不变。
-- `ContextBuilder` 的 `system_prompt` 属性仍是 `str`（从 builder 实时渲染）。
-
-### Key files, classes, and functions
-
-- `context/system_prompt.py`：`PromptContributor` (Protocol), `SystemPromptBuilder.build/add`, `DEFAULT_IDENTITY`
-- `context/builder.py`：`ContextBuilder(..., system_prompt: str | SystemPromptBuilder | None)`，backward-compat
-- `skills/models.py`：`Skill(name, description, category, directory, skill_md_path, frontmatter, body)`, `SkillMeta`
-- `skills/frontmatter.py`：`parse_frontmatter(content) -> (dict, body)`
-- `skills/loader.py`：`SkillLoader(discover/get/metas)`, `default_skills_dirs()`, `_matches_platform`, `MAX_NAME_LENGTH=64`, `MAX_DESCRIPTION_LENGTH=1024`
-- `skills/router.py`：`SkillRouter` Protocol, `DefaultSkillRouter`, `normalize_skill_key`
-- `skills/prompt.py`：`SkillsIndexContributor.render() -> str | None`
-- `skills/tools.py`：`SkillsListTool`, `SkillViewTool`, `SKILLS_LIST`/`SKILL_VIEW` schemas
-- `runtime.py`：`with_defaults(enable_skills, skills_dir)`, `skill_router` property
-- `cli.py`：`_maybe_route_skill`, `--skills-dir`/`--no-skills`
-
-### Reliability invariants, edge cases, and failure handling
-
-- 缺失目录 → 空列表，不抛异常。
-- 一个技能格式错误 → 跳过，不影响其他。
-- 平台不匹配 → 跳过（debug 日志）。
-- `skill_view` 路径遍历：`../etc/passwd` → error result（路径跑出技能目录被拒绝）。
-- `skill_view` 文件不存在/技能不存在/cwd 外 → error result（永不抛异常）。
-- Name 空/无 → 跳过；collision → 先赢后报警告。
-- 工具注册后即使零技能存在，索引 contributor 返回 None，prompt 不变。
-
-### Tests
-
-- `tests/test_skills_frontmatter.py`（9）：正当/缺 fence/YAML 错误回退/非 mapping/CRLF/列表/tags/markdown body
-- `tests/test_skills_loader.py`（18）：发现、category 派生、metas、空 dir、name/description 必填/截断、
-  名称碰撞、get_by_name、缓存/force、unreadable skip、排除 dir（.git）、platform gate 4 个、
-  默认 dir（env/no env）
-- `tests/test_skills_prompt.py`（10）：builder 行为（6：identity-only/custom/none drop/empty drop/
-  multiple join/strip/empty identity）、skills index（4：render/when none/group by category/general fallback）
-- `tests/test_skills_tools.py`（12）：skills_list（5：返回所有/过滤/null category/case-insensitive/空）、
-  skill_view（7：body/unknown/missing name/引用文件/绝对路径拒绝/traversal 拒绝/文件缺失/error永不抛）
-- `tests/test_skills_router.py`（9）：slug 归一化（5）、resolve（3）、invocation message（3：
-  activation note/supporting files/instruction append）
-- `tests/test_context_invariants.py`（6）：source unchanged 3路径（string/builder/skills）、
-  backward-compat string/None/空
-- `tests/test_cli.py` 既有用例通过（非 TTY fallback 路径）
-
-### Source relationship
-
-所有技能模块都是 **ADAPT** 自 Hermes，保留了 Hermes MIT 署名头。
-`SystemPromptBuilder` + `PromptContributor` 是**参考 Hermes 分层思想的新实现**。
-`cli.py` / `runtime.py` 的接线是 **original**。
-详见 `docs/source-map.md` Stage 4 表。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- **Skills 只从 user dir 加载**（不 bundled，不 external dir config）→ 极简。
-- **Prompt 缓存**：Hermes 有 disk snapshot 缓存避免每次都 rebuild prompt index；
-  Aegis 无，每次都 render（代价低，因索引很小）。
-- **Prompt 注入扫描**：Hermes 有 `_INJECTION_PATTERNS` 检查 skill 内容是否含不安全注入；
-  Aegis 已砍（轻量面）。
-- **Plugin/命名空间**：不支持 `plugin:skill` 限定名（Hermes 有）。
-- **Reload**：无 `/reload-skills` 命令；只有 force=True 的 API（CLI 不暴露）。
-- **MCP 技能**：下一阶段（Milestone B）是轻量 MCP client，复用的缝已就绪——
-  `PromptContributor` 用于工具使用指导，`Tool` Protocol 用于 MCP 工具注册。
-
-### Interview summary
-
-"Stage 4 实现了 Hermes 的 Skills 子系统，但适配到 Aegis 的显式 DI 架构里。
-核心设计是 **progressive disclosure**：技能的全部 body 不放进 prompt，只在系统提示里注入
-一个紧凑的 `<available_skills>` 索引（名字+描述，按category分组），模型看到相关技能后调用
-`skill_view` 工具获取完整指令——这叫 tier 1→tier 2 的两级展开，Hermes 也是这样做的。
-
-用户可以通过 `/skill-name instruction` 显式调用，`_maybe_route_skill` 把斜杠命令解析成
-`SkillRouter.invocation_message` 注入到当前轮次的用户输入里。
-
-整个技能的 discover→register→index→view 流程都是通过现有的 `Tool` Protocol 和显式构造的
-`ToolRegistry`，Hermes 那种全局单例 + AST 发现模式没搬过来。
-
-另外，为了同时支持技能索引注入和后来的 MCP 工具指导，我先把 `ContextBuilder` 从"一条静态字
-符串"升级成了 `SystemPromptBuilder` + `PromptContributor` 缝：`ContextBuilder` 构造时接受
-一个 `SystemPromptBuilder`（或普通 str 保持向后兼容），每轮 `build()` 实时调用
-`prompt_builder.build()` 渲染系统提示——所以技能索引会随加载的技能集合变化，但原始的会话
-消息列表完全不碰，source-of-truth 不变式不改。"
-
-## Milestone 5 — 动态系统提示词的实际内容（identity / behaviour / model / environment）
-
-### Problem and goal
+#### Problem and goal
 
 Milestone 4 把 `ContextBuilder` 升级成了 `SystemPromptBuilder` + `PromptContributor`
 的缝，但真正的系统提示词内容一直是残缺的：`DEFAULT_IDENTITY` 只有一句话
@@ -1675,7 +1536,7 @@ Milestone 4 把 `ContextBuilder` 升级成了 `SystemPromptBuilder` + `PromptCon
 **真正拥有的能力对应的那几段** 补齐，其余（长期记忆、session_search、USER.md、SOUL.md、
 context files、kanban、computer-use、平台提示、Nous 品牌）坚决不写进去。
 
-### Relevant Hermes behavior and source
+#### Relevant Hermes behavior and source
 
 Hermes 在 `agent/system_prompt.py:build_system_prompt_parts` 里把提示词分成三层
 （stable / context / volatile），每层用"条件 append + 丢空串 + `\n\n` join"的方式组装：
@@ -1687,7 +1548,7 @@ Hermes 在 `agent/system_prompt.py:build_system_prompt_parts` 里把提示词分
 
 Aegis 的 `SystemPromptBuilder` 本质就是这套"有序 contributor + 丢空 + join"的泛化版。
 
-### Migration decision: ADAPT
+#### Migration decision: ADAPT
 
 文本块（finishing the job / tool-use enforcement / WSL hint / 模型身份行）从 Hermes
 **改写去品牌**后照搬语义；identity 是 REWRITE（去掉 Nous 和 docs URL）；`_is_wsl`
@@ -1697,7 +1558,7 @@ Aegis 的 `SystemPromptBuilder` 本质就是这套"有序 contributor + 丢空 +
 `build_environment_hints` 的 remote-backend 分支（docker/ssh/modal）不搬——Aegis 没有
 远程终端后端。
 
-### Aegis design and data flow
+#### Aegis design and data flow
 
 新增 `src/aegis_agent/context/prompt_sections.py`，五个 `PromptContributor`：
 
@@ -1714,7 +1575,7 @@ identity → task-completion → tool-use →（技能索引）→（MCP 提示�
 每个 contributor 都持有活的依赖（registry / provider），每轮 `build()` 重新渲染，所以提示
 词跟随当前状态变化；但 `run_turn` 和"原始消息不可变"不变式一个字没动——这些只影响派生视图。
 
-### Key files
+#### Key files
 
 - `src/aegis_agent/context/prompt_sections.py`（新）—— 五个 contributor + 文本常量 + `_is_wsl`；
 - `src/aegis_agent/context/system_prompt.py` —— 重写 `DEFAULT_IDENTITY`；
@@ -1722,7 +1583,7 @@ identity → task-completion → tool-use →（技能索引）→（MCP 提示�
 - `src/aegis_agent/context/__init__.py` —— re-export；
 - `tests/test_prompt_sections.py`（新）—— 14 个测试。
 
-### Reliability invariants, edge cases, and failure handling
+#### Reliability invariants, edge cases, and failure handling
 
 - 无工具 → 行为两段消失；fake provider → 无模型身份行；无技能 → 无索引段（已有测试覆盖）；
 - 组合顺序有测试断言（identity < finishing < enforcement < host < started）；
@@ -1730,21 +1591,21 @@ identity → task-completion → tool-use →（技能索引）→（MCP 提示�
   `USER.md` / `persistent memory` 等 Aegis 不支持的子系统词；
 - date-only 时间戳保证系统提示词一天内字节稳定（prompt-cache 友好）。
 
-### Tests
+#### Tests
 
 `uv run pytest -q tests/test_prompt_sections.py`（14 passed）；
 回归 `test_skills_prompt` / `test_context_invariants`（32 passed）、
 `test_runtime` / `test_cli` / `test_tui`（21 passed）。
 `uv run ruff check`（改动文件全过）、`uv run mypy src`（改动文件无新增错误）。
 
-### Trade-offs, remaining limitations, and TODOs
+#### Trade-offs, remaining limitations, and TODOs
 
 - tool-use enforcement 不按模型家族门控，是有意简化；若将来接入更多真实 provider，
   可以把 Hermes 的 `TOOL_USE_ENFORCEMENT_MODELS` 匹配表补上；
 - 没有 context-files / memory / user-profile 段，符合当前里程碑边界；
 - 仓库里 `mcp/client.py`、`cli.py` 有先前遗留的 ruff/mypy 告警，与本次改动无关，未触碰。
 
-### Interview summary
+#### Interview summary
 
 "这一步是把之前搭好的 `SystemPromptBuilder` 缝真正填满内容。我先读了 Hermes 怎么动态
 拼系统提示词——它分 stable/context/volatile 三层，每层条件 append、丢空串、`\n\n` join。
@@ -1756,9 +1617,9 @@ session_search、SOUL、context files 这些 Aegis 还没有的东西，我特�
 
 ---
 
-## Milestone 6 — 个人级长期记忆（Stage 1：存储格式 + MEMORY.md 索引注入 + 行为提示词）
+### Milestone 14 — Stage 14：个人级长期记忆（Memory Stage 1：存储格式 + MEMORY.md 索引注入 + 行为提示词）
 
-### Task goal and the original problem
+#### Task goal and the original problem
 
 给 Aegis 加**跨会话的个人长期记忆**。本阶段**只做个人级**，且只做读侧三件事：
 （1）Memory 存储格式，（2）`MEMORY.md` 索引注入，（3）Memory 行为提示词。
@@ -1766,7 +1627,7 @@ session_search、SOUL、context files 这些 Aegis 还没有的东西，我特�
 embedding / 向量库、Project / Team Memory、autoDream。参考文档是
 `Claude-Code/docs/08-memory.md`（即 Claude Code 的 `src/memdir/*`）。
 
-### 参考行为与来源（Claude Code，不是 Hermes）
+#### 参考行为与来源（Claude Code，不是 Hermes）
 
 - `src/memdir/paths.ts:getAutoMemPath` —— 记忆目录解析；
 - `src/memdir/memoryTypes.ts` —— 四类记忆（user/feedback/project/reference）与"存什么/不存什么"文案；
@@ -1776,14 +1637,14 @@ embedding / 向量库、Project / Team Memory、autoDream。参考文档是
 
 因为源在 Claude Code，本阶段是**行为再实现（ADAPT/original）**，不是代码 port。
 
-### Migration decision
+#### Migration decision
 
 - **paths / types / store / prompt**：ADAPT —— 复刻可观察行为（目录布局、四类型、截断上限、
   索引/正文分离、行为规则），但只保留个人级，砍掉 settings 覆盖链、git-root 规范化、
   `~/.ssh` 安全护栏（Aegis 目前没有"不可信项目级 settings"这个来源）、project/team 目录。
 - **runtime / cli / tui 接线**：original。
 
-### Aegis 设计、数据流与关键接口
+#### Aegis 设计、数据流与关键接口
 
 目录布局（个人级）：
 
@@ -1822,7 +1683,7 @@ AgentRuntime.with_defaults(enable_memory=True, memory_home=...)
 段落顺序：行为准则 → skills → mcp → **memory 三段** → 模型身份 → 环境 → 时间戳。
 `USER.md` 段在 `MEMORY.md` 段之前，且各自带清晰不同的标题，语义不混。
 
-### Reliability invariants / edge cases / failure handling
+#### Reliability invariants / edge cases / failure handling
 
 - 文件缺失/空/不可读 → 对应段 `render()` 返回 `None`，被 builder 丢弃，**不影响启动**；
 - `MEMORY.md` 超 200 行或 25 KB → 安全截断并追加"可能不完整"提示（对齐 Claude）；
@@ -1831,7 +1692,7 @@ AgentRuntime.with_defaults(enable_memory=True, memory_home=...)
   （有专门测试守这条线）；
 - `USER.md` 与 Auto Memory 分开处理，前者不当普通 Memory。
 
-### Tests、结果
+#### Tests、结果
 
 新增 `tests/test_memory.py`（27 项）：路径解析与 `$AEGIS_HOME`/`$AEGIS_MEMORY_DIR` 覆盖、
 四类型解析、frontmatter 解析、行/字节截断、存在/缺失注入、USER.md vs MEMORY.md 语义区分、
@@ -1847,14 +1708,14 @@ runtime 接线 + `--no-memory`、以及"记忆不影响会话持久化"。更新
   `test_web_tools::test_web_extract_blocks_private_url`（真实 Tavily 网络调用返回 400）、
   以及被本次有意更新的 `test_prompt_sections` 旧排他断言（已改）。
 
-### Trade-offs、限制与 TODO
+#### Trade-offs、限制与 TODO
 
 - 本阶段**只有读侧**：不自动写记忆、不自动召回、不做 embedding；
 - `parse_memory_file`/`MemoryEntry` 已就绪但暂无消费者，为下一阶段召回预留；
 - 未做 Project / Team Memory，但 `MemoryType` 四类已按 Claude 对齐，可直接复用；
 - 未移植 `~/.ssh` 安全护栏——等 Aegis 引入"项目级 settings"这类不可信来源时再补。
 
-### Interview summary
+#### Interview summary
 
 "这步给 Aegis 加个人级长期记忆，但我严格只做读侧三件事：存储格式、`MEMORY.md` 索引注入、
 行为提示词。核心照搬 Claude Code 的两条设计——**索引/正文分离**（常驻上下文的只有目录页，
@@ -1866,9 +1727,9 @@ runtime 接线 + `--no-memory`、以及"记忆不影响会话持久化"。更新
 
 ---
 
-## Milestone 7 — 记忆相关性召回 + 后台自动提取（Stage 2/3，个人级）
+### Milestone 15 — Stage 15：记忆相关性召回 + 后台自动提取（Memory Stage 2/3，个人级）
 
-### Task goal and the original problem
+#### Task goal and the original problem
 
 第一阶段已有「存储格式 + `MEMORY.md` 索引注入 + 行为提示词」。本阶段一次性补齐 Claude Code
 Auto Memory 的两条**动态**通道，仍然只做个人级：
@@ -1879,7 +1740,7 @@ Auto Memory 的两条**动态**通道，仍然只做个人级：
 
 **明确不做**：embedding / Vector DB、Project / Team Memory、autoDream、复杂 Memory Eval。
 
-### 参考行为与来源（Claude Code）
+#### 参考行为与来源（Claude Code）
 
 - `src/memdir/memoryScan.ts:scanMemoryFiles` / `formatMemoryManifest` —— 只读 frontmatter 的
   轻量扫描 + 紧凑清单，上限 200 文件；
@@ -1891,12 +1752,12 @@ Auto Memory 的两条**动态**通道，仍然只做个人级：
   提取提示词；
 - `src/query/stopHooks.ts` / `src/query.ts:301/1599` —— 召回预取/收集、最终回复后触发提取。
 
-### Migration decision
+#### Migration decision
 
 全部 **ADAPT（行为再实现）**，因为源在 Claude Code（TS）而非 Hermes；`sidequery.py`、
 `runtime/cli` 接线为 **original**。三处刻意简化见下。
 
-### Aegis 设计、数据流与关键接口
+#### Aegis 设计、数据流与关键接口
 
 **Recall 调用链：**
 
@@ -1924,7 +1785,7 @@ run_turn → 正常 FINAL_ANSWER 后 → MemoryManager.after_turn(session_id, me
   → 推进游标到最新消息 client_msg_id
 ```
 
-### 与 Claude Code 的对应关系 & 简化
+#### 与 Claude Code 的对应关系 & 简化
 
 | 维度 | Claude Code | Aegis |
 |---|---|---|
@@ -1939,7 +1800,7 @@ run_turn → 正常 FINAL_ANSWER 后 → MemoryManager.after_turn(session_id, me
 正文单文件/总量上限、游标只审新增消息、主 Agent 已写则跳过、`MEMORY.md` 只存索引且幂等去重、
 extractor 失败不影响主回答。
 
-### 可靠性不变量 / 边界 / 失败处理
+#### 可靠性不变量 / 边界 / 失败处理
 
 - 召回/提取任意失败（provider 异常、JSON 解析失败、坏文件、文件消失）→ 记 debug 日志，**绝不影响主流程**；
 - 只塑形派生 context / 只写 memory 目录，**原始会话历史与 session/resume/持久化不变式完全不碰**；
@@ -1947,7 +1808,7 @@ extractor 失败不影响主回答。
 - 游标失效安全回退（最近 12 条），不会永久停摆；有消息无 client_msg_id 时用最后一条有 id 的推进；
 - interrupted / error 轮次不跑提取（partial turn 不进记忆），但 recall block 仍会清掉防泄漏。
 
-### Tests 与结
+#### Tests 与结
 
 新增 `tests/test_memory_recall.py`（17 项）+ `tests/test_memory_extract.py`（14 项），覆盖两份
 验收清单全部 12+12 条。
@@ -1957,7 +1818,7 @@ extractor 失败不影响主回答。
 - `uv run ruff check`（memory 包 + 改动文件）→ **All checks passed**；
 - `uv run mypy src` → memory 包与 runtime **无新增错误**（既有 cli/mcp/sessions 历史告警与本次无关）。
 
-### Trade-offs、限制与 TODO
+#### Trade-offs、限制与 TODO
 
 - 提取是**同步** best-effort，非后台线程/fork —— 后续优化项，非行为需求；
 - 未实现主动 Read 检测去重（`note_surfaced` 已留接口，接入 Read 工具后即可用）；
@@ -1965,7 +1826,7 @@ extractor 失败不影响主回答。
 - 仅个人级，`project` type 在提取侧被主动拒绝（enum 已就绪，供后续项目级复用）；
 - 未做 embedding / 向量召回（严格按要求）。
 
-### Interview summary
+#### Interview summary
 
 "第二三阶段我给个人级记忆补上了两条动态通道：召回和提取，但都严格照 Claude Code 的调用链走，
 不自己发明架构。召回是 scan→manifest→side query→校验文件名→只读选中正文→注入 '## Relevant
@@ -1978,9 +1839,9 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 
 ---
 
-## Milestone 7 补记 — 召回/提取异步化（对齐 Claude 的 fire-and-forget + 预取/收集）
+#### Stage 15 补记 — 召回/提取异步化（对齐 Claude 的 fire-and-forget + 预取/收集）
 
-### 改了什么
+##### 改了什么
 
 上一版召回和提取都是**同步**的（召回挡在首轮模型调用前，提取挡在 `run_turn` 返回前）。本轮改成
 后台异步，对齐 Claude Code 的调用链：
@@ -1993,7 +1854,7 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 - **提取**：`after_turn` 不再同步跑，改为把任务快照入队（fire-and-forget），由**单个 worker 线程**
   串行消费；新增 `drain()` 在 CLI 退出前等待未完成工作落盘。
 
-### 锁的结论（回答「写入 md 有没有锁」）
+##### 锁的结论（回答「写入 md 有没有锁」）
 
 - Aegis 单文件写用 `atomic_write`（mkstemp + fsync + `os.replace`）是**原子替换**，能保证不写坏
   文件，但**不是锁**——并发会「后写覆盖先写」。
@@ -2005,7 +1866,7 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
   提取写盘天然串行，不再需要文件锁。文件写层面 Aegis 的 `os.replace` 原子写其实**不弱于甚至强于**
   Claude 的 Node `fs`。
 
-### 与 Claude 的对齐点 / 差异
+##### 与 Claude 的对齐点 / 差异
 
 | 维度 | Claude | Aegis（异步化后） |
 |---|---|---|
@@ -2016,7 +1877,7 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 | 提取串行 | stash 队列 | 单 worker 线程 + 队列 |
 | 退出 drain | `drainPendingExtraction`（-p 最多等 60s） | `runtime.shutdown()` → `manager.drain()` |
 
-### 改动文件
+##### 改动文件
 
 - `memory/manager.py`：`_SessionState.pending_recall`（`Future`）、`_ExtractTask`、线程池 + 提取
   队列/worker、`before_turn`/`collect_recall`/`after_turn`/`drain` 重写；
@@ -2024,14 +1885,14 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 - `cli.py`：退出路径 `runtime.shutdown()`（`runtime` 提为 `AgentRuntime | None`）；
 - 测试：3 处加 `drain()` / `collect_recall()` 显式等待（异步语义下不能立即断言）。
 
-### 测试与结果
+##### 测试与结果
 
 - `uv run pytest tests/test_memory_recall.py tests/test_memory_extract.py tests/test_memory.py -q` → **58 passed**；
 - 回归（prompt/runtime/streaming/cli/tui/context_invariants/sessions/sqlite）→ **130 passed**；
 - `uv run ruff check`（memory 包 + runtime + cli）→ 仅 cli 既有告警，新代码零告警；
 - `uv run mypy src` → memory 包与 runtime **无新增错误**（既有 14 个历史告警不变）。
 
-### 遗留 / TODO
+##### 遗留 / TODO
 
 - `RelevantMemoriesContributor` 的 set/clear/render 全部在主线程，故未加锁（召回线程只通过
   `Future` 返回结果，不碰 contributor）——若将来 contributor 被后台线程直接写，需补锁；
@@ -2042,9 +1903,9 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 
 ---
 
-## Milestone 7 补记二 — 跨进程写冲突检测（mtime staleness check，对齐 Claude FileWrite）
+#### Stage 15 补记二 — 跨进程写冲突检测（mtime staleness check，对齐 Claude FileWrite）
 
-### 为什么做
+##### 为什么做
 
 上一版 memory 写盘是「原子但不检测冲突」：两个 Aegis 窗口（两个进程）同时提取时，后写者会
 静默覆盖先写者，索引 `rebuild_index` 会丢条目。查证 Claude 源码后确认，**Claude 的常规提取也
@@ -2053,7 +1914,7 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 写前对比文件当前 mtime 和本进程上次读取时间，变了就抛 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`。
 （Claude 里唯一真正的跨进程锁是 autoDream 专用的 `consolidationLock.ts`，常规提取不用。）
 
-### 做了什么
+##### 做了什么
 
 在 Aegis 的 memory 写入口 `write_memory_file` 复刻这个乐观并发检查：
 
@@ -2063,7 +1924,7 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 - `write_memory_file` 写前：若目标存在且当前 mtime > 记录值 → 抛 `ValueError`（`apply_actions`
   捕获后跳过该 action），否则原子写并刷新记录。
 
-### 与 Claude 的对齐 / 局限（一致）
+##### 与 Claude 的对齐 / 局限（一致）
 
 | 维度 | 行为 |
 |---|---|
@@ -2072,13 +1933,13 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 | 性质 | 乐观并发 + 冲突检测，**不是锁**——不串行化写者，只检测到就拒绝 |
 | mtime 精度 | 秒级/亚秒级精度局限与 Claude 相同 |
 
-### 测试
+##### 测试
 
 新增 `TestStalenessCheck`（3 项）：外部改动后拒绝写、本进程未变则正常写、新文件不检查。
 `uv run pytest tests/test_memory_extract.py tests/test_memory_recall.py tests/test_memory.py -q` → **61 passed**；
 回归（含 write_file/patch）→ **149 passed**；ruff/mypy 干净。
 
-### 结论
+##### 结论
 
 对齐 Claude 的「常规提取」跨进程行为：进程内串行（单 worker）+ 写文件 mtime 冲突检测，无锁文件。
 用户诉求「先写存、后写提示」在当前个人级、best-effort 语义下，以「后写者检测到冲突 → 跳过本轮
@@ -2086,63 +1947,62 @@ memories'，全程 best-effort，失败就当作没召回。注入我用了 Aegi
 锁文件。
 ---
 
-## 工具执行协作式中断（is_cancelled 轮询）
+#### Stage 15 补记三 — 缓存友好的固定锚点 Recall Attachment
 
-### 为什么做
+##### 原始问题与参考来源
 
-交互式 REPL 里 Ctrl+C 只能「杀进程」：CLI 的 `interrupt` 事件只接跨进程 lease 丢失，SIGINT 默认
-抛 `KeyboardInterrupt`（`BaseException`），而 `call_tool`/`executor` 只 `except Exception`，于是
-KeyboardInterrupt 一路穿透、整个进程退出。用户实测：`mcp_paper_search_search_papers`
-（`sources:"all"`）聚合多个上游源，慢到触到 180s 超时，期间无任何进度、无优雅取消，只能 `^C`
-杀掉。问题不止 MCP——`terminal`（最长 600s）、`process wait`（最长 180s）、`web_search/extract`
-（网络）同样无法被 Ctrl+C 打断。
+异步召回原先通过 `RelevantMemoriesContributor` 改写 system prompt。它不会产生孤立
+`tool` 消息，但召回完成前后的 system bytes 不同，会把 prompt-cache miss 提前到历史之前。
+只读调查确认 Claude Code 将 `relevant_memories` 转成尾部 `isMeta user` attachment，并在
+收集时固定位置；Hermes 则把 `<memory-context>` 追加到本轮 user message，且明确避免修改
+稳定 system prompt。本次采用 **COMBINED ADAPTATION**：复用 Claude Code 的异步收集与固定
+位置语义，结合 Hermes 的非-tool user-context 语义；Python 实现为 Aegis 独立编写，没有复制
+参考源码。
 
-### 做了什么
+##### Aegis 设计与数据流
 
-给工具层加一条与模型流一致的协作式中断路径（对齐 `events.collect_response` 的 `is_cancelled`
-模式），Ctrl+C 优雅取消当前工具、回到 `❯`，而不是杀进程：
+`MemoryManager.before_turn` 仍把 recall 提交线程池。`collect_recall` 不再写 system contributor，
+而是在 Future 完成时返回一次已定型的 `## Relevant memories` block，并立即消费 Future。
+`AgentRuntime.run_turn` 在该时刻记录当前持久消息数量作为 anchor，创建一条仅存在于当前
+`run_turn` 的 `Role.USER` 消息。以后每次从原始历史构造派生上下文时，都在相同 boundary 插入
+同一个 attachment；更晚产生的 assistant/tool 消息排在它之后。因此 attachment 在逻辑上只
+出现一次，却会随完整上下文在后续请求中稳定重放。回合结束后局部变量自然释放，数据库、恢复
+历史和提取输入都不含该消息。
 
-- **`tools/registry.py`**：`ToolContext` 加 `is_cancelled: Callable[[], bool] | None` 字段
-  （frozen dataclass 新增可选字段，向后兼容），ambient 取消信号，模型不可设。
-- **`tools/executor.py`**：`execute`/`execute_one` 接受 `is_cancelled`；用 `dataclasses.replace`
-  注入 context；执行前预检、执行中 `except OperationCancelled: raise`（区别于「工具报错→error result」，
-  取消要穿透到 runtime 而非落一个假 error 结果）。
-- **`runtime.py`**：把 `is_cancelled` 从循环内提到循环外，同时传给 `collect_response`（模型流）和
-  `executor.execute`（工具）；工具执行 `except OperationCancelled → INTERRUPTED`，不持久化半成品工具结果。
-- **`mcp/client.py`**：`_run_on_loop` 轮询循环里（每次 `future.result(timeout=0.1)` 之间）检查
-  `is_cancelled`，置位即 `future.cancel()` 并抛 `OperationCancelled`；`call_tool` 透传并 re-raise。
-- **`mcp/tools.py`**：`MCPToolWrapper.run` 把 `context.is_cancelled` 传给 `call_tool`。
-- **`terminal.py`**：前台 `subprocess.run` 改为 `Popen` + `_wait_and_drain`（`communicate(timeout=0.2)`
-  增量排水，避免满管道死锁；每次迭代查 cancel/deadline，cancel 先 kill 再抛 `OperationCancelled`），
-  超时语义不变（`exit_code 124`）。
-- **`process_registry.py` / `process.py`**：`wait()` 加 `is_cancelled`，轮询循环里置位即抛。
-- **`web/backends.py` + `web_search/web_extract.py`**：`web_search`/`web_extract` 及 ddgs 迭代循环、
-  逐 URL 之间轮询 `_check_cancelled`；`except OperationCancelled: raise` 避免被兜底 `except Exception` 吞掉。
-- **`cli.py`**：装 `SIGINT` handler——turn 运行时第一次 Ctrl+C 只 `interrupt.set()`（优雅取消），第二次
-  Ctrl+C 抛 `KeyboardInterrupt`（强制退出兜底）；空闲时保持默认 `KeyboardInterrupt`（退出 REPL）。
-  每次 turn 前 `interrupt.clear()`（Ctrl+C 是瞬态），lease 丢失另用 `lease_lost` 持久标记、不清，
-  避免「上一个取消信号误杀下一条消息」也避免「租约丢失后继续写」。
+##### 可靠性、边界与权衡
 
-### 测试
+- Recall 不使用 `Role.TOOL`，不需要 `tool_call_id`，不会形成孤立 tool result。
+- 固定 anchor 同时保持因果顺序和缓存前缀；不能在每次迭代重新追加到最新尾部。
+- `render_recall_block` 明示内容是历史上下文而非新用户指令，并保留 stale-data 警告。
+- 原始消息仍是事实源，attachment 不持久化；中断、错误和下一用户轮次均不会泄漏。
+- attachment 在压缩前进入派生列表，以保持与 source-history boundary 的确定关系；真正触发
+  compaction 时上下文本来就可能改变，后续可为 transient/meta 消息增加显式压缩保护标记。
+- `RelevantMemoriesContributor` 被删除，避免未来重新把动态 recall 放回 system prompt。
 
-新增 4 项：终端前台取消抛 `OperationCancelled`；工具抛取消 → runtime `INTERRUPTED` 且不落工具结果；
-executor 预取消先抛；executor 把 `is_cancelled` 注入 context。
-`HOME=$(mktemp -d) uv run pytest -q` → **440 passed, 2 skipped**（跳过项为 opt-in integration）。
-`uv run ruff check .` 剩 4 个**改动前已存在**的告警（cli.py `F821 _print_session_list`、`DTZ005/006`、
-`mcp/client.py SIM115`），本次未引入新告警。
+##### 文件、验证与结果
 
-### 结论 / 局限
+- `memory/manager.py`：`collect_recall() -> str | None`，一次性返回召回块；
+- `runtime.py`：固定 boundary 的 transient-context overlay；
+- `memory/retriever.py`：补充“context, not new user instructions”边界；
+- `tests/test_memory_recall.py`：两次工具调用回归，验证位置固定、只出现一次且不落库；
+- `memory/prompt.py`：移除不再使用的 stateful recall contributor。
 
-MCP / terminal / process wait 这类「Python 轮询等待」的工具现在可被 Ctrl+C 亚秒级取消并回到提示符，
-不再杀进程、不污染历史（半成品工具结果不持久化）。局限：模型流若卡在**不可轮询的阻塞网络读**上，
-第一次 Ctrl+C 只能置位事件、无法立刻打断该次读——用「第二次 Ctrl+C 强制退出」兜底（对齐常见 CLI 的
-双击退出约定）。web 的单个 httpx 请求仍受其自身 30s 超时约束（只在请求之间可取消）。
+定向 memory recall/extract 测试为 **35 passed**；全量测试为 **813 passed, 3 skipped**；
+`uv run ruff check .` 通过。定向 mypy 暴露的是 `runtime.py` 中既有的两个 `object`
+manager 属性告警，与本改动无关。
+
+##### Interview summary
+
+“异步召回本身没问题，问题是把动态正文放进 system prompt 会过早截断缓存。我保留非阻塞
+Future，但让 manager 只返回一次召回块；runtime 在召回完成时把它作为临时 user context 固定
+在当时的历史边界。后续工具轮次继续在其后增长，而不是把记忆反复移动到尾部。这样既没有
+tool-call 配对风险，也不污染数据库，并让 system prompt 与既有历史保持稳定缓存前缀。”
 
 ---
 
-## session_search：SQLite + FTS5 历史会话检索
+### Milestone 16 — Stage 16：session_search（SQLite + FTS5 历史会话检索）
 
-### 为什么做
+#### 为什么做
 
 Aegis 已具备 SQLite 会话持久化（幂等消息、快照+尾部恢复、会话租约），但**没有检索历史聊天
 的能力**。用户问「我们之前是怎么处理 X 的 / 上次聊到哪里了」时，Agent 只能靠 web 搜索或文件
@@ -2153,7 +2013,7 @@ Aegis 已具备 SQLite 会话持久化（幂等消息、快照+尾部恢复、�
 能力——`session_search` 查的是原始 messages，Auto Memory 读的是 `~/.aegis/memory/*.md`。明确不做：
 FTS5 用到 memory 文件、改长期记忆 recall、embedding / 向量库 / LLM rerank / 混合检索 / Project Memory。
 
-### Hermes 行为与源码位置
+#### Hermes 行为与源码位置
 
 - `hermes_state.py` `SessionDB`：`FTS_SQL`/`FTS_TRIGRAM_SQL`（虚拟表 + 同步触发器，行 id 即
   rowid，正文 = content || tool_name || tool_calls）；`_ensure_fts_schema`/`_rebuild_fts_indexes`
@@ -2164,7 +2024,7 @@ FTS5 用到 memory 文件、改长期记忆 recall、embedding / 向量库 / LLM
   `SESSION_SEARCH_SCHEMA` + registry 注册 + `check_session_search_requirements`。
 - `tests/tools/test_session_search.py`：四态行为 + schema + FTS 生命周期测试。
 
-### 迁移决策
+#### 迁移决策
 
 **整体搬运 + 最小 Aegis 适配**（ADAPT port）。FTS 的 DDL、触发器同步、BM25 检索、CJK 降级、
 锚点窗口 / bookends、工具四态推断全部照搬；只做最薄的 schema 与 API 适配：
@@ -2175,7 +2035,7 @@ FTS5 用到 memory 文件、改长期记忆 recall、embedding / 向量库 / LLM
 - 工具侧丢弃 `profile` 参数、跨 profile 读取、`@session:<profile>/<id>` 自动拆分、压缩链
   `_resolve_to_parent`（恒等）、scroll 的 lineage rebind——Aegis 无 profile、无压缩链（不 fork 会话）。
 
-### Aegis 设计、数据流与关键接口
+#### Aegis 设计、数据流与关键接口
 
 **写入 → 索引同步**：`append_message` 走 `_execute_write`（BEGIN IMMEDIATE 事务）INSERT messages，
 同一事务里 FTS 触发器 `AFTER INSERT/UPDATE/DELETE ON messages` 把 `rowid=id, content=...` 写进
@@ -2201,7 +2061,7 @@ browse/discovery 跳过、scroll 拒绝当前会话（那些消息已在上下�
 session_search.py`（`SessionSearchTool` + `session_search`）；`tools/builtin/__init__.py`（按仓库能力注册）；
 `tools/registry.py`（`ToolContext.session_id`）、`tools/executor.py`、`runtime.py`（session_id 注入）。
 
-### 可靠性不变式、边界与失败处理
+#### 可靠性不变式、边界与失败处理
 
 - **写→索引一致**：FTS 触发器与 messages INSERT 同事务，不存在分裂。
 - **幂等**：FTS 表/触发器 `IF NOT EXISTS`；重复 init 不重复建、不重复回填（回填前先 DELETE）。
@@ -2215,7 +2075,7 @@ session_search.py`（`SessionSearchTool` + `session_search`）；`tools/builtin/
 - **不破坏现有能力**：resume / snapshot+tail / 消息幂等 / lease / Auto Memory 全部不动——FTS 是
   纯新增的读路径 + 触发器，不改 `append_message` 主链路；恢复/快照/幂等测试全绿。
 
-### 测试
+#### 测试
 
 新增 `tests/test_session_search.py`（49 项，改编自 Hermes + 新增 FTS 生命周期）：
 
@@ -2233,7 +2093,7 @@ tests/test_session_lease.py tests/test_tools.py -q` → **98 passed**。全量 `
 `uv run ruff check .`（改动文件）干净；`uv run mypy src` 改动文件无新增错误（余 10 个为改动前已存在的
 其它文件告警）。
 
-### 结论 / 局限
+#### 结论 / 局限
 
 Hermes 原版 FTS5 会话检索能力已稳定迁入 Aegis，且与 Auto Memory 职责分离（本工具查真实历史聊天，
 不碰 `memory/*.md`）。局限：Aegis 无 profile / 压缩链，故丢弃了跨 profile 读取与 lineage 去重（对单
@@ -2243,9 +2103,9 @@ Hermes 的 trigram + LIKE 降级（无 embedding）。后续若做 `FTS5 + LLM r
 
 ---
 
-## 交互式斜杠命令套件（/save、/new、/undo 等）
+### Milestone 17 — Stage 17：交互式斜杠命令套件（/save、/new、/undo 等）
 
-### 为什么做
+#### 为什么做
 
 Hermes 运行时在 REPL 里提供一整套 `/命令`：导出会话调试快照（/chatlog）、开新会话（/new、
 /clear）、看历史（/history）、撤回与重试（/undo、/retry）、标题与列表（/title、/sessions）等。
@@ -2258,7 +2118,7 @@ Aegis 此前只有裸 `exit`/`quit`，这些日常操作都不可用。本阶段
 边界（CLAUDE.md §5）：只迁 REPL 面对的命令。Hermes 注册表里 gateway/Telegram/Slack 分发、
 /model、/cron、/kanban、浏览器/语音/图片、皮肤、自动更新等产品命令全部不迁。
 
-### Hermes 行为与源码位置
+#### Hermes 行为与源码位置
 
 - `hermes_cli/commands.py`：`CommandDef` + `COMMAND_REGISTRY` 中央注册表（所有消费方——CLI help、
   gateway 分发、自动补全——共用同一份数据）；`resolve_command` 别名解析；`SlashCommandCompleter`。
@@ -2270,7 +2130,7 @@ Aegis 此前只有裸 `exit`/`quit`，这些日常操作都不可用。本阶段
 - `hermes_state.py` `SessionDB`：`rewind_to_message`（软删除截断）、`set_session_title`、
   `sanitize_title`。
 
-### 迁移决策
+#### 迁移决策
 
 **逐命令 ADAPT + 少量 REWRITE**，不做整体搬运：Hermes 的分发器长在 16k 行的 `cli.py` 巨类里，
 直接整文件迁移会把大量越界产品功能带进来。具体决策：
@@ -2285,7 +2145,7 @@ Aegis 此前只有裸 `exit`/`quit`，这些日常操作都不可用。本阶段
 - 分发器做成 UI 无关的 `SlashHandler`（输出走 `emit` 回调、会话轮换走 `rotate_session` 回调），
   不依赖 Typer/Rich/TTY，可纯单测；runtime 不 import 它（保持 cli → runtime 单向依赖）。
 
-### Aegis 设计、数据流与关键接口
+#### Aegis 设计、数据流与关键接口
 
 **分发**：`cli._repl` 对 `/` 开头的行先问 `SlashHandler.handle(line)`——命中注册表则执行并返回
 `SlashResult(kind=HANDLED/REQUEUE/EXIT)`；未命中返回 `None`，落回既有的 skill 路由再进模型
@@ -2315,7 +2175,7 @@ recall/extract 的旁路调用覆盖会话捕获。`/save` 写 `NN-local.json`�
 `system_prompt` 只读属性）；`tui.py`（`prompt(default=)`、`out`、`clear_screen`）；`cli.py`
 （REPL 分发 + `_rotate_session`；provider 包装）。
 
-### 可靠性不变式、边界与失败处理
+#### 可靠性不变式、边界与失败处理
 
 - **原始消息不被物理删除**：undo/retry 只置 `active=0`；审计行保留，FTS 检索默认排除。
 - **快照失效**：rewind 递增 `history_version`，旧快照恢复自动降级全量重放（有测试覆盖）。
@@ -2325,7 +2185,7 @@ recall/extract 的旁路调用覆盖会话捕获。`/save` 写 `NN-local.json`�
 - **租约获取失败**：`/new` 留在旧会话并报错，不会半轮换。
 - **命令层崩溃隔离**：所有导出路径捕获 OSError 并输出错误，debug 命令绝不弄挂 REPL。
 
-### 测试
+#### 测试
 
 新增 `tests/test_slash_commands.py`（36 项）：注册表/别名/未知 token 回落、help 完整性、标题清洗、
 /save 三件套导出内容与数字前缀递增 + 首轮前回退 + 空会话、/chatlog 别名等价、/history 渲染与
@@ -2347,7 +2207,7 @@ SSRF 门，前置条件本就应该是「未配置付费 key」。
 均为 master 既有，本次未触碰）；本次新代码零告警。`uv run mypy src` → 10 errors in 6 files，
 与改动前基线数量一致（无新增）。
 
-### 结论 / 局限
+#### 结论 / 局限
 
 Hermes 交互式斜杠命令的 CLI 子集已可用：`/save` 按用户决策实现为 Hermes `/chatlog` 的三件套调试
 导出（`/chatlog` 保留为别名；Hermes 原版 `/save` 的 JSON 快照导出未采用），/history、/new、
@@ -2357,7 +2217,7 @@ prompt_toolkit 自动补全（Hermes 有 SlashCommandCompleter）；`/undo` 的�
 留待后续阶段；Hermes 的 `/undo` 还会通知 memory provider 并做 agent 内部状态手术，Aegis 的
 memory manager 无对应钩子，暂未联动。
 
-### 后续修复：空会话不可 resume
+#### 后续修复：空会话不可 resume
 
 实测发现：启动后未发消息直接退出时，退出提示 `Resume: aegis --resume <id>` 实际会报
 "session not found"——会话行是懒创建的（首条消息的 `run_turn` 才落库），0 条消息时 DB 里根本没有
@@ -2366,9 +2226,443 @@ memory manager 无对应钩子，暂未联动。
 
 ---
 
-## Milestone 9 — 项目级长期记忆（Project Memory scope）
+### Milestone 18 — Stage 18：交互式 TTY / TUI 渲染与滚动修复
 
-### Task goal and the original problem
+#### Stage 18 addendum — interactive TTY rendering polish
+
+##### Problem and goal
+
+用户反馈当前 Aegis CLI 界面“各种渲染”比较弱，至少应该支持特殊字体、高亮和代码显示；同时输入框在普通终端 scrollback 中，滚轮翻历史时会跟着输出一起移动。目标是参考 Claude Code CLI 的界面体验，先在 Aegis 现有 Python 架构里提升 TTY 渲染质量与输入提示，而不是迁移 Claude Code 的 TypeScript/Ink/React UI 栈。
+
+##### Relevant Hermes and/or Claude Code behavior and source locations
+
+- Claude Code `src/components/Markdown.tsx` / `src/utils/markdown.ts`：Markdown token 渲染、纯文本 fast path、streaming markdown 的稳定前缀思路。
+- Claude Code `src/components/HighlightedCode.tsx`：代码块单独高亮。
+- Claude Code `src/components/BaseTextInput.tsx` / `src/hooks/useTextInput.ts`：输入组件把高亮、placeholder、viewport、键盘编辑和提示拆开。
+- Claude Code `src/ink/components/ScrollBox.tsx` / `src/hooks/useVirtualScroll.ts`：输出区滚动、输入区固定底部、长历史虚拟滚动的结构。
+- Hermes 关系：本次没有新增 Hermes 行为参考；Aegis `tui.py` 原有 banner/spinner 基础仍沿用早期 Hermes attribution。
+
+##### Migration decision
+
+**REWRITE / behavioural reference**：只借鉴 Claude Code 的可观察 UI 行为与结构（Markdown/code rendering、composer highlighting、scrollable output + fixed bottom composer 方向），不复制 TypeScript/Ink 代码，也不引入 React/Ink 依赖。实现使用 Aegis 已有的 Rich + prompt_toolkit。
+
+##### Aegis design, data flow, and key interfaces
+
+- `TurnEvent.TEXT_DELTA` 在 TTY 下先写入 `_TurnState._text_buffer`；遇到工具调用、工具结果、错误或 `TURN_END` 时由 `_flush_assistant_text()` flush。
+- `_render_markdown_text()` 使用 Rich `Markdown(..., code_theme="monokai", hyperlinks=False)` + `Padding` 渲染；任何 Rich 渲染异常都回退到 plain text，确保 UI 不影响 Agent Loop。
+- 非 TTY 路径保持原来的直接 streaming text 输出，保证 `CliRunner`、管道、日志和脚本化使用不被 Markdown 重排影响。
+- `_FullscreenShell` 使用 prompt_toolkit `Application(full_screen=True)` + `HSplit` + `ScrollablePane`：聊天记录进入上方可滚动 output pane，composer 固定在底部；鼠标滚轮和 PageUp/PageDown 滚动 output pane，不再把输入行一起卷走。
+- prompt_toolkit composer 增加 `_AegisInputLexer`、`bottom_toolbar` 和 inline placeholder：输入中已知 slash command、未知 slash command、引号字符串、路径、`@mention`、`#tag` 会分别着色；底部只保留一条 `/undo`、`/title` 等轻量提示，顶部 placeholder 不再重复 `/help`。
+- 工具调用行用 `Text.assemble` 分层渲染，工具名使用 Aegis info 色，参数摘要保持 dim。
+
+##### Important files, classes, functions, and fields
+
+- `src/aegis_agent/tui.py`：`_FullscreenShell`、`_TurnState.append_text` / `pop_text`、`Tui._flush_assistant_text`、`_render_markdown_text`、`_render_to_ansi`、`_AegisInputLexer`、`_highlight_input_line`、`_input_token_style`、`_slash_hint`。
+- `tests/test_tui.py`：新增 Markdown rendering、input lexer、slash hint 测试；保留事件顺序与非 TTY CLI 输出测试。
+- `README.md`：Interactive UX 和 Interactive TTY rendering 说明。
+- `docs/source-map.md`：Stage 18 addendum 记录 Claude Code 行为参考与 Aegis 重写关系。
+
+##### Reliability invariants, edge cases, and failure handling
+
+- **UI failure containment**：Markdown 渲染异常不会中断 turn；fallback plain text。
+- **TTY / non-TTY separation**：交互式 TTY 使用 full-screen output pane + fixed composer，并 buffer + Markdown render；非 TTY 保持逐 chunk plain output，测试和脚本依赖稳定。
+- **Tool boundary flushing**：工具调用前先 flush 已有助手文本，避免回复片段与工具状态行混在一起。
+- **Input highlighting is cosmetic**：lexer 只改变展示 fragment style，不影响发送给 slash handler、skill router 或 model 的原始文本。
+- **No source-of-truth change**：所有改动都在 presentation layer；runtime/session/message log 不变。
+
+##### Tests, fault injection, and measured results
+
+- `uv run pytest -q tests/test_tui.py` → `7 passed in 0.82s`。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- Windows UNC 路径直接运行 `uv run pytest -q tests/test_tui.py` 曾因 uv 创建 `.venv/lib64` symlink 失败（Windows/UNC 环境限制）中止；改为 `wsl -d Ubuntu -- bash -lc 'cd /home/nacha/aegis-agent && ...'` 后通过。
+
+##### Trade-offs, remaining limitations, and TODOs
+
+- full-screen backend 是轻量实现：输出区可滚动、输入区固定，但没有迁移 Claude Code 的完整 virtual-scroll/windowing 算法。
+- TTY 下助手文本会先以 plain live preview 更新，再在工具边界或 turn end 渲染成 Markdown；后续可参考 Claude Code `StreamingMarkdown` 的 stable prefix + unstable suffix 做真正结构化 streaming Markdown。
+- 不支持 full-screen 的终端会自动 fallback 到原 PromptSession 路径。
+
+##### Concise interview-ready explanation
+
+"这次把 Aegis 的 CLI 展示层从普通 scrollback PromptSession 升级成 TTY 下的 full-screen layout：上方是 prompt_toolkit `ScrollablePane` 聊天记录，底部 composer 固定，不会跟着滚轮翻历史一起移走；鼠标滚轮和 PageUp/PageDown 滚的是输出区。模型 deltas 先以 plain live preview 显示，完成一个回复片段后用 Rich Markdown 渲染，所以标题、列表、粗体、inline code、代码块都有样式和语法高亮；非 TTY 仍保持逐 chunk plain streaming，避免破坏脚本和测试。输入侧用 prompt_toolkit Lexer + bottom toolbar 做 composer polish，高亮 slash command、路径、引号、mention/tag，且 placeholder 只显示 `Ask Aegis...`，不再和底部 `/help` 提示重复。参考的是 Claude Code 的 Markdown/TextInput/ScrollBox 行为，但代码完全用 Aegis 的 Python/Rich/prompt_toolkit 重写，没有迁移 Ink/React UI 栈。"
+
+---
+
+#### 阶段 18 修复——固定输入框与可用的历史滚动
+
+##### 任务目标与原始问题
+
+修复 `master` 上刚加入的 full-screen TTY：历史窗启动后是空白，提交消息仍看不到交互记录；
+工具调用、工具结果和错误直接写到底层 terminal，破坏 full-screen 重绘；底部同时出现 placeholder
+与整行反色提示，视觉噪声过多。目标收敛为上方独立可滚动的完整交互历史，以及底部始终可见的
+单行用户输入框，同时保留已有 Rich Markdown 和代码高亮。
+
+##### 相关参考行为与迁移决策
+
+- Claude Code `src/components/FullscreenLayout.tsx` 的行为参考：消息区与 bottom slot 分离；
+  手动离开底部后 streaming 不强制拉回，重新提交时恢复 tail following。
+- Hermes `cli.py` 的 prompt_toolkit 固定底部输入布局作为轻量结构参考。
+- 选择 **behavioural rewrite / repair**：未复制 React/Ink 或 Hermes CLI 代码，只修正 Aegis
+  已有的 Python `ScrollablePane` 实现并保持依赖不变。
+
+##### Aegis 设计与主要数据流
+
+- `_FullscreenShell._formatted_output()` 根据历史实际物理行数和 terminal 高度计算
+  `_last_max_scroll`，不再用 `10**9` 作为滚动位置。`_follow_output=True` 时贴住尾部；PageUp/
+  mouse wheel 向上后关闭跟随，新增 streaming 内容保持当前位置；滚回底部或提交新输入后恢复跟随。
+- Rich 的 ANSI 预渲染宽度预留一个 scrollbar cell，避免 scrollbar 出现时 Panel 多包一列、
+  高度翻倍并把最新内容挤出视口。
+- full-screen `prompt()` 提交后将原始用户文本以 `you❯` 写入历史。assistant Markdown、tool call、
+  tool result、runtime error 和 terminal stop status 都经 `_FullscreenShell.print_renderable()` 进入同一
+  history buffer，禁止再向底层 `Console` 穿透输出。
+- bottom slot 只保留一条分隔线和单行 `❯` composer；删除 full-screen placeholder 与反色 hint row。
+  非 full-screen PromptSession fallback 仍保留 placeholder、slash hint、历史和 token lexer。
+
+##### 重要文件与接口
+
+- `src/aegis_agent/tui.py`：`_FullscreenShell.prompt`、`_formatted_output`、
+  `_history_viewport_height`、`_history_overflows`、`Tui._emit`、`_render_to_ansi`。
+- `tests/test_tui.py`：tail clamp、manual-scroll stickiness、full-screen tool-output containment 回归测试。
+- `README.md`、`docs/source-map.md`：更新可观察行为与参考关系；未新增 milestone 编号。
+
+##### 可靠性不变量与边界情况
+
+- full-screen 模式下不存在绕过 history buffer 的 turn-event 输出。
+- 空/短历史从第 0 行显示；长历史的最大 scroll 位置等于 `line_count - viewport_height`，不会出现
+  整片空白。
+- 用户主动滚动历史时，异步 spinner、streaming text 和 tool status 不改变其阅读位置；提交下一条
+  输入明确恢复贴尾。
+- non-TTY streaming 路径完全保留，因此管道、日志和 CliRunner 的文本契约不变。
+- full-screen 初始化失败仍自动回退到 PromptSession。
+
+##### 测试与实测结果
+
+- `uv run pytest -q tests/test_tui.py` → `10 passed in 0.95s`（最终复跑）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `647 passed, 2 skipped in 542.49s`。
+- `uv run ruff check .` → 仍有 6 个与本修复无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+- 100×30 tmux PTY 手工验证：启动 banner 可见；`you❯` / `aegis❯` / tool call / tool result 同处
+  history；PageUp 只滚动 history；底部 composer 保持固定。
+
+##### 权衡、剩余限制与待办事项
+
+- 当前保留最多 4,000 个预渲染 history lines，没有 Claude Code 的 virtualized message list。
+- prompt_toolkit scrollbar 是轻量指示条；本阶段验证 mouse wheel 与 PageUp/PageDown，不实现
+  unseen-message pill、turn jump 或复杂 selection-preserving scroll。
+- Rich streaming preview 仍在 segment 完成后转换为 Markdown，不是 stable-prefix 增量 Markdown。
+
+##### 面试式简明说明
+
+"这个 bug 不是配色问题，而是滚动状态和输出通道错了：代码把 scroll 直接设为十亿，在 history
+window 不持有 focus 时 prompt_toolkit 不会替它 clamp，于是内容全被滚出屏幕；同时 tool/error 还在
+写原 terminal。修复后用实际行数减 viewport 算最大滚动位置，并维护 follow-tail 状态；手动上滚后
+新 token 不抢位置，下一次提交再回到底部。所有用户、assistant、tool、error 输出统一进入 history，
+bottom 只剩单行 composer。Rich Markdown 渲染保留，TTY 与非 TTY 的行为边界也没变。"
+
+---
+
+#### 阶段 18 修复补充——实时 Markdown 与可用的鼠标滚轮
+
+##### 任务目标与原始问题
+
+第一次布局修复后，full-screen assistant 在 streaming 阶段仍以 plain `Text` 显示，只有收到
+tool boundary 或 `TURN_END` 才变成 Rich Markdown；同时 PageUp/PageDown 可滚动，但 Windows
+Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外层 `ScrollablePane` 的
+`vertical_scroll`。目标是在不改变固定 composer 和最终字体风格的前提下修复这两条交互路径。
+
+##### 相关参考行为与迁移决策
+
+- Claude Code `src/components/Markdown.tsx::StreamingMarkdown` 提供 streaming 阶段已有格式的
+  可观察行为参考；Aegis 不迁移其 stable-prefix/Ink 实现，而是在现有 10 Hz full-screen refresh
+  中重渲染累计 Rich Markdown。
+- Claude Code `src/components/ScrollKeybindingHandler.tsx::scroll:lineUp/lineDown` 提供 wheel
+  直接控制 message scroll box、离底后关闭 sticky、回到底部恢复 sticky 的行为参考。
+- Hermes 当前 `cli.py` 明确使用 `mouse_support=False`，因此不适合作为本次 wheel 修复来源。
+- 决策为 **behavioural rewrite / targeted repair**，没有复制参考代码或增加依赖。
+
+##### Aegis 设计与主要数据流
+
+- `Tui._render_event(TEXT_DELTA)` 继续将 delta 累加到 `_TurnState`，但 live slot 现在接收
+  `_assistant_markdown_renderable(state.peek_text())`，和最终 `_flush_assistant_text()` 使用完全相同的
+  Rich `Group(label, Markdown)` 结构。每次 prompt_toolkit refresh 都显示当前累计 Markdown。
+- `_HistoryControl` 扩展 `FormattedTextControl.mouse_handler()`：只截获 `SCROLL_UP` /
+  `SCROLL_DOWN`，其余点击行为交回基类。wheel 事件经 `_FullscreenShell._scroll_history()` 修改
+  外层 pane，而不再落到高度等于全部内容的内层 `Window`。
+- wheel 与 PageUp/PageDown 共用 clamp 和 sticky 状态：向上滚设置 `_follow_output=False`；向下
+  到 `_last_max_scroll` 时恢复；所有目标都限制在 `[0, _last_max_scroll]`。
+
+##### 重要文件与接口
+
+- `src/aegis_agent/tui.py`：`_HistoryControl`、`_handle_history_mouse`、`_scroll_history`、
+  `_assistant_markdown_renderable`、`Tui._render_event`。
+- `tests/test_tui.py`：`test_fullscreen_streaming_preview_is_markdown_rendered` 和
+  `test_fullscreen_mouse_wheel_scrolls_history`。
+- `README.md`、`docs/source-map.md`：更新 streaming 与 wheel 的用户可见行为和参考关系。
+
+##### 可靠性不变量与边界情况
+
+- turn 未结束时 live preview 已是 Markdown，结束时只从 live slot 原样提交到 history，不出现
+  plain-to-Markdown 的突然替换。
+- incomplete Markdown 允许在后续 delta 到来时自然重排；UI 渲染异常仍走已有 plain fallback。
+- wheel burst 不会产生负 scroll 或越过 history tail；短历史下 scroll clamp 为 0。
+- 用户上滚后新 token 不抢走阅读位置；向下滚到底后 streaming 才继续贴尾。
+- non-TTY char-by-char output 路径未改变。
+
+##### 测试与实测结果
+
+- `uv run pytest -q tests/test_tui.py` → `12 passed in 1.58s`（最终复跑）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `649 passed, 2 skipped in 528.69s`。
+- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+- 100×30 tmux VT100 实测：连续三轮工具输出后发送三次 SGR wheel-up 序列，history 从尾部移动到
+  banner/第一轮消息，固定 composer 保持在底部。
+
+##### 权衡、剩余限制与待办事项
+
+- 当前对累计文本做完整 Rich Markdown 重渲染；实现简单且刷新上限为 10 Hz，但超长单段回复的
+  渲染成本高于 stable-prefix/unstable-suffix 增量方案。
+- incomplete fenced code/table 在 streaming 中可能短暂重排，这是 Markdown 流式渲染的预期行为。
+- scrollbar 仍是 prompt_toolkit 指示条，不实现抓住 thumb 拖拽或 selection-preserving scroll。
+
+##### 面试式简明说明
+
+"两个现象来自两条不同的事件路由：delta live slot 用的是 plain Text，所以最终 flush 才出现
+Markdown；VT100 wheel 则交给内层 Window，而真正的 scroll offset 在外层 ScrollablePane。现在
+streaming 与 final 共用同一个 Rich Markdown renderable，wheel 和 PageUp/PageDown 也共用一个
+clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了离底/回底 sticky 状态。"
+
+---
+
+#### 阶段 18 修复补充——稳定的流式帧与精细滚轮
+
+##### 任务目标与原始问题
+
+实时 Markdown 和滚轮路由修复后，用户仍观察到 streaming 中偶尔闪回开场 history 一帧，滚轮移动
+也显得偏猛、偏卡。目标是在不更换 prompt_toolkit 布局的前提下消除中间空帧，并把滚动步长调到
+更接近 Claude Code 的精细体验。
+
+##### 相关参考行为与迁移决策
+
+- Aegis 当前 `TEXT_DELTA` 路径的直接证据：每个 delta 都先调用 `state.stop_spinner()`，而
+  full-screen 的实现会执行 `shell.set_live(None)`，随后才写入新的 Markdown renderable。
+- Claude Code `src/components/ScrollKeybindingHandler.tsx` 明确规定 precision scroll 的基准为
+  `1 event = 1 row`；其后还有设备识别和加速曲线，本次只采用最低风险的基准步长。
+- 选择 **targeted repair / behavioural adaptation**：修正 Aegis 自身竞态，将 wheel 常量从 3 降到
+  1；不迁移 Claude Code 的 pending-delta、bounce detection 或 acceleration 系统。
+
+##### Aegis 设计与主要数据流
+
+- `Tui._render_event(TEXT_DELTA)` 只在 `state.started_text` 为 false 时清除 thinking spinner。
+  第一个 delta 之后，live slot 始终从一个 Markdown renderable 原子替换为下一个，不再经过 `None`。
+- `_WHEEL_SCROLL_LINES = 1`；已有 `_scroll_history()` 继续负责 clamp、离底关闭 follow、回底恢复
+  follow，因此只改变手感，不改变边界语义。
+
+##### 重要文件与接口
+
+- `src/aegis_agent/tui.py`：`_WHEEL_SCROLL_LINES`、`Tui._render_event`。
+- `tests/test_tui.py`：扩展 streaming 测试以断言第二个 delta 之间没有 `None` live update；wheel
+  测试断言单事件只移动一行。
+- `README.md`、`docs/source-map.md`：记录 precision wheel 和无中间空帧行为。
+
+##### 可靠性不变量与边界情况
+
+- thinking spinner 仍会在第一个 text delta 前正确清除。
+- 第二个及后续 delta 不清空 live slot；不再产生可被 UI thread 捕获的空历史帧。
+- tool/error/turn boundary 仍可显式清空 live slot并提交最终 segment。
+- wheel 始终 clamp 在 `[0, _last_max_scroll]`，只是每事件移动量从 3 变为 1。
+- non-TTY streaming 路径不变。
+
+##### 测试与实测结果
+
+- `uv run pytest -q tests/test_tui.py` → `12 passed in 0.88s`（实现后首轮）。
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
+- `uv run pytest -q` → `649 passed, 2 skipped in 526.15s`。
+- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
+  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
+  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+
+##### 权衡、剩余限制与待办事项
+
+- 单事件一行优先保证精细与稳定；没有 Claude Code 针对快速连续滚动的自适应加速，长距离回看应使用
+  PageUp/PageDown。
+- prompt_toolkit `ScrollablePane` 仍会重绘其虚拟内容；非常长的 4,000 行历史可能需要后续做窗口化，
+  本次没有以高风险重构换取尚未量化的性能收益。
+
+##### 面试式简明说明
+
+"闪屏不是 Markdown 本身，而是每个 token 都把 live slot 先设成 None，再放回新 renderable；UI
+线程偶尔会画到这个中间态。现在只在首个 delta 清 spinner，后续 frame 直接 Markdown-to-Markdown
+替换。滚轮则从 3 行降到 Claude Code 的 precision baseline 1 行，边界和 sticky 逻辑保持不变。"
+
+---
+
+#### TUI 滚动性能的视口裁剪优化
+
+##### 问题
+
+终端界面滑动时卡顿，特别是当历史记录很长时。原因是 `_formatted_output()` 每次渲染都连接所有行（最多 4000 行），即使只有视口内（约 50 行）的内容可见。
+
+##### 参考实现
+
+Claude Code 使用前端/后端帧缓冲和 Yoga 布局引擎，只渲染视口内的内容。Aegis 需要在 prompt_toolkit 框架下实现类似的视口裁剪。
+
+##### 实现方案
+
+在 `_FullscreenShell._formatted_output()` 中添加视口裁剪：
+
+1. **计算视口范围**：基于滚动位置和视口高度，计算需要渲染的行范围
+2. **添加缓冲区**：在视口上下各添加 50 行缓冲区，确保平滑滚动
+3. **只渲染可见部分**：只连接和渲染视口范围内的行，而不是所有历史行
+
+##### 关键修改
+
+**文件**: `src/aegis_agent/tui.py`
+
+1. 添加常量 `_VIEWPORT_BUFFER_SIZE = 50`
+2. 修改 `_formatted_output()` 方法：
+   ```python
+   # 计算视口范围（带缓冲区）
+   scroll_pos = self.scroll.vertical_scroll
+   start = max(0, scroll_pos - _VIEWPORT_BUFFER_SIZE)
+   end = min(len(lines), scroll_pos + viewport_height + _VIEWPORT_BUFFER_SIZE)
+
+   # 只渲染可见部分
+   visible_lines = lines[start:end]
+   text = "\n".join(visible_lines)
+   ```
+
+##### 性能测试结果
+
+- **优化前**：渲染 10000 行需要连接所有行
+- **优化后**：只渲染 98 行（视口高度 48 + 2×50 缓冲区）
+- **渲染时间**：0.0017s（10000 行中只渲染 1%）
+
+##### 修改文件
+
+- `src/aegis_agent/tui.py` — 添加视口裁剪优化
+
+##### 执行的测试
+
+- `uv run pytest -q tests/test_tui.py` → 12 passed
+- `uv run pytest -q` → 649 passed, 2 skipped
+
+##### 权衡
+
+- 缓冲区大小（50 行）是经验值，需要在平滑滚动和内存使用之间平衡
+- 极端情况下（快速滚动大量内容），可能需要调整缓冲区大小
+
+##### 剩余待办事项
+
+- 监控实际使用中的性能表现
+- 考虑添加自适应缓冲区大小（基于滚动速度）
+
+---
+
+#### 阶段 18 视口裁剪正确性补充
+
+##### 问题与根因
+
+第一版视口裁剪把格式化后的历史缩减为带缓冲区的切片，但仍然把
+`ScrollablePane.vertical_scroll` 当作完整历史中的绝对位置使用。切片起点超过第 0 行后，
+prompt_toolkit 收到的是面向完整历史的偏移量，而实际文档只有视口大小。这会导致长回复流式
+输出时，手动滚动的视图冻结或变为空白；同一坐标不一致还可能让实时思考状态落到有效窗格之外。
+
+##### 实现
+
+- `_FullscreenShell._history_scroll` 现在保存完整历史中的绝对位置。
+- `_formatted_output()` 根据绝对位置计算裁剪边界，再设置
+  `scroll.vertical_scroll = _history_scroll - start`，向窗格传入有效的切片内坐标。
+- 鼠标滚轮、Home/End、清屏、尾部跟随和历史截断统一更新该逻辑坐标。
+- 实时内容增长时保持手动滚动位置不变；到达尾部时恢复跟随模式。
+
+##### 验证
+
+- `tests/test_tui.py` 覆盖超过 50 行缓冲区时的全局到局部坐标转换、历史尾部可见的实时
+  思考状态，以及手动滚动视口期间连续增长的 100 帧实时内容。
+- `uv run pytest -q tests/test_tui.py` → `15 passed in 0.95s`.
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
+- `uv run pytest -q` → `652 passed, 2 skipped in 526.04s`.
+- 全仓 Ruff 仍保留 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
+  本次 TUI 修复涉及的文件均通过定向检查。
+
+##### 权衡与剩余工作
+
+由于滚动条由 prompt_toolkit 管理，它描述的是缓冲切片而不是完整逻辑历史。滚轮和翻页使用
+逻辑历史位置，因此行为仍然正确；要实现对应完整历史的比例滑块，需要自定义滚动条或改用其他
+虚拟化容器。
+
+---
+
+#### 阶段 18 补充——移除误导性滚动条并增加跳转到尾部
+
+##### 任务目标与原始问题
+
+视口裁剪使 prompt_toolkit 的内置滚动条只能描述缓冲切片，因此滑块大小变化不一致，无法拖动
+浏览完整历史，而且会传达错误的位置。界面还需要一种快速方式，让用户离开手动滚动位置并返回
+实时输出尾部。
+
+##### 相关参考行为与迁移决策
+
+- Claude Code 的 `src/keybindings/defaultBindings.ts` 将 `ctrl+end` 映射到
+  `scroll:bottom`，随后由 ScrollBox 恢复粘性尾部跟随。
+- Aegis 对该快捷键与跟随行为做小范围行为适配，不迁移 Claude Code 的自定义 ScrollBox 或
+  比例滚动条。
+- 直接移除仅描述切片的 prompt_toolkit 滚动条，不用另一个不准确实现替换它；真实可拖动滑块
+  需要独立的完整历史虚拟滚动控件。
+
+##### Aegis 设计与主要数据流
+
+- `ScrollablePane(show_scrollbar=False)` 移除不准确的可视滑块。
+- 即使输入框拥有焦点，全局 `Keys.ControlEnd` 绑定也会调用 `_jump_to_bottom()`。
+- `_jump_to_bottom()` 将 `_last_max_scroll` 赋给 `_history_scroll`，启用
+  `_follow_output` 并刷新应用。下一帧继续执行现有的绝对坐标到切片内坐标转换。
+- 输入框拥有焦点时，单独按 End 仍保持正常的光标移动行为。
+
+##### 可靠性不变量与边界情况
+
+- 隐藏滚动条后，滚轮及 PageUp/PageDown 仍然可用。
+- `Ctrl+End` 能从很长历史中的手动滚动位置跳到底部，并恢复实时尾部跟随。
+- 短历史下 `_last_max_scroll` 为零，因此会正常限制位置。
+- 模型、Runtime、持久化及非 TTY 行为均未改变。
+
+##### 测试与实测结果
+
+- `tests/test_tui.py` 验证滚动条被禁用、存在全局 `Keys.ControlEnd` 绑定，并确认跳到底部会同时
+  恢复最大逻辑位置与跟随模式。
+- `uv run pytest -q tests/test_tui.py` → `16 passed in 0.70s`.
+- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
+- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
+- `uv run pytest -q` → `653 passed, 2 skipped in 525.45s`.
+- `git diff --check` → 通过。
+- 全仓 Ruff 仍保留相同的 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
+  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
+  本次补充未引入新问题。
+
+##### 权衡、剩余限制与待办事项
+
+当前有意不显示完整历史位置指示器。真实可拖动的滚动条需要自定义控件，把完整历史映射到裁剪
+窗格；除非用户测试证明增加的复杂度值得，否则暂不实现。
+
+##### 面试式简明说明
+
+“内置滑块描述的是约一百行的渲染切片，而不是完整对话，因此大小和位置具有误导性，也不能用于
+有效拖动。Aegis 现在隐藏该滑块，并采用 Claude Code 已有的 Ctrl+End 快捷键：一次操作跳到逻辑
+历史尾部并重新启用粘性实时跟随，同时由既有的视口坐标转换控制渲染规模。”
+
+---
+
+### Milestone 19 — Stage 19：项目级长期记忆（Project Memory scope）
+
+#### Task goal and the original problem
 
 在已完成的**个人级** Memory 之上，增加第二个 **project（项目）作用域**。目标是让与某个项目
 强相关的长期事实（长期目标、架构决策、技术约束、用户确认过的项目规则、长期有效的坑/参考）
@@ -2378,21 +2672,21 @@ memory manager 无对应钩子，暂未联动。
 "按当前 scope 取不同的 `MEMORY.md` + `memory/`"，然后继续复用 Recall / Extract /
 `already_surfaced` / cursor / 异步预取 / 串行提取队列 / 路径安全 / 原子写。
 
-### 参考行为与来源（Claude Code，不是 Hermes）
+#### 参考行为与来源（Claude Code，不是 Hermes）
 
 - `src/memdir/paths.ts:findCanonicalGitRoot` + `getAutoMemPath` —— 项目记忆目录
   `~/.claude/projects/<净化后的 git 根路径>/memory/`，同仓库所有 worktree 共享一个目录；
 - `docs/08-memory.md` —— "每个项目一个记忆目录"、四类型、`MEMORY.md` 索引/正文分离；
 - `src/services/extractMemories/prompts.ts` —— 提取 agent 的按目录/按作用域文案变体。
 
-### Migration decision
+#### Migration decision
 
 - **paths**（`project_id`/`project_home`/`MemoryScope`）：ADAPT —— 复刻 git-root 规范化 + 项目
   目录布局，但用纯文件系统（不调用 `git` 子进程），`<basename>-<sha256[:8]>` 稳定 slug。
 - **extractor / prompt / manager / runtime / cli / tui**：ADAPT/original —— 加 project 变体，
   但不复制第二套 pipeline（现有函数已统一接受 `home` 参数）。
 
-### Aegis 设计、数据流与关键接口
+#### Aegis 设计、数据流与关键接口
 
 ```
 USER.md                  全局共享（两个 scope 都读）
@@ -2429,7 +2723,7 @@ scope = project  →  current project memory only
   重写为 `--project <cwd>`（Typer 0.27 无法表达 optional-value option）；缺省 → personal。
 - `tui.py`：启动面板显示 `Memory: on (personal)` / `Memory: on (project <id>)`。
 
-### Reliability invariants / edge cases / failure handling
+#### Reliability invariants / edge cases / failure handling
 
 - **作用域隔离严格**：project 模式下不读/不召回/不写 personal `MEMORY.md` 与 `memory/*.md`，
   反之亦然（有测试专门守住 `prefer-search.md` vs `architecture.md` / `dataset-rules.md` 三条线）；
@@ -2438,7 +2732,7 @@ scope = project  →  current project memory only
 - 缺省仍 personal；两种模式都读同一个全局 `USER.md`；
 - 现有 personal / session / resume / `session_search` 不变（回归测试通过）。
 
-### Tests、结果
+#### Tests、结果
 
 新增 `tests/test_memory_project.py`（15 项）：默认 personal、双 scope 共享全局 USER.md、
 project 不读 personal 索引/召回、project 召回只搜本目录、project 提取只写本目录、拒绝 `user`
@@ -2449,7 +2743,7 @@ project 不读 personal 索引/召回、project 召回只搜本目录、project 
 - `uv run ruff check`（改动文件）通过（仅剩既有 `cli.py:DTZ005` 历史告警，非本次引入）；
 - `uv run mypy src` 改动模块（`memory/*`、runtime）**无新增错误**（剩余 10 处均为既有历史告警）。
 
-### Trade-offs、限制与 TODO
+#### Trade-offs、限制与 TODO
 
 - 本阶段**只做 Project Memory**，不做 Personal + Project 混合召回、Team Memory、embedding / 向量库；
 - `project_id` 用纯文件系统 + 哈希，未移植 Claude 的 settings 覆盖链与 `~/.ssh` 安全护栏
@@ -2457,7 +2751,7 @@ project 不读 personal 索引/召回、project 召回只搜本目录、project 
 - `--project` 的可选值通过 `main()` 里对 `sys.argv` 的轻量归一化实现（Typer 0.27 限制），
   集中在入口一处，无侵入 Typer 内部。
 
-### Interview summary
+#### Interview summary
 
 "这一步在现成个人级 Memory 之上加了项目作用域，但**一行 pipeline 都没重写**。我观察到 scan /
 retriever / extractor / store / manager 全都已经接受 `home` 参数并派生 `<home>/memory`，所以
@@ -2469,7 +2763,7 @@ project scope 就是把这个 `home` 指到 `<~/.aegis>/projects/<git-root-hash>
 TUI 显示当前 scope。隔离性用三条独立记忆（personal `prefer-search`、project A `architecture`、
 project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 
-### 后续修复一：project 模式下模型不知道项目根在哪
+#### 后续修复一：project 模式下模型不知道项目根在哪
 
 实测 `--project /mnt/e/xxx` 后问"项目根目录下有什么文件"，模型把**启动目录**当成了项目根。
 根因：scope 只切换了记忆存储位置，系统提示词里没有任何项目根信息，工具 cwd 也是启动目录。
@@ -2481,7 +2775,7 @@ project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 - `MemoryBehaviorContributor(project_root=...)` 在项目分节末尾显式追加一行
   "The current project root is: <路径>"。
 
-### 后续修复二：project 会话的 resume 绑定（对齐 Claude Code 的按项目存放）
+#### 后续修复二：project 会话的 resume 绑定（对齐 Claude Code 的按项目存放）
 
 随后发现：project 会话关闭后 `aegis --resume <id>`（不带 `--project`）会**退回 personal 作用域**
 恢复——sessions 表没有 scope 元数据，scope 是纯启动期参数。危害不只是注入错索引：恢复的对话
@@ -2503,7 +2797,7 @@ project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 （`SQLiteSessionRepository` 本来就 `mkdir(parents=True)` 且接受任意路径）。新增 6 个 CLI 测试
 覆盖：project 库落位、同 scope resume 成功、双向跨 scope 不可见 + 提示、显式 `--db` 覆盖。
 
-### 后续修复三：提示词必须告诉模型记忆目录在哪
+#### 后续修复三：提示词必须告诉模型记忆目录在哪
 
 实测发现模型拿到索引条目 `[...](aegis-agent-project-overview.md)` 后，把相对链接解析到**项目根**
 去读（报 File not found）；用户让它删掉这条项目记忆时，它又在项目目录里 find/search——因为
@@ -2522,76 +2816,9 @@ project B `dataset-rules`）锁死。不做混合召回/Team/embedding。"
 
 ---
 
-## 后续修复：MCP 下载超时诊断 + terminal partial-output timeout 修复
+### Milestone 20 — Stage 20：多代理编排（Agent / team_create / send_message / /agents）
 
-### Task goal and original problem
-
-用户在真实 REPL 中用 `paper_search` MCP 找论文时，搜索工具可用，但
-`mcp_paper_search_download_arxiv({paper_id:"2001.03093", save_path:"/mnt/c/Users/nacha/Desktop"})`
-等待 180 秒后返回 `MCP operation timed out after 180s`。随后模型改用 `terminal` 调
-`wget` / `curl` 下载同一 PDF，又失败为 `Tool execution failed: TypeError: sequence item 0: expected str instance, bytes found`；最后用 Python `urllib.request` 才成功。
-
-本次目标不是迁移新的论文 MCP，也不修改用户的 `~/.aegis/config.yaml`，而是定位 Aegis 自身在这个链路中暴露的缺陷：MCP 超时是否属于客户端错误、以及 terminal fallback 为什么会把可恢复的 shell 结果变成 Python 类型异常。
-
-### Relevant behavior and source locations
-
-- `src/aegis_agent/mcp/config.py`：MCP server 配置合并默认值，`timeout` 是每个工具调用的 deadline；用户配置中 `paper_search.timeout=180`。
-- `src/aegis_agent/mcp/client.py`：`call_tool` 通过 `_run_on_loop(..., effective_timeout)` 等待 `session.call_tool`；超时会取消 future，并把 `TimeoutError("MCP operation timed out after 180s")` 包成 `{"error":"MCP call failed: ..."}`。搜索工具已经成功说明 stdio discovery / wrapper 注册是正常的；下载慢到 180 秒是单次 MCP 工具/上游网络问题，不是 Aegis MCP 发现失效。
-- `src/aegis_agent/tools/builtin/terminal.py`：前台命令用 `Popen(text=True)` + 循环 `communicate(timeout=0.2)` 排水。Python 的 `TimeoutExpired.output` / `stderr` 可能仍是 **bytes**，且每次 timeout 暴露的是**累计 partial output**，不是新增 delta；旧代码直接 append 后 `"".join(...)`，因此既会 bytes/string 类型崩溃，也会重复拼接 partial output。
-
-### Migration decision
-
-- MCP：**无代码迁移 / 诊断结论**。当前 Aegis 行为符合已实现的最小 MCP 合同（配置 deadline → error result，不 crash）。真正的后续能力是 reconnect / retry / progress / per-tool timeout policy，属于 README roadmap 里已有的 MCP reconnect/circuit breaker 后续项，不在本次修复范围内。
-- terminal：**REWRITE path 的可靠性修复**。`terminal.py` 本来就是 Aegis 自写的最小行为等价工具；本次只修补 stdout/stderr 排水与 timeout payload，不扩大 shell 功能。
-
-### Aegis design, data flow, key functions
-
-修复点集中在 `terminal.py`：
-
-1. `_wait_and_drain` 捕获 `subprocess.TimeoutExpired` 后，用 `_as_text(value: str | bytes)` 将 partial stdout/stderr 归一为 UTF-8 replacement-decoded `str`；
-2. 因 `TimeoutExpired.output` 是累计值，使用 `stdout_parts[:] = [...]` / `stderr_parts[:] = [...]` 替换当前缓存，而不是 append；
-3. 到达总 deadline 时，kill 子进程并抛带 `output`/`stderr` 的 `TimeoutExpired`，让 `_run_foreground` 能继续返回标准 terminal JSON：`{"output": <partial>, "exit_code": 124, "error": "Command timed out ..."}`。
-
-未改变：危险命令 guardrail、`allow_dangerous_shell` operator-only 语义、后台进程、输出截断、grep/diff exit-code 解释、cooperative cancel。
-
-### Reliability invariants, edge cases, failure handling
-
-- terminal 工具 handler 不应因 Python subprocess 的 partial-output 类型差异而抛异常；工具级失败必须回到 `ToolResult(is_error=True)`。
-- 超时仍 kill + reap 子进程，仍用 `exit_code=124` 表达。
-- partial stdout 与 partial stderr 都保留；二进制/非 UTF-8 片段用 `errors="replace"`，不污染 JSON 编码。
-- MCP 工具超时继续是模型可见的 JSON error result；不会污染 Python 异常栈，也不会持久化半成品 MCP 内部状态。
-
-### Tests and measured results
-
-新增 `tests/test_terminal.py` 两个回归用例：
-
-- command 写 stdout 后 sleep 到 timeout：返回 `exit_code=124` 且 `output == "partial"`；
-- command 写 stderr 后 sleep 到 timeout：同样保留 `partial`。
-
-验证结果：
-
-- `uv run pytest tests/test_terminal.py -q` → **15 passed**；
-- `uv run pytest -q` → **562 passed, 2 skipped**；
-- `uv run ruff check src/aegis_agent/tools/builtin/terminal.py tests/test_terminal.py` → **All checks passed**；
-- `uv run ruff check .` → **2 个既有告警**（`src/aegis_agent/cli.py:431` `DTZ005`、`src/aegis_agent/mcp/client.py:457` `SIM115`），与本次改动无关，未做广泛清理。
-
-尝试直接连接外部 `paper-search-mcp` 做端到端 MCP 复现时，被当前 Claude Code 权限策略拒绝（外部 package execution 需要显式授权），因此没有擅自运行或修改该外部 MCP。
-
-### Trade-offs, remaining limitations, TODOs
-
-- 这次只修 Aegis 自身确定的 terminal bug；`paper-search-mcp` 下载 180 秒超时的根因可能在上游包、arXiv/网络、WSL 到 Windows 路径写入、或该工具的下载实现中。
-- Aegis MCP 仍没有 per-tool 进度、下载重试、自动 fallback、server reconnect/circuit breaker；README roadmap 已有 MCP reconnect/circuit breaker，建议作为下一阶段。
-- 若要继续查 `paper-search-mcp`，需要用户授权执行该外部包，或用户在 Aegis 里把该工具 timeout 提高后提供日志。
-
-### Interview-ready explanation
-
-"这次我把用户实测的失败拆成两层：MCP 搜索能跑说明连接和 schema wrapper 没坏，`download_arxiv` 是单个外部 MCP 工具超过了配置的 180 秒 deadline，Aegis 正确把它转成 error result；真正的 Aegis bug 是 fallback shell 工具。Python 的 `communicate(timeout=...)` 在 text mode 下仍可能把 partial output 放在 `TimeoutExpired.output` 里作为 bytes，而且这个 partial 是累计值。旧代码把它当 str delta append，最后 join 就炸。修复后我们先把 partial 统一 decode 成 str，再替换累计缓存，超时时把已捕获输出放回标准 `{output, exit_code:124, error}` payload。测试覆盖 stdout/stderr 两条 partial-output timeout 路径，全量测试 562 passed。"
-
----
-
-### Milestone 20 — Stage 20：Multi-agent orchestration（Agent / team_create / send_message / /agents）
-
-### Problem and goal
+#### 任务目标与原始问题
 
 Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由一个主 Agent 串行完成：大范围只读调查、当前上下文复核、后台长任务、以及多角色协作都缺少一等建模。目标是在不引入第二套 Agent Loop 的前提下，把 Aegis 扩展成 multi-agent orchestration runtime：
 
@@ -2604,20 +2831,20 @@ Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由
 
 本阶段的核心约束是：复用 Aegis 已有 `AgentRuntime` / `ToolRegistry` / `SessionRepository` / `ModelProvider` Protocol，不让 Agent Loop 直接依赖 CLI、具体 provider、SQLite SQL、team transport 或全局状态。
 
-### Relevant Hermes and/or Claude Code behavior and source locations
+#### 参考行为与源码位置
 
 - Claude Code 是本阶段的主要行为与架构参考：`Agent` tool、typed subagents、forked context、background async agent task、completion notification、`team_create`、`send_message`、persistent teammate、message envelope / mailbox、idle wake-up。
 - Hermes 不是本阶段 multi-agent/team 的主要来源；它只间接影响了已有 slash-command registry pattern（Stage 17）和 Agent Loop 抽象方式。
 - Aegis 没有 port Claude Code 的完整 harness、remote sandbox、file mailbox、managed team UI 或产品特定 agent definitions；只保留当前 milestone 需要的 runtime 行为。
 
-### Migration decision: combined adaptation + rewrite
+#### 迁移决策：组合适配 + 重写
 
 - `AgentTool`、`SubagentManager`、`TeamManager`、`TeamCreateTool`、`SendMessageTool`、`PersistentTeammate` 采用 **ADAPT / REWRITE**：参考 Claude Code 可见行为和架构边界，用 Aegis 的 Python dataclass、Protocol、tool result 和 thread 模型重新实现。
 - `SubagentRunner` 是 **REWRITE**：关键决策是重新实例化同一个 `AgentRuntime`，只替换 agent config、system prompt、工具白名单和私有 session repository。
 - `runtime.py` / `cli.py` / `/agents` 是 **original wiring**：runtime 只注册工具和 drain queues，CLI 只在 turn 间注入通知/消息，不参与 spawn 或 team routing。
 - 没有迁移 Hermes/Claude Code 的大耦合入口文件，也没有复制 reference repository 的产品功能或品牌 UI。
 
-### Aegis design and data flow
+#### Aegis 设计与主数据流
 
 **One-shot subagent path**：
 
@@ -2640,7 +2867,7 @@ Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由
 5. `TeamManager.send_message()` enforcement：sender 必须属于同一 team；未知成员或 cross-team delivery 返回工具级错误。
 6. Teammate 收到 `<agent-message ...>` 后用同一 transcript 跑一轮，结束后回到 IDLE；idle hook 给 lead inbox 发送状态通知。Runtime/CLI 在 turn 间 drain lead messages。
 
-### Key implementation
+#### 关键实现
 
 - `src/aegis_agent/agents/definitions.py`：`AgentDefinition`、`builtin_agents()`、`fork_agent_definition()`、`READ_ONLY_TOOL_NAMES`。
 - `src/aegis_agent/agents/agent_tool.py`：`AgentTool` schema 与 run path，foreground/background result shaping。
@@ -2654,7 +2881,7 @@ Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由
 - `src/aegis_agent/cli.py`：REPL turn 间收集 subagent notifications 和 team messages。
 - `src/aegis_agent/slash_commands.py`：`/agents` task status command。
 
-### Reliability invariants, edge cases, and failure handling
+#### 可靠性不变量、边界与失败处理
 
 - **Main transcript isolation**：subagent intermediate messages 不写入 parent session；parent 只看到 final report 或 background notification。
 - **Fork isolation**：forked child repo 复制 parent messages，但清理 `client_msg_id` / `seq`，避免 idempotency key 与 ordering metadata 污染子会话。
@@ -2667,60 +2894,62 @@ Aegis 已经有可恢复的单 Agent Runtime，但复杂工程任务仍只能由
 - **Teammate failure isolation**：一次 teammate turn failure 不杀死整个 team，后续消息仍可恢复运行。
 - **Source of truth**：原始 parent session 仍是 source of truth；context/fork/notification 都是派生结构，不覆盖原始消息日志。
 
-### Tests and evidence
+---
 
-Direct multi-agent coverage:
+#### 测试与证据
+
+多代理直接覆盖：
 
 - `tests/test_subagent.py`：第一版 `Agent` acceptance、tool filtering、full tool loop、private transcript、subagent failure as tool error、disabled-subagents regression。
 - `tests/test_subagent_v2.py`：fresh vs fork、omitted `subagent_type` fork、background task handle、notification drain、runtime drain seam、concurrency/depth guard、kill/cancel、`/agents` command。
 - `tests/test_team.py`：team creation、persistent teammate identity/context、idle wakeup、lead → teammate、teammate → teammate、broadcast、team boundary、parallel teammates、runtime wiring、teammate failure isolation。
 
-Verification command for this docs milestone:
+该阶段的验证命令：
 
 ```bash
 uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_team.py
 ```
 
-Result for this docs update: `53 passed in 211.80s (0:03:31)`.
+当时记录的结果：`53 passed in 211.80s (0:03:31)`。这是实现阶段的历史证据，不代表本轮文档整理重新执行了测试。
 
-### Source relationship
+#### 来源关系
 
-- Primary reference: **Claude Code** behaviour and architecture for subagents, background tasks, team creation, inter-agent messaging, persistent teammates, and task notifications.
-- Hermes relationship: indirect only in this milestone; existing slash-command registry pattern came from Stage 17, but `/agents` task content and the multi-agent managers are Aegis-specific.
-- Aegis implementation is a **combined adaptation + rewrite**: no complete Claude Code or Hermes multi-agent module is copied; Aegis reuses its own runtime, tool registry, session repository, thread model, and tool-result conventions.
-- Full mapping is recorded in `docs/source-map.md` Stage 20.
+- 主要参考：Claude Code 的 subagent、后台任务、team、代理间消息、persistent teammate 和任务通知行为与架构。
+- Hermes 在本阶段只有间接关系：Stage 17 已参考其斜杠命令 registry pattern，但 `/agents` 内容和多代理 manager 是 Aegis 自己的实现。
+- Aegis 采用 **combined adaptation + rewrite**，没有复制 Claude Code 或 Hermes 的完整多代理模块，而是复用自身 runtime、tool registry、session repository、线程模型和 tool-result 约定。
+- 逐文件映射见 `docs/source-map.md` 的 Stage 20。
 
-### Design trade-offs, limitations, and TODOs
+#### 设计权衡、限制与 TODO
 
-- Only built-in `explore` and `general-purpose` are available; custom `.aegis/agents/*.md` loading is future work.
-- Teams are in-process; no durable team roster, cross-process mailbox, remote A2A, or restart recovery yet.
-- Teammate sessions are continuous within the process but not persisted as durable teammate state.
-- `/agents` lists subagent tasks, not full teams or teammate transcripts.
-- Background daemon threads fit the lightweight CLI runtime, but are not distributed workers.
-- Agents currently reuse the configured provider path; there is no automatic cheap-worker/provider routing policy.
+- 当前只有内置 `explore` 与 `general-purpose`；自定义 `.aegis/agents/*.md` loader 尚未实现。
+- Team 只在进程内运行，尚无 durable roster、跨进程 mailbox、remote A2A 或重启恢复。
+- Teammate session 在进程内连续，但未持久化为 durable teammate state。
+- `/agents` 只列 subagent task，不展示完整 team 或 teammate transcript。
+- 后台 daemon thread 适合轻量 CLI runtime，但不是分布式 worker。
+- 子代理当前复用已配置的 provider path，没有自动选择低成本 worker/provider 的路由策略。
 
-### Interview summary
+#### Interview summary
 
 "Stage 20 把 Aegis 从单 Agent Runtime 扩展成 multi-agent orchestration，但没有引入第二套 loop。`Agent` 工具通过 `SubagentManager`/`SubagentRunner` 重新实例化同一个 `AgentRuntime`，只换 `AgentConfig`、系统提示、工具白名单和私有 session repository；所以 subagent 的工具调用和中间历史不会污染主会话。typed subagent 默认 fresh context，省略 `subagent_type` 时走 fork，把父会话复制进子 repo 但清掉 seq/client_msg_id。后台 subagent 在线程里跑，完成后进入通知队列，CLI between turns 注入给主 Agent，不需要模型 polling。Team 部分把 one-shot subagent 扩展成长生命周期 teammate：每个 teammate 有稳定名字、私有连续 transcript 和 event-driven inbox；`send_message` 只在 team 内路由，idle teammate 收到消息后醒来继续同一上下文。整体参考 Claude Code 的 Agent/team 行为，但实现上保持 Aegis 的 dependency-injected runtime 和轻量线程模型。"
 
 ---
 
-### Milestone 20.1 — Stage 20 增量：启动面板 Subagents 数字改为实时运行中数
+#### Milestone 20.1 — Stage 20 增量：启动面板 Subagents 数字改为实时运行中数
 
-### Problem and goal
+##### 任务目标与原始问题
 
 Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类型注册表大小**（`explore` / `general-purpose` 两个类型，`definitions.py:BUILTIN_AGENTS`），是静态配置数，与"当前到底有几个 subagent 正在跑"无关。用户希望显示实时状态：后台 subagent 正在运行时数字应为 1，全部结束后回到 0。
 
-### Relevant Hermes and/or Claude Code behavior and source locations
+##### 参考行为与源码位置
 
 - Hermes `hermes_cli/banner.py` 的启动横幅概念此前已用于 `_startup_panel`（Stage 3）。本次不新增任何 Hermes/Claude Code 行为参考。
 - 实时数量的数据源是 Aegis 自己的 `SubagentManager.running_count()`（`agents/manager.py`，Stage 20 已有，遍历 task 表统计 `RUNNING`）。
 
-### Migration decision
+##### 迁移决策
 
 **New implementation（original）**：不改数据源（`running_count()` 已存在），只调整 startup_info 组装与 TUI/CLI 渲染。无 port、无 copy。
 
-### Aegis design and data flow
+##### Aegis 设计与主数据流
 
 - `runtime.py:with_defaults` 把静态 `"subagents": len(agents)` 替换成两个键：
   - `"subagent_types"`：仍为类型注册表大小（用于面板门控，功能启用才有这一行）；
@@ -2732,7 +2961,7 @@ Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类�
   - 采用"追加式"而非整块重绘：banner 是一次性打印，`Live` spinner 与 prompt_toolkit 输入都在场，回合间整块重绘会造成终端闪烁/抢行。
 - 数据流：`SubagentManager`（后台线程更新 task 状态）→ `runtime.startup_info["subagent_running"]`（turn 间由 CLI 刷新）→ 下一轮状态行。
 
-### Key implementation
+##### 关键实现
 
 - `src/aegis_agent/runtime.py`：`with_defaults` 的 `startup_info` 改 `subagent_types` / `subagent_running`。
 - `src/aegis_agent/tui.py`：`_startup_panel` 渲染运行中数。
@@ -2740,1915 +2969,212 @@ Stage 20 之后启动横幅的 `Subagents: 2` 显示的是内置 subagent **类�
 - `tests/test_subagent.py`：两处 startup_info 断言改键。
 - `tests/test_subagent_v2.py`：`test_subagent_manager_present_in_with_defaults` 断新键；新增 `test_startup_info_reflects_running_count` 验证后台 spawn 后 running 数上升、结束后回到 0（容忍后台线程抢先完成的竞态）。
 
-### Reliability invariants, edge cases, and failure handling
+##### 可靠性不变量、边界与失败处理
 
 - 竞态：后台 daemon 线程可能在 `running_count()` 查询前就完成；`_refresh_subagent_status` 只反映瞬时值（1 或 0 都可能），测试用轮询 `_wait_done` 收敛到 0，不用强断言"spawn 后必为 1"。
 - 功能禁用：`subagent_manager is None` 或 `subagent_types` 为 0 时 `_refresh_subagent_status` 直接返回，不打印、不改 dict。
 - 只更新同一 `startup_info` dict 对象，banner 持有的引用与刷新路径一致。
 
-### Tests and evidence
+##### 测试与证据
 
 - `uv run pytest -q tests/test_subagent.py tests/test_subagent_v2.py tests/test_tui.py tests/test_cli.py` → `51 passed in 10.48s`。
 - `uv run pytest -q` → `634 passed, 2 skipped in 54.32s`。
 - `uv run ruff check src/aegis_agent/runtime.py src/aegis_agent/tui.py tests/test_subagent.py tests/test_subagent_v2.py` → `All checks passed!`。
 - `cli.py` 的 `DTZ005 datetime.now() 无 tz` 为 pre-existing 问题（git stash 验证干净树同样报），不在本次改动范围。
 
-### Design trade-offs, limitations, and TODOs
+##### 设计权衡、限制与 TODO
 
 - 启动横幅仍是打印一次，只有变化时追加状态行；不会实时原地刷新面板数字。
 - 前台 foreground subagent 在 turn 内同步完成，turn 结束后 running 数恒为 0，只有 background 路径能观察到非 0。
 - 类型数不再显示在面板里（`subagent_types` 仅作门控）；如需"2 types"可改回并排显示。
 
-### Interview summary
+##### Interview summary
 
 "把启动面板的 `Subagents: 2` 从'可用类型数'改成'实时运行中数'。数据源是现成的 `SubagentManager.running_count()`；runtime 只把 startup_info 拆成 `subagent_types`（门控）+ `subagent_running`（实时值），TUI 渲染 `Subagents: N running`，CLI 每轮 turn 后对比 running_count 与缓存值，变化时追加打印一行。没有整块重绘 banner，因为 `Live` spinner 和 prompt_toolkit 输入同时在场，追加式更稳。测试覆盖启动快照为 0、后台 spawn 后 running 升为 1、结束后归 0，并容忍后台线程抢先完成的竞态。"
 
 ---
 
-## Stage 18 addendum — interactive TTY rendering polish
+#### Stage 20 补充——内置子代理迭代预算调整
 
-### Problem and goal
+##### 任务目标与原始问题
 
-用户反馈当前 Aegis CLI 界面“各种渲染”比较弱，至少应该支持特殊字体、高亮和代码显示；同时输入框在普通终端 scrollback 中，滚轮翻历史时会跟着输出一起移动。目标是参考 Claude Code CLI 的界面体验，先在 Aegis 现有 Python 架构里提升 TTY 渲染质量与输入提示，而不是迁移 Claude Code 的 TypeScript/Ink/React UI 栈。
+一次 Harbor SWE-bench 运行中，主 Aegis 进程正确接收到 `--max-iterations 50`，但首次调用的 `explore` 子代理在 10 次迭代后返回
+`(maximum iterations reached without a final answer)`。主代理本身只运行了 6 次迭代，因此提高主代理上限不能解决该失败；需要增加内置 typed subagent 的独立探索预算。
 
-### Relevant Hermes and/or Claude Code behavior and source locations
+##### 相关行为与源码位置
 
-- Claude Code `src/components/Markdown.tsx` / `src/utils/markdown.ts`：Markdown token 渲染、纯文本 fast path、streaming markdown 的稳定前缀思路。
-- Claude Code `src/components/HighlightedCode.tsx`：代码块单独高亮。
-- Claude Code `src/components/BaseTextInput.tsx` / `src/hooks/useTextInput.ts`：输入组件把高亮、placeholder、viewport、键盘编辑和提示拆开。
-- Claude Code `src/ink/components/ScrollBox.tsx` / `src/hooks/useVirtualScroll.ts`：输出区滚动、输入区固定底部、长历史虚拟滚动的结构。
-- Hermes 关系：本次没有新增 Hermes 行为参考；Aegis `tui.py` 原有 banner/spinner 基础仍沿用早期 Hermes attribution。
+`src/aegis_agent/agents/definitions.py` 的 `AgentDefinition.max_iterations` 是每个子代理 definition 的配置字段；`explore` 与 `general-purpose` 原先都隐式采用通用默认值 10。`src/aegis_agent/agents/runner.py` 将 `definition.max_iterations` 传入子代理专用的 `AgentRuntime`，因此该值独立于 Harbor 传给主进程的 50 次上限。运行时在 `src/aegis_agent/runtime.py` 的 `IterationBudget` 守卫处返回 `StopReason.MAX_ITERATIONS`。
 
-### Migration decision
+##### 迁移决策
 
-**REWRITE / behavioural reference**：只借鉴 Claude Code 的可观察 UI 行为与结构（Markdown/code rendering、composer highlighting、scrollable output + fixed bottom composer 方向），不复制 TypeScript/Ink 代码，也不引入 React/Ink 依赖。实现使用 Aegis 已有的 Rich + prompt_toolkit。
+本次是**独立于 Hermes 与 Claude Code 的小范围 Aegis 配置调整**，没有复制或修改两个参考仓库，也没有改变 Agent Loop、Harbor 集成或用户自定义 definition 的语义。
 
-### Aegis design, data flow, and key interfaces
+##### Aegis 设计与主数据流
 
-- `TurnEvent.TEXT_DELTA` 在 TTY 下先写入 `_TurnState._text_buffer`；遇到工具调用、工具结果、错误或 `TURN_END` 时由 `_flush_assistant_text()` flush。
-- `_render_markdown_text()` 使用 Rich `Markdown(..., code_theme="monokai", hyperlinks=False)` + `Padding` 渲染；任何 Rich 渲染异常都回退到 plain text，确保 UI 不影响 Agent Loop。
-- 非 TTY 路径保持原来的直接 streaming text 输出，保证 `CliRunner`、管道、日志和脚本化使用不被 Markdown 重排影响。
-- `_FullscreenShell` 使用 prompt_toolkit `Application(full_screen=True)` + `HSplit` + `ScrollablePane`：聊天记录进入上方可滚动 output pane，composer 固定在底部；鼠标滚轮和 PageUp/PageDown 滚动 output pane，不再把输入行一起卷走。
-- prompt_toolkit composer 增加 `_AegisInputLexer`、`bottom_toolbar` 和 inline placeholder：输入中已知 slash command、未知 slash command、引号字符串、路径、`@mention`、`#tag` 会分别着色；底部只保留一条 `/undo`、`/title` 等轻量提示，顶部 placeholder 不再重复 `/help`。
-- 工具调用行用 `Text.assemble` 分层渲染，工具名使用 Aegis info 色，参数摘要保持 dim。
+内置 `explore` 与 `general-purpose` 现在显式设置 `max_iterations=25`；`AgentDefinition` 的通用默认值仍为 10，因此外部自定义 definition 仍由显式值或原有默认值控制。`SubagentRunner` 继续按 `AgentDefinition → AgentConfig → AgentRuntime` 传递预算；隐式 fork 继续保持 25 次。主 Agent 默认值仍是 50。
 
-### Important files, classes, functions, and fields
+##### 可靠性、权衡与限制
 
-- `src/aegis_agent/tui.py`：`_FullscreenShell`、`_TurnState.append_text` / `pop_text`、`Tui._flush_assistant_text`、`_render_markdown_text`、`_render_to_ansi`、`_AegisInputLexer`、`_highlight_input_line`、`_input_token_style`、`_slash_hint`。
-- `tests/test_tui.py`：新增 Markdown rendering、input lexer、slash hint 测试；保留事件顺序与非 TTY CLI 输出测试。
-- `README.md`：Interactive UX 和 Interactive TTY rendering 说明。
-- `docs/source-map.md`：Stage 18 addendum 记录 Claude Code 行为参考与 Aegis 重写关系。
+25 次迭代为代码搜索、读取、分析和最终总结提供更多余量，同时不把所有主运行都无条件提高到 100 次，控制潜在延迟与模型费用。预算仍是硬上限；若模型工具循环不收敛，仍会以 `MAX_ITERATIONS` 结束。真实付费 Harbor 评测不属于本次验证范围。
 
-### Reliability invariants, edge cases, and failure handling
+##### 测试与验证
 
-- **UI failure containment**：Markdown 渲染异常不会中断 turn；fallback plain text。
-- **TTY / non-TTY separation**：交互式 TTY 使用 full-screen output pane + fixed composer，并 buffer + Markdown render；非 TTY 保持逐 chunk plain output，测试和脚本依赖稳定。
-- **Tool boundary flushing**：工具调用前先 flush 已有助手文本，避免回复片段与工具状态行混在一起。
-- **Input highlighting is cosmetic**：lexer 只改变展示 fragment style，不影响发送给 slash handler、skill router 或 model 的原始文本。
-- **No source-of-truth change**：所有改动都在 presentation layer；runtime/session/message log 不变。
+新增 `tests/test_subagent.py` 回归断言，固定两个内置 typed subagent 的预算为 25。随后运行相关子代理测试与 Ruff；最终命令和结果记录在任务完成报告中。
 
-### Tests, fault injection, and measured results
+##### Interview summary
 
-- `uv run pytest -q tests/test_tui.py` → `7 passed in 0.82s`。
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
-- Windows UNC 路径直接运行 `uv run pytest -q tests/test_tui.py` 曾因 uv 创建 `.venv/lib64` symlink 失败（Windows/UNC 环境限制）中止；改为 `wsl -d Ubuntu -- bash -lc 'cd /home/nacha/aegis-agent && ...'` 后通过。
-
-### Trade-offs, remaining limitations, and TODOs
-
-- full-screen backend 是轻量实现：输出区可滚动、输入区固定，但没有迁移 Claude Code 的完整 virtual-scroll/windowing 算法。
-- TTY 下助手文本会先以 plain live preview 更新，再在工具边界或 turn end 渲染成 Markdown；后续可参考 Claude Code `StreamingMarkdown` 的 stable prefix + unstable suffix 做真正结构化 streaming Markdown。
-- 不支持 full-screen 的终端会自动 fallback 到原 PromptSession 路径。
-
-### Concise interview-ready explanation
-
-"这次把 Aegis 的 CLI 展示层从普通 scrollback PromptSession 升级成 TTY 下的 full-screen layout：上方是 prompt_toolkit `ScrollablePane` 聊天记录，底部 composer 固定，不会跟着滚轮翻历史一起移走；鼠标滚轮和 PageUp/PageDown 滚的是输出区。模型 deltas 先以 plain live preview 显示，完成一个回复片段后用 Rich Markdown 渲染，所以标题、列表、粗体、inline code、代码块都有样式和语法高亮；非 TTY 仍保持逐 chunk plain streaming，避免破坏脚本和测试。输入侧用 prompt_toolkit Lexer + bottom toolbar 做 composer polish，高亮 slash command、路径、引号、mention/tag，且 placeholder 只显示 `Ask Aegis...`，不再和底部 `/help` 提示重复。参考的是 Claude Code 的 Markdown/TextInput/ScrollBox 行为，但代码完全用 Aegis 的 Python/Rich/prompt_toolkit 重写，没有迁移 Ink/React UI 栈。"
+问题表面上是 Harbor 任务失败，实际根因是主 Agent 的子代理拥有独立预算：主 Agent 的 50 次并未耗尽，而只读 `explore` 子代理的 10 次预算先耗尽。最小风险修复是在内置 definition 层把两个 typed subagent 的预算提升到 25，保留运行时循环和自定义 definition 的可配置接口不变，并用 definition 回归测试防止预算意外回退。
 
 ---
 
-## Aegis Agent Quality 阶段 0——Langfuse 可观测性
+#### Milestone 20.2 — Stage 20 增量：自动会话标题
 
-### 问题与目标
+> 会话标题是轻量的会话元数据增量，不单独占用新的主 Milestone 编号。
 
-本阶段只为现有 Aegis Agent 增加一次完整任务执行的 Langfuse Trace。要求一个
-`AgentRuntime.run_turn` 对应一个顶层 Agent observation，内部模型、工具、子 Agent 和最终
-结果可见，同时保证观测后端任何故障都不改变 Runtime 行为。本阶段不包含
-Evaluation、Harbor、Process Evaluation、Failure Attribution、Regression 或 Quality Gate。
+##### 任务目标与原始问题
 
-### 当前 Aegis 的相关源码位置
+历史会话已经可以恢复，但无标题或只依赖手工 `/title` 时，`/sessions` 很难快速辨认上下文。本阶段把标题定义为**可丢弃、可重建的派生元数据**：首轮结束后立即生成本地启发式标题，再由后台模型做可选增强，同时不阻塞对话、不覆盖用户命名。
 
-- Agent Run / Final Result：`src/aegis_agent/cli.py::_repl` 调用
-  `src/aegis_agent/runtime.py::AgentRuntime.run_turn`；内部 loop 返回 `TurnResult`。
-- Model Call：`AgentRuntime` 原有的统一边界是
-  `collect_response(self._provider.stream(...))`，现由 `_call_model` 在同一位置包装。
-- Tool Call：`src/aegis_agent/tools/executor.py::ToolExecutor.execute_one` 是所有工具的
-  统一执行入口；本次没有修改任何具体 Tool。
-- Subagent：`AgentTool.run` → `SubagentManager.spawn/_execute` →
-  `SubagentRunner.run` → 子 `AgentRuntime.run_turn`。
-- 文档与源码存在差异时，以上当前源码调用链为准。
+##### 参考行为与迁移决策
 
-### 外部参考与实现决策
+Hermes 提供“首轮后异步生成标题”的行为参考；Claude Code 提供 manual title 高于 AI title 的优先级思路。Aegis 采用 **combined adaptation + rewrite**，基于现有 `ModelProvider`、`SessionRepository` 和 Python 线程重写，没有移植专用 SDK 或产品 UI。
 
-- 使用 Langfuse Python SDK v4 推荐的 `Langfuse` client、
-  `start_as_current_observation(...)` 和 `propagate_attributes(...)`。
-- 选择 **original additive implementation**：Aegis Runtime 仅依赖内部 `Observability`
-  协议，Langfuse 隔离在 adapter 中，以后可替换为 OpenTelemetry 或其他后端。
-- Langfuse 是 `observability` optional extra；未安装 SDK、未配置完整密钥或初始化
-  失败时自动使用 `NoopObservability`。
-- 本阶段没有使用 Hermes 或 Claude Code 作为观测行为参考，也没有修改两个
-  reference repository。
+##### Aegis 设计、主数据流与关键接口
 
-### Aegis 设计、数据流与追踪层级
+`sessions/titles.py` 负责清洗、脱敏、启发式生成和时间戳兜底；`SessionTitleService` 先同步写 heuristic，再在最终回答后至多调度一次 LLM 标题。Session 元数据增加 `title_source`，repository 原子维护 `manual > llm > heuristic`。SQLite 迁移把旧库已有标题回填为 manual；`/title`、`/new` 和 `/sessions` 复用同一套清洗与展示规则。
 
-```text
-AgentRuntime.run_turn
-└── Aegis Run (agent)
-    ├── Model Call (generation)
-    ├── Tool Call: <name> (tool)
-    ├── Tool Call: Agent (tool)
-    │   └── Subagent Run: <type> (agent)
-    │       ├── Model Call (generation)
-    │       ├── Tool Call: <name> (tool)
-    │       └── Final Result (span)
-    ├── Model Call (generation)
-    └── Final Result (span)
-```
+##### 可靠性、验证与限制
 
-- 顶层 Agent 记录 task、session id、agent name、Aegis version、result、success/error；
-  latency 由 SDK observation 的开始/结束时间自动得出。
-- Model generation 记录 provider、可用时的 model、messages、output、finish reason、
-  tool calls 和 error。
-- Tool observation 记录 name、arguments、result、success/error；例外仍按原来语义
-  返回或抛出。
-- 子 Runtime 共享同一 Observability 实例。后台线程使用 `contextvars.copy_context()`
-  携带当前 observation parent，使子 Agent 内部 model/tool 挂在子 Agent 节点下。
-- `sanitize` 在 adapter 边界统一处理输入、输出和 metadata：递归脱敏常见
-  credential key、Bearer/token 模式，限制递归深度/集合大小，并将长字符串截断为
-  20,000 字符且保留原始长度。
+标题不修改原始消息；自动任务永不覆盖手工标题；provider 失败或进程提前退出只会保留 heuristic，不影响会话。测试覆盖清洗与脱敏、优先级、SQLite 持久化/迁移和斜杠命令集成。后台增强会增加一次模型请求，且不是 durable job。
 
-### 重要文件与接口
+##### Interview summary
 
-- `src/aegis_agent/observability/tracer.py`：`Observability` / `Observation` 协议、
-  `NoopObservability`、`LangfuseObservability`、`create_observability`。
-- `src/aegis_agent/observability/sanitize.py`：`sanitize`。
-- `src/aegis_agent/runtime.py`：Agent/Model/Final 观测边界与子 Runtime 共享。
-- `src/aegis_agent/tools/executor.py`：统一 Tool observation。
-- `src/aegis_agent/agents/runner.py`, `agents/manager.py`：子 Runtime 传递与背景上下文传播。
-- `tests/test_observability.py`：本阶段的确定性 Trace/故障注入测试。
-
-### 可靠性不变量与故障处理
-
-- Langfuse 创建、更新、关闭 observation，属性传播、flush/shutdown 任一步异常
-  都在 adapter 内捕获，不进入 Agent 业务错误路径。
-- `ToolExecutor` 先保留原有 result/exception/cancellation，再以最小包装更新 Trace，
-  不改变工具错误如何返馈给模型。
-- 未配置时的 no-op 不进行网络请求。配置后 SDK 的异步上报在进程 shutdown
-  路径 flush，上报失败仍不影响 Aegis shutdown。
-- 不将密钥硬编码或写入 Trace；配置只从 `LANGFUSE_PUBLIC_KEY`、
-  `LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` 读取。
-
-### 测试、故障注入与实测结果
-
-- `uv run pytest -q tests/test_observability.py` → `6 passed`：普通 Model→Tool→Model→Final、
-  Tool failure recovery、Subagent 父子层级、未配置 no-op、模拟 Langfuse 不可用、
-  sanitize 和 SDK v4 adapter 参数。
-- `uv run pytest -q tests/test_runtime.py tests/test_runtime_streaming.py tests/test_runtime_config.py tests/test_tools.py tests/test_subagent.py tests/test_subagent_v2.py`
-  → `68 passed in 509.06s`，覆盖相关 Runtime/Tool/Subagent 回归。
-- `uv run pytest -q` → `643 passed, 2 skipped in 530.69s`。
-- `uv run ruff check src/aegis_agent/observability src/aegis_agent/runtime.py src/aegis_agent/tools/executor.py src/aegis_agent/agents/runner.py src/aegis_agent/agents/manager.py tests/test_observability.py`
-  → `All checks passed!`。
-- `uv run mypy src/aegis_agent/observability` → `Success: no issues found in 3 source files`。
-- 全仓 `ruff check .` 仍报 6 个与本阶段无关的已有文件问题，另外已修复并验证
-  本次 `runtime.py` import 格式；全仓 `mypy src` 的剩余 22 个错误位于既有
-  session/MCP/web/skills/runtime/agents/CLI 代码，新增 observability 包单独检查通过。
-
-### 权衡、当前缺口与待办事项
-
-- 当前 `ChatResponse` / model event stream 没有 token usage、cache token 或 cost 字段，
-  因此本阶段不伪造或估算这些值。
-- model 名称仅在当前 provider 暴露时采集；provider 类型始终作为 metadata。
-- 本阶段只增加 Trace，不生成 score、grader、dataset、dashboard、alert 或 quality gate。
-- 没有为实现 Trace 而重构 Agent Loop；新接口是后端中立的，下一阶段若需
-  OpenTelemetry 可在 adapter 层扩展。
-
-### 面试式简明说明
-
-"这次接入选择了五个现成统一边界：`run_turn`、provider stream、`ToolExecutor.execute_one`、
-子 `run_turn` 和 `TurnResult`。Runtime 只依赖内部 Observability protocol，Langfuse v4 是一个
-optional adapter。一次 turn 形成 Aegis Run，model/tool/final 是子 observation；Agent 工具下的
-子 Runtime 再形成 Subagent Run，并用 ContextVar 在后台线程传播 parent。所有 SDK 操作都
-fail-open，上报失败不会改变 Agent 的 result、exception 或 stop reason。进入 backend 前所有数据
-统一脱敏和截断。当前 Aegis 模型层拿不到 token/cache/cost，所以明确留空，不伪造。"
+“会话标题作为 Stage 20 的轻量派生元数据增量：先用本地启发式保证立即可用，再异步调用当前 provider 提升可读性；repository 用 `title_source` 原子维护 `manual > llm > heuristic`，所以后台竞态不会覆盖用户命名。SQLite 兼容迁移和失败降级保证标题功能不影响消息事实源与会话恢复。”
 
 ---
 
-## 阶段 18 修复——固定输入框与可用的历史滚动
+## 跨阶段可靠性专题
 
-### 任务目标与原始问题
+### 工具执行的协作式中断
 
-修复 `master` 上刚加入的 full-screen TTY：历史窗启动后是空白，提交消息仍看不到交互记录；
-工具调用、工具结果和错误直接写到底层 terminal，破坏 full-screen 重绘；底部同时出现 placeholder
-与整行反色提示，视觉噪声过多。目标收敛为上方独立可滚动的完整交互历史，以及底部始终可见的
-单行用户输入框，同时保留已有 Rich Markdown 和代码高亮。
+#### 任务目标、设计与验证
 
-### 相关参考行为与迁移决策
+早期 Ctrl+C 会让 `KeyboardInterrupt` 穿透工具栈并终止 REPL。修复后，`ToolContext.is_cancelled` 把操作员侧信号从 CLI 传到 runtime、executor 及 MCP/terminal/process/web 等可轮询边界；`OperationCancelled` 不会被包装成普通工具错误，runtime 以 `INTERRUPTED` 收口且不持久化半成品结果。第一次 Ctrl+C 取消当前回合，第二次保留强退兜底。测试覆盖预取消、信号注入、终端取消和“不落半成品结果”。
 
-- Claude Code `src/components/FullscreenLayout.tsx` 的行为参考：消息区与 bottom slot 分离；
-  手动离开底部后 streaming 不强制拉回，重新提交时恢复 tail following。
-- Hermes `cli.py` 的 prompt_toolkit 固定底部输入布局作为轻量结构参考。
-- 选择 **behavioural rewrite / repair**：未复制 React/Ink 或 Hermes CLI 代码，只修正 Aegis
-  已有的 Python `ScrollablePane` 实现并保持依赖不变。
+#### 权衡与限制
 
-### Aegis 设计与主要数据流
+协作式取消只能在轮询点生效；不可中断的底层网络读仍受自身 timeout 约束。lease 丢失使用独立的持久标记，不与每轮清除的瞬态 Ctrl+C 信号混用。
 
-- `_FullscreenShell._formatted_output()` 根据历史实际物理行数和 terminal 高度计算
-  `_last_max_scroll`，不再用 `10**9` 作为滚动位置。`_follow_output=True` 时贴住尾部；PageUp/
-  mouse wheel 向上后关闭跟随，新增 streaming 内容保持当前位置；滚回底部或提交新输入后恢复跟随。
-- Rich 的 ANSI 预渲染宽度预留一个 scrollbar cell，避免 scrollbar 出现时 Panel 多包一列、
-  高度翻倍并把最新内容挤出视口。
-- full-screen `prompt()` 提交后将原始用户文本以 `you❯` 写入历史。assistant Markdown、tool call、
-  tool result、runtime error 和 terminal stop status 都经 `_FullscreenShell.print_renderable()` 进入同一
-  history buffer，禁止再向底层 `Console` 穿透输出。
-- bottom slot 只保留一条分隔线和单行 `❯` composer；删除 full-screen placeholder 与反色 hint row。
-  非 full-screen PromptSession fallback 仍保留 placeholder、slash hint、历史和 token lexer。
+#### Interview summary
 
-### 重要文件与接口
+“核心不是捕获 Ctrl+C，而是把取消建模为贯穿 CLI、runtime、executor 和工具的控制流。取消异常必须穿透普通错误包装，才能保证回合以 INTERRUPTED 结束、半成品不入库，并让 REPL 在第一次 Ctrl+C 后继续可用。”
 
-- `src/aegis_agent/tui.py`：`_FullscreenShell.prompt`、`_formatted_output`、
-  `_history_viewport_height`、`_history_overflows`、`Tui._emit`、`_render_to_ansi`。
-- `tests/test_tui.py`：tail clamp、manual-scroll stickiness、full-screen tool-output containment 回归测试。
-- `README.md`、`docs/source-map.md`：更新可观察行为与参考关系；未新增 milestone 编号。
+### MCP 超时诊断与 terminal partial-output 修复
 
-### 可靠性不变量与边界情况
+#### 任务目标、设计与验证
 
-- full-screen 模式下不存在绕过 history buffer 的 turn-event 输出。
-- 空/短历史从第 0 行显示；长历史的最大 scroll 位置等于 `line_count - viewport_height`，不会出现
-  整片空白。
-- 用户主动滚动历史时，异步 spinner、streaming text 和 tool status 不改变其阅读位置；提交下一条
-  输入明确恢复贴尾。
-- non-TTY streaming 路径完全保留，因此管道、日志和 CliRunner 的文本契约不变。
-- full-screen 初始化失败仍自动回退到 PromptSession。
+真实下载中，外部 MCP 调用越过配置 deadline；fallback shell 又因 `TimeoutExpired.output` 可能是 bytes 且属于累计快照而发生二次异常。MCP 继续把单次上游超时转成模型可见 error result；terminal 则统一解码 partial stdout/stderr，用“替换累计缓存”代替追加，并在总 deadline 后 kill/reap 子进程，返回 `exit_code=124`、已捕获输出和明确错误。stdout/stderr 两条 timeout 路径均有回归测试。
 
-### 测试与实测结果
+#### Interview summary
 
-- `uv run pytest -q tests/test_tui.py` → `10 passed in 0.95s`（最终复跑）。
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
-- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
-- `uv run pytest -q` → `647 passed, 2 skipped in 542.49s`。
-- `uv run ruff check .` → 仍有 6 个与本修复无关的既有问题，位于 `cli.py`、
-  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
-  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
-- 100×30 tmux PTY 手工验证：启动 banner 可见；`you❯` / `aegis❯` / tool call / tool result 同处
-  history；PageUp 只滚动 history；底部 composer 保持固定。
-
-### 权衡、剩余限制与待办事项
-
-- 当前保留最多 4,000 个预渲染 history lines，没有 Claude Code 的 virtualized message list。
-- prompt_toolkit scrollbar 是轻量指示条；本阶段验证 mouse wheel 与 PageUp/PageDown，不实现
-  unseen-message pill、turn jump 或复杂 selection-preserving scroll。
-- Rich streaming preview 仍在 segment 完成后转换为 Markdown，不是 stable-prefix 增量 Markdown。
-
-### 面试式简明说明
-
-"这个 bug 不是配色问题，而是滚动状态和输出通道错了：代码把 scroll 直接设为十亿，在 history
-window 不持有 focus 时 prompt_toolkit 不会替它 clamp，于是内容全被滚出屏幕；同时 tool/error 还在
-写原 terminal。修复后用实际行数减 viewport 算最大滚动位置，并维护 follow-tail 状态；手动上滚后
-新 token 不抢位置，下一次提交再回到底部。所有用户、assistant、tool、error 输出统一进入 history，
-bottom 只剩单行 composer。Rich Markdown 渲染保留，TTY 与非 TTY 的行为边界也没变。"
+“我先区分上游超时和本地缺陷：搜索成功说明 MCP discovery 正常，下载是单工具越过 deadline；真正的 Aegis bug 是把 subprocess 的 bytes 累计快照当作 str delta。统一解码并替换缓存后，诊断 fallback 不再制造第二个失败。”
 
 ---
 
-## 阶段 18 修复补充——实时 Markdown 与可用的鼠标滚轮
+## Milestone 21 — 质量、可观测性与评测
 
-### 任务目标与原始问题
+这不是逐次提交清单，而是一条证据链：runtime 事件进入可观测性与 `ExecutionRecord`，Trace Viewer 用于人工审计，Process Evaluation 再基于同一证据执行确定性规则和可选 LLM Judge。下面按 21.1-21.6 记录该 Milestone 的各个组成部分。
 
-第一次布局修复后，full-screen assistant 在 streaming 阶段仍以 plain `Text` 显示，只有收到
-tool boundary 或 `TURN_END` 才变成 Rich Markdown；同时 PageUp/PageDown 可滚动，但 Windows
-Terminal 的鼠标滚轮事件由内层 output `Window` 消费，没有改变外层 `ScrollablePane` 的
-`vertical_scroll`。目标是在不改变固定 composer 和最终字体风格的前提下修复这两条交互路径。
+### Milestone 21.1 — Langfuse、Usage/Cost 与原生 Anthropic Provider
 
-### 相关参考行为与迁移决策
+#### 任务目标与迁移决策
 
-- Claude Code `src/components/Markdown.tsx::StreamingMarkdown` 提供 streaming 阶段已有格式的
-  可观察行为参考；Aegis 不迁移其 stable-prefix/Ink 实现，而是在现有 10 Hz full-screen refresh
-  中重渲染累计 Rich Markdown。
-- Claude Code `src/components/ScrollKeybindingHandler.tsx::scroll:lineUp/lineDown` 提供 wheel
-  直接控制 message scroll box、离底后关闭 sticky、回到底部恢复 sticky 的行为参考。
-- Hermes 当前 `cli.py` 明确使用 `mouse_support=False`，因此不适合作为本次 wheel 修复来源。
-- 决策为 **behavioural rewrite / targeted repair**，没有复制参考代码或增加依赖。
+核心 runtime 缺少跨模型、工具和子代理的统一观测，也无法可靠解释 token、cache token 与成本。Aegis 使用 Langfuse 官方数据模型作为外部协议参考，但把接入实现为可选 adapter；usage 分别按 OpenAI-compatible 和 Anthropic 原生响应归一。Anthropic provider 通过既有 `ModelProvider` 接入，用第二套真实协议验证 Agent Loop 未绑定具体 SDK。
 
-### Aegis 设计与主要数据流
+#### 设计、不变量与验证
 
-- `Tui._render_event(TEXT_DELTA)` 继续将 delta 累加到 `_TurnState`，但 live slot 现在接收
-  `_assistant_markdown_renderable(state.peek_text())`，和最终 `_flush_assistant_text()` 使用完全相同的
-  Rich `Group(label, Markdown)` 结构。每次 prompt_toolkit refresh 都显示当前累计 Markdown。
-- `_HistoryControl` 扩展 `FormattedTextControl.mouse_handler()`：只截获 `SCROLL_UP` /
-  `SCROLL_DOWN`，其余点击行为交回基类。wheel 事件经 `_FullscreenShell._scroll_history()` 修改
-  外层 pane，而不再落到高度等于全部内容的内层 `Window`。
-- wheel 与 PageUp/PageDown 共用 clamp 和 sticky 状态：向上滚设置 `_follow_output=False`；向下
-  到 `_last_max_scroll` 时恢复；所有目标都限制在 `[0, _last_max_scroll]`。
+一次 `run_turn` 对应顶层 agent observation，generation/tool/subagent 通过 parent id 形成层级。runtime 只发中立事件和结构化 usage，adapter 负责映射与失败降级。usage 沿 `ChatResponse → TurnResult → ExecutionRecord` 传播；缺失与零值分开，cache read/write 不混入普通 input，未知成本保持 unknown。测试覆盖无配置降级、观测层级、usage/cost 聚合，以及 Anthropic 文本、工具和流式事件。
 
-### 重要文件与接口
+#### Interview summary
 
-- `src/aegis_agent/tui.py`：`_HistoryControl`、`_handle_history_mouse`、`_scroll_history`、
-  `_assistant_markdown_renderable`、`Tui._render_event`。
-- `tests/test_tui.py`：`test_fullscreen_streaming_preview_is_markdown_rendered` 和
-  `test_fullscreen_mouse_wheel_scrolls_history`。
-- `README.md`、`docs/source-map.md`：更新 streaming 与 wheel 的用户可见行为和参考关系。
+“21.1 的关键是稳定边界：runtime 发 provider-neutral 事件，adapter 再映射 Langfuse；usage 在 provider 层归一，未知成本不猜。原生 Anthropic provider 复用同一个 Agent Loop，证明 provider 抽象不只是给 OpenAI client 换了名字。”
 
-### 可靠性不变量与边界情况
+### Milestone 21.2 — Harbor 离线评测与 ExecutionRecord
 
-- turn 未结束时 live preview 已是 Markdown，结束时只从 live slot 原样提交到 history，不出现
-  plain-to-Markdown 的突然替换。
-- incomplete Markdown 允许在后续 delta 到来时自然重排；UI 渲染异常仍走已有 plain fallback。
-- wheel burst 不会产生负 scroll 或越过 history tail；短历史下 scroll clamp 为 0。
-- 用户上滚后新 token 不抢走阅读位置；向下滚到底后 streaming 才继续贴尾。
-- non-TTY char-by-char output 路径未改变。
+#### 任务目标、架构与可靠性
 
-### 测试与实测结果
+在线 trace 不适合作为可重复、可导出和可离线评分的唯一事实源。Aegis 让同一条 runtime 事件流同时服务 TUI 和 recorder，归一成包含稳定 ID、消息/工具步骤、usage、终止原因、错误和 provenance 的 `ExecutionRecord`；Harbor adapter 负责非交互运行与幂等导入。setup、agent、verifier 和 infrastructure failure 分层保存；无轨迹或缺字段返回 `unknown` / `insufficient_data`，不能默认成功。离线 fake 与 fixtures 覆盖 schema、序列化、稳定 ID、导入幂等和缺失证据。
 
-- `uv run pytest -q tests/test_tui.py` → `12 passed in 1.58s`（最终复跑）。
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
-- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
-- `uv run pytest -q` → `649 passed, 2 skipped in 528.69s`。
-- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
-  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
-  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
-- 100×30 tmux VT100 实测：连续三轮工具输出后发送三次 SGR wheel-up 序列，history 从尾部移动到
-  banner/第一轮消息，固定 composer 保持在底部。
+#### Interview summary
 
-### 权衡、剩余限制与待办事项
+“21.2 把在线事件落成离线事实记录，但不另造一套执行逻辑。Harbor adapter 用稳定 ID 幂等导入，并把 setup、agent、verifier 和基础设施错误分层保存；缺证据就是 insufficient_data。后续评分因此建立在真实步骤上，而不是从最终文本反推过程。”
 
-- 当前对累计文本做完整 Rich Markdown 重渲染；实现简单且刷新上限为 10 Hz，但超长单段回复的
-  渲染成本高于 stable-prefix/unstable-suffix 增量方案。
-- incomplete fenced code/table 在 streaming 中可能短暂重排，这是 Markdown 流式渲染的预期行为。
-- scrollbar 仍是 prompt_toolkit 指示条，不实现抓住 thumb 拖拽或 selection-preserving scroll。
+### Milestone 21.3 — Trace Viewer：从记录到可审计证据
 
-### 面试式简明说明
+#### 任务目标、设计与可靠性
 
-"两个现象来自两条不同的事件路由：delta live slot 用的是 plain Text，所以最终 flush 才出现
-Markdown；VT100 wheel 则交给内层 Window，而真正的 scroll offset 在外层 ScrollablePane。现在
-streaming 与 final 共用同一个 Rich Markdown renderable，wheel 和 PageUp/PageDown 也共用一个
-clamped scroll helper。真实 tmux SGR wheel 输入和单元测试都验证了离底/回底 sticky 状态。"
+Viewer 将本地 record 按 session、turn 和 Harbor job 聚合，并分为 Conversations、Harbor Evaluations 与 All Runs；详情按时间展示消息、工具、usage、错误和 grader evidence。同步只增量导入可识别的 Harbor job，不覆盖原文件；用户内容按文本渲染。最终成功不会抹去中途 recovered error，旧 schema、缺 usage、缺云链接和测试生成 trace 均有明确降级。测试覆盖聚合、筛选、安全转义、旧记录、同步幂等、恢复状态与 refresh 成功/失败复位。
 
----
+#### Interview summary
 
-## 阶段 18 修复补充——稳定的流式帧与精细滚轮
+“Trace Viewer 不是成功率仪表盘，而是 ExecutionRecord 的审计界面。它保留来源和时间顺序，让最终成功与中途恢复错误同时可见；评分可以一路追到原始消息和工具证据，缺字段也不会被 UI 填成虚假的默认值。”
 
-### 任务目标与原始问题
+### Milestone 21.4 — Process Evaluation 与 Failure Recovery
 
-实时 Markdown 和滚轮路由修复后，用户仍观察到 streaming 中偶尔闪回开场 history 一帧，滚轮移动
-也显得偏猛、偏卡。目标是在不更换 prompt_toolkit 布局的前提下消除中间空帧，并把滚动步长调到
-更接近 Claude Code 的精细体验。
+#### 任务目标与迁移决策
 
-### 相关参考行为与迁移决策
+最终 reward 无法说明模型是否循环调用、遇错后是否恢复、是否做了必要验证。过程评测器依据 Aegis 的 `ExecutionRecord` 独立设计；Harbor 只提供任务与 verifier 语境，Hermes/Claude Code 不是评分规则来源。LLM Judge 复用现有 provider，不另建模型客户端。
 
-- Aegis 当前 `TEXT_DELTA` 路径的直接证据：每个 delta 都先调用 `state.stop_spinner()`，而
-  full-screen 的实现会执行 `shell.set_live(None)`，随后才写入新的 Markdown renderable。
-- Claude Code `src/components/ScrollKeybindingHandler.tsx` 明确规定 precision scroll 的基准为
-  `1 event = 1 row`；其后还有设备识别和加速曲线，本次只采用最低风险的基准步长。
-- 选择 **targeted repair / behavioural adaptation**：修正 Aegis 自身竞态，将 wheel 常量从 3 降到
-  1；不迁移 Claude Code 的 pending-delta、bounce detection 或 acceleration 系统。
+#### 数据流、证据与失败处理
 
-### Aegis 设计与主要数据流
+`ExecutionRecord → evidence extraction → deterministic graders → optional failure-recovery judge → aggregate result`。确定性规则检查工具失败、重复/低效步骤、最终验证、上下文与异常终止；每项都输出 reason 和 evidence reference。Judge 只处理需要语义判断的失败恢复。空轨迹、无恢复机会或基础设施故障返回 `insufficient_data` 或正确归因；Judge 超时、失败、不可解析时降级到确定性结果并保留 provenance。普通对话按 turn 记录，配置按 CLI、持久设置和默认值的明确优先级解析。
 
-- `Tui._render_event(TEXT_DELTA)` 只在 `state.started_text` 为 false 时清除 thinking spinner。
-  第一个 delta 之后，live slot 始终从一个 Markdown renderable 原子替换为下一个，不再经过 `None`。
-- `_WHEEL_SCROLL_LINES = 1`；已有 `_scroll_history()` 继续负责 clamp、离底关闭 follow、回底恢复
-  follow，因此只改变手感，不改变边界语义。
+#### 验证、权衡与 TODO
 
-### 重要文件与接口
+测试覆盖确定性规则、空轨迹、失败后恢复、Judge 降级、配置优先级、旧记录回填与 Viewer 展示。真实 Harbor 样例用于反向审计评分器，发现内联 Python 自测漏判、无轨迹满分、部分验收覆盖和“是否有恢复机会”等问题。规则便宜且可重复，Judge 更有语义能力但引入成本与不确定性，因此保留混合结构和完整来源信息。
 
-- `src/aegis_agent/tui.py`：`_WHEEL_SCROLL_LINES`、`Tui._render_event`。
-- `tests/test_tui.py`：扩展 streaming 测试以断言第二个 delta 之间没有 `None` live update；wheel
-  测试断言单事件只移动一行。
-- `README.md`、`docs/source-map.md`：记录 precision wheel 和无中间空帧行为。
+#### Interview summary
 
-### 可靠性不变量与边界情况
+“21.4 的重点不是再造总分，而是让每个判断绑定证据。可证明的事实先走确定性 grader，只有 failure recovery 这类语义问题才调用 Judge；Judge 失败安全降级。空轨迹、基础设施失败和没有恢复机会必须单独建模，否则评分器会比 Agent 更不可靠。”
 
-- thinking spinner 仍会在第一个 text delta 前正确清除。
-- 第二个及后续 delta 不清空 live slot；不再产生可被 UI thread 捕获的空历史帧。
-- tool/error/turn boundary 仍可显式清空 live slot并提交最终 segment。
-- wheel 始终 clamp 在 `[0, _last_max_scroll]`，只是每事件移动量从 3 变为 1。
-- non-TTY streaming 路径不变。
+### Milestone 21.5 — Efficiency Calibration 与 Judge 证据解析
 
-### 测试与实测结果
+#### 原始问题与设计决策
 
-- `uv run pytest -q tests/test_tui.py` → `12 passed in 0.88s`（实现后首轮）。
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`。
-- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`。
-- `uv run pytest -q` → `649 passed, 2 skipped in 526.15s`。
-- `uv run ruff check .` → 仍为 6 个与本次修改无关的既有问题，位于 `cli.py`、
-  `mcp/client.py`、`sessions/__init__.py`、`sessions/titles.py` 和
-  `tests/test_session_titles.py`；本次涉及的 Python 文件单独检查通过。
+未配置效率阈值或 baseline 时，Execution Efficiency 过去返回 `insufficient_data`，容易被误读为失败，也会污染总体状态。现在保留 step、tool call、model call、duration、token、cost 等当前 execution 指标，但用 `not_scored` 表示未校准状态；它不参与 overall PASS/FAIL 或 overall score。阈值仍只来自显式配置，历史 baseline 按 `task_id` 分组，仅从成功 execution 生成，至少五个成功样本后按各指标 median 校准；失败、setup/verifier failure、其他 task 的样本均排除。
 
-### 权衡、剩余限制与待办事项
+#### Judge 解析与 episode 关联
 
-- 单事件一行优先保证精细与稳定；没有 Claude Code 针对快速连续滚动的自适应加速，长距离回看应使用
-  PageUp/PageDown。
-- prompt_toolkit `ScrollablePane` 仍会重绘其虚拟内容；非常长的 4,000 行历史可能需要后续做窗口化，
-  本次没有以高风险重构换取尚未量化的性能收益。
+Final Verification 共用防御性 JSON 提取逻辑，支持纯 JSON、Markdown fenced JSON 和平衡对象提取，解析失败继续 fail-open。Failure Recovery 为每个失败 step 派生稳定 `episode:<failure_step_id>`，同时保留原 failure step address；Judge 输出必须覆盖精确 episode 集合，恢复 step 必须属于该 episode 的后续 timeline，避免跨 episode 关联。ID 不匹配时保留规则 fallback 和紧凑 telemetry。
 
-### 面试式简明说明
+#### 验证、权衡与 TODO
 
-"闪屏不是 Markdown 本身，而是每个 token 都把 live slot 先设成 None，再放回新 renderable；UI
-线程偶尔会画到这个中间态。现在只在首个 delta 清 spinner，后续 frame 直接 Markdown-to-Markdown
-替换。滚轮则从 3 行降到 Claude Code 的 precision baseline 1 行，边界和 sticky 逻辑保持不变。"
+新增/更新测试覆盖未校准效率的聚合语义、历史成功样本和失败样本过滤、fenced JSON、episode ID 校验；完整测试结果为 812 passed, 3 skipped，Ruff 检查通过。最低五个样本是校准所需的数据充分性门槛，不是执行步数硬阈值；后续可在真实成功 execution corpus 增长后审查 baseline multiplier 与 metric 缺失策略。
+
+#### Interview summary
+
+“我把未校准和失败分开：没有 baseline 只能说无法评分，不能说效率失败；只有真正的 grader warning/fail 才影响总体状态。baseline 不凭空写死，而是按 task_id 从至少五个成功历史 execution 的 median 生成。Judge 端既接受模型常见的 Markdown JSON，也用稳定 episode ID 和后续 timeline 约束证据，防止恢复结论串到另一个失败 episode。”
+
+### Milestone 21.6 — Harbor / Terminal-Bench 运行与验收可靠性
+
+#### 原始问题与分层修复
+
+真实评测暴露了四层边界：setup、模型传输、verifier 和 Docker environment。修复只传用户显式代理与 pip 配置，提前拒绝容器不可达的回环代理；本地 Docker/WSL 在显式 `host.docker.internal` 无解析时才按默认网关补 hosts。setup/runtime/verifier 分别获得所需代理，模型 timeout 独立配置。terminal 在 Bash 可用时启用 `pipefail`，长任务识别基于结构化命令而非路径子串，容器身份优先于共享 WSL kernel。Docker 启动日志流式写入 trial；取消时终止并等待子进程，同时保留下载进度与原超时分类。
+
+#### 验证、边界与来源关系
+
+定向测试覆盖代理隔离/贯通、pip 设置、回环拒绝、provider timeout、pipefail、命令识别、容器检测、Docker 取消和启动日志。真实 trial 分别验证各阶段并保留原始 Job/record/log；没有修改 benchmark、reward 或 verifier。网关映射只针对本地 Docker/WSL，预缓存一个镜像也不代表所有 registry 问题已解决。该专题是 Aegis/Harbor 的原创可靠性修复，与 Hermes/Claude Code 无代码迁移关系。
+
+#### Interview summary
+
+“我没有用一个更大的 timeout 掩盖所有 Harbor 失败，而是按 setup、模型、verifier 和 environment 拆层，因为它们的网络与生命周期不同。显式代理、回环早失败、按需网关映射、pipefail 和流式启动日志让基础设施故障可诊断；稳定后再用真实轨迹审计 Process Evaluation，才能正确区分 Agent 行为、缺证据和环境问题。”
 
 ---
 
-## TUI 滚动性能的视口裁剪优化
-
-### 问题
-
-终端界面滑动时卡顿，特别是当历史记录很长时。原因是 `_formatted_output()` 每次渲染都连接所有行（最多 4000 行），即使只有视口内（约 50 行）的内容可见。
-
-### 参考实现
-
-Claude Code 使用前端/后端帧缓冲和 Yoga 布局引擎，只渲染视口内的内容。Aegis 需要在 prompt_toolkit 框架下实现类似的视口裁剪。
-
-### 实现方案
-
-在 `_FullscreenShell._formatted_output()` 中添加视口裁剪：
-
-1. **计算视口范围**：基于滚动位置和视口高度，计算需要渲染的行范围
-2. **添加缓冲区**：在视口上下各添加 50 行缓冲区，确保平滑滚动
-3. **只渲染可见部分**：只连接和渲染视口范围内的行，而不是所有历史行
-
-### 关键修改
-
-**文件**: `src/aegis_agent/tui.py`
-
-1. 添加常量 `_VIEWPORT_BUFFER_SIZE = 50`
-2. 修改 `_formatted_output()` 方法：
-   ```python
-   # 计算视口范围（带缓冲区）
-   scroll_pos = self.scroll.vertical_scroll
-   start = max(0, scroll_pos - _VIEWPORT_BUFFER_SIZE)
-   end = min(len(lines), scroll_pos + viewport_height + _VIEWPORT_BUFFER_SIZE)
-
-   # 只渲染可见部分
-   visible_lines = lines[start:end]
-   text = "\n".join(visible_lines)
-   ```
-
-### 性能测试结果
-
-- **优化前**：渲染 10000 行需要连接所有行
-- **优化后**：只渲染 98 行（视口高度 48 + 2×50 缓冲区）
-- **渲染时间**：0.0017s（10000 行中只渲染 1%）
-
-### 修改文件
-
-- `src/aegis_agent/tui.py` — 添加视口裁剪优化
-
-### 执行的测试
-
-- `uv run pytest -q tests/test_tui.py` → 12 passed
-- `uv run pytest -q` → 649 passed, 2 skipped
-
-### 权衡
-
-- 缓冲区大小（50 行）是经验值，需要在平滑滚动和内存使用之间平衡
-- 极端情况下（快速滚动大量内容），可能需要调整缓冲区大小
-
-### 剩余待办事项
-
-- 监控实际使用中的性能表现
-- 考虑添加自适应缓冲区大小（基于滚动速度）
-
----
-
-## 阶段 18 视口裁剪正确性补充
-
-### 问题与根因
-
-第一版视口裁剪把格式化后的历史缩减为带缓冲区的切片，但仍然把
-`ScrollablePane.vertical_scroll` 当作完整历史中的绝对位置使用。切片起点超过第 0 行后，
-prompt_toolkit 收到的是面向完整历史的偏移量，而实际文档只有视口大小。这会导致长回复流式
-输出时，手动滚动的视图冻结或变为空白；同一坐标不一致还可能让实时思考状态落到有效窗格之外。
-
-### 实现
-
-- `_FullscreenShell._history_scroll` 现在保存完整历史中的绝对位置。
-- `_formatted_output()` 根据绝对位置计算裁剪边界，再设置
-  `scroll.vertical_scroll = _history_scroll - start`，向窗格传入有效的切片内坐标。
-- 鼠标滚轮、Home/End、清屏、尾部跟随和历史截断统一更新该逻辑坐标。
-- 实时内容增长时保持手动滚动位置不变；到达尾部时恢复跟随模式。
-
-### 验证
-
-- `tests/test_tui.py` 覆盖超过 50 行缓冲区时的全局到局部坐标转换、历史尾部可见的实时
-  思考状态，以及手动滚动视口期间连续增长的 100 帧实时内容。
-- `uv run pytest -q tests/test_tui.py` → `15 passed in 0.95s`.
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
-- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
-- `uv run pytest -q` → `652 passed, 2 skipped in 526.04s`.
-- 全仓 Ruff 仍保留 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
-  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
-  本次 TUI 修复涉及的文件均通过定向检查。
-
-### 权衡与剩余工作
-
-由于滚动条由 prompt_toolkit 管理，它描述的是缓冲切片而不是完整逻辑历史。滚轮和翻页使用
-逻辑历史位置，因此行为仍然正确；要实现对应完整历史的比例滑块，需要自定义滚动条或改用其他
-虚拟化容器。
-
----
-
-## 阶段 18 补充——移除误导性滚动条并增加跳转到尾部
-
-### 任务目标与原始问题
-
-视口裁剪使 prompt_toolkit 的内置滚动条只能描述缓冲切片，因此滑块大小变化不一致，无法拖动
-浏览完整历史，而且会传达错误的位置。界面还需要一种快速方式，让用户离开手动滚动位置并返回
-实时输出尾部。
-
-### 相关参考行为与迁移决策
-
-- Claude Code 的 `src/keybindings/defaultBindings.ts` 将 `ctrl+end` 映射到
-  `scroll:bottom`，随后由 ScrollBox 恢复粘性尾部跟随。
-- Aegis 对该快捷键与跟随行为做小范围行为适配，不迁移 Claude Code 的自定义 ScrollBox 或
-  比例滚动条。
-- 直接移除仅描述切片的 prompt_toolkit 滚动条，不用另一个不准确实现替换它；真实可拖动滑块
-  需要独立的完整历史虚拟滚动控件。
-
-### Aegis 设计与主要数据流
-
-- `ScrollablePane(show_scrollbar=False)` 移除不准确的可视滑块。
-- 即使输入框拥有焦点，全局 `Keys.ControlEnd` 绑定也会调用 `_jump_to_bottom()`。
-- `_jump_to_bottom()` 将 `_last_max_scroll` 赋给 `_history_scroll`，启用
-  `_follow_output` 并刷新应用。下一帧继续执行现有的绝对坐标到切片内坐标转换。
-- 输入框拥有焦点时，单独按 End 仍保持正常的光标移动行为。
-
-### 可靠性不变量与边界情况
-
-- 隐藏滚动条后，滚轮及 PageUp/PageDown 仍然可用。
-- `Ctrl+End` 能从很长历史中的手动滚动位置跳到底部，并恢复实时尾部跟随。
-- 短历史下 `_last_max_scroll` 为零，因此会正常限制位置。
-- 模型、Runtime、持久化及非 TTY 行为均未改变。
-
-### 测试与实测结果
-
-- `tests/test_tui.py` 验证滚动条被禁用、存在全局 `Keys.ControlEnd` 绑定，并确认跳到底部会同时
-  恢复最大逻辑位置与跟随模式。
-- `uv run pytest -q tests/test_tui.py` → `16 passed in 0.70s`.
-- `uv run ruff check src/aegis_agent/tui.py tests/test_tui.py` → `All checks passed!`.
-- `uv run mypy src/aegis_agent/tui.py` → `Success: no issues found in 1 source file`.
-- `uv run pytest -q` → `653 passed, 2 skipped in 525.45s`.
-- `git diff --check` → 通过。
-- 全仓 Ruff 仍保留相同的 6 个既有问题，位于 `cli.py`、`mcp/client.py`、
-  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
-  本次补充未引入新问题。
-
-### 权衡、剩余限制与待办事项
-
-当前有意不显示完整历史位置指示器。真实可拖动的滚动条需要自定义控件，把完整历史映射到裁剪
-窗格；除非用户测试证明增加的复杂度值得，否则暂不实现。
-
-### 面试式简明说明
-
-“内置滑块描述的是约一百行的渲染切片，而不是完整对话，因此大小和位置具有误导性，也不能用于
-有效拖动。Aegis 现在隐藏该滑块，并采用 Claude Code 已有的 Ctrl+End 快捷键：一次操作跳到逻辑
-历史尾部并重新启用粘性实时跟随，同时由既有的视口坐标转换控制渲染规模。”
-
----
-
-## Quality 阶段 0 补充——Token Usage、Cache Tokens 与 Cost 数据链
-
-### 根因与目标调用链
-
-当前安装的 OpenAI SDK 在 `ChatCompletion` 和 `ChatCompletionChunk` 上都会暴露
-`usage`。标准 Usage 包含 `prompt_tokens`、`completion_tokens`、`total_tokens`，以及可选的
-`prompt_tokens_details.cached_tokens` / `cache_write_tokens`。本次补充前，Aegis 在四个边界
-丢失了这些值：
-
-1. 流式请求没有设置 `stream_options.include_usage`；
-2. `StreamAssembler` 忽略最终 `choices=[]` 的纯 Usage chunk，
-   `_events_from_response` 也忽略非流式 `response.usage`；
-3. `ModelEvent` 和 `ChatResponse` 没有 Usage 字段；
-4. `AgentRuntime._call_model` 只更新生成输出。
-
-既有 Langfuse adapter 已能接收 `usage_details` 和 `cost_details`，因此没有给 Runtime 增加
-具体 SDK 依赖。
-
-### 数据模型与传递
-
-- `ModelUsage` 是 Provider 中立的数据结构，包含 `input_tokens`、`output_tokens`、
-  `total_tokens`、`cache_read_tokens`、`cache_write_tokens` 和可选的上游直接 `cost`。
-- `parse_openai_usage` 是 OpenAI 兼容协议的适配器。OpenAI 的 `prompt_tokens` 包含缓存
-  Token，因此构造普通 `input_tokens` 前会减去缓存读写明细。这样得到互斥的 Langfuse
-  计数桶，避免推导成本时重复计数。
-- Provider 发出 `ModelEventKind.USAGE`；`collect_response` 将最新的累计 Usage 事件保存在
-  `ChatResponse.usage` 中。因此，即使 Usage 只出现在最后一个流式 chunk，也不会在聚合时丢失。
-- Runtime 通过现有 Observation API 传递 `input`、`output`、`total`、
-  `cache_read_input_tokens` 和 `cache_creation_input_tokens`。
-- 如果 OpenAI 兼容网关直接返回 `usage.cost` 或等价的总成本字段，Aegis 会发送
-  `cost_details.total`。标准 OpenAI Chat Completions 不返回成本，因此该字段保持未设置。
-  Aegis 不维护价格表，也不估算成本。
-
-### Provider 兼容性与不变量
-
-- `OpenAICompatibleProvider`：在流式和单次响应模式下采集标准 Chat Completions Usage，
-  同时支持已知兼容协议中的缓存与直接成本字段。
-- `FakeModelProvider`：测试时可接收确定性的 `ModelUsage`；普通回复仍默认为 `usage=None`。
-- Provider 不返回 Usage 时，保持原有 Runtime 结果和事件行为。`USAGE` 是非 UI 事件，因此
-  TUI 语义不变。
-- Observability 继续保持故障开放；No-op Langfuse 不产生网络流量，新增 Usage 也不能导致
-  模型调用或整个 Turn 失败。
-
-### 测试与验证
-
-- 定向 Provider、Stream、Observability 和 Fake 测试首次运行结果为
-  `45 passed, 1 skipped`。
-- 覆盖普通输入/输出 Usage、独立缓存读写、只在最终流式 chunk 出现的 Usage、缺失 Usage、
-  API 直接成本、Langfuse v4 更新字段，以及 Langfuse 禁用或故障的情况。
-- `uv run pytest -q` → `659 passed, 2 skipped in 527.77s`.
-- 本次补充修改的全部文件通过 Ruff：`All checks passed!`。
-- `uv run mypy src/aegis_agent/models src/aegis_agent/events.py src/aegis_agent/observability`
-  → `Success: no issues found in 11 source files`.
-
-### 范围外事项与剩余缺口
-
-- 未增加模型价格数据库、成本预测、Evaluation、Harbor、Regression、Quality Gate 或无关的
-  Provider 重构。
-- 上游 API 不返回成本时，Cost 保持 `None`。Langfuse 可以根据自身配置的模型定义独立推算成本，
-  但 Aegis 不制造或接收这种估算值。
-
----
-
-## Quality 阶段 0 补充——原生 Anthropic Provider
-
-### 目标与 Provider 边界
-
-本次补充把 Anthropic 作为 Aegis 的第二个真实模型适配器，并且不改变 Runtime、Tool Executor
-或 Observability 抽象。实现直接使用原生 Messages API，而不是让 Anthropic 经过 OpenAI 兼容
-协议格式：
-
-```text
-Anthropic Messages response/stream
-  -> AnthropicProvider
-  -> provider-neutral ModelEvent / ModelUsage
-  -> collect_response / ChatResponse
-  -> AgentRuntime
-  -> existing Langfuse observation update
-```
-
-通过 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL` 和可选的 `ANTHROPIC_BASE_URL` 配置该
-Provider。`--model-backend anthropic` 会强制选择它；`auto` 保留现有 OpenAI 兼容 Provider
-的优先级，并在 Anthropic Key 与模型同时存在时选择 Anthropic。自动模式下缺少配置时，仍然回退到
-Fake Provider。
-
-### 消息、工具与流式行为
-
-- System 消息被提取到 Messages API 的 `system` 参数中。
-- Aegis Assistant Tool Call 转换为 Anthropic `tool_use` block；Tool 消息转换为 User 角色的
-  `tool_result` block。工具 Schema 使用 `input_schema`。
-- 流式 `text_delta`、`thinking_delta` 和 `input_json_delta` 事件转换为 Aegis 现有的文本、
-  推理和已完成 Tool Call 事件。
-- `end_turn`、`tool_use`、`max_tokens`、拒绝和上下文窗口等停止原因，被统一映射到 Runtime
-  使用的 Finish Reason 词汇。
-- SDK 或传输错误统一转换为 `ModelProviderError` 或 `ModelTimeoutError`，保持现有 Runtime
-  错误路径。
-
-### Usage、缓存、总量与成本
-
-Anthropic 在 `message_start` 提供输入与缓存 Usage，然后在 `message_delta` 提供最终输出
-Usage。`parse_anthropic_usage` 会累计合并两者；最终 delta 中为零的输入或缓存值不会覆盖此前
-观察到的非零计数。Anthropic 的 `input_tokens` 保留为普通非缓存计数桶，
-`cache_read_input_tokens` 与 `cache_creation_input_tokens` 则继续分开保存。
-
-Messages API 不直接返回 `total_tokens` 或金额成本，因此两者保持 `None`；Aegis 不合成总数、
-不套用价格表，也不估算成本。现有 Observability Adapter 会原样接收可靠的输入、输出和缓存计数桶。
-
-### 来源关系与范围
-
-- Hermes 的 `agent/transports/anthropic.py` 为原生 Tool Block 和停止原因归一化提供参考。
-- Claude Code 的 `src/services/api/claude.ts` 为累计流式 Usage 规则提供参考，避免起始事件中的
-  非零字段被最终事件中的零值覆盖。
-- 实现是针对 Aegis 同步 `ModelProvider` 协议的紧凑重写。未迁移 Hermes/Claude Code 的认证栈、
-  Bedrock/Vertex 变体、重试系统和产品遥测。
-- 未增加 Evaluation、价格数据库、Fallback Router 或无关 Provider 重构。
-
-### 验证
-
-确定性测试覆盖原生消息/工具转换、流式文本与工具 JSON 组装、独立缓存读写 Usage、仅最终事件
-含 Usage、缺失 Usage、单次响应、错误归一化、CLI 选择和摘要 Provider 构建。
-
-- 定向 Provider、Stream、Observability 和 Compression 测试：
-  `88 passed, 1 skipped in 0.39s`.
-- `uv run pytest -q` → `668 passed, 2 skipped in 525.13s`.
-- 全仓 Ruff 仅报告原有的 6 个问题，位于 `cli.py`、`mcp/client.py`、
-  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；
-  Anthropic 实现没有引入新问题。
-- Model、Event、Observability 和 Wrapper 边界的定向 mypy 检查通过。加入整个 `runtime.py` 后，
-  仍只暴露两个既有的动态 Manager 属性问题：`drain_lead_messages` 和 `drain_notifications`。
-- `git diff --check` 通过。
-
----
-
-## Agent Quality 阶段 1 + 阶段 2——Harbor 离线评测与 ExecutionRecord
-
-### 范围与 Harbor 扩展决策
-
-本阶段只增加 Harbor 执行桥接，以及后续质量工作所需的统一记录；不增加过程评分器、失败归因、
-回归、坏例挖掘、质量门禁或 Dashboard。
-
-实现前直接检查了 Harbor 0.22 源码及其本地分析文档。最终选择 Harbor 官方支持的 Python
-自定义 Agent 导入路径，并以 `BaseInstalledAgent` 为基础：
-
-```text
-harbor run --agent aegis_agent.integrations.harbor:Aegis
-  -> Aegis.install(): build/upload/install the current Aegis wheel
-  -> Aegis.run(): execute `aegis run` inside the task environment
-  -> /app: Aegis ToolContext working directory
-  -> Harbor verifier
-  -> Harbor result.json
-  -> `aegis quality import-harbor`
-  -> final ExecutionRecord
-```
-
-同目录 Harbor 仓库没有被修改或 Fork。选择 `BaseInstalledAgent` 而不是宿主机侧 Wrapper，是因为
-Aegis Runtime 及其工具必须在 Harbor 环境内部执行。Task/Dataset、Job/Trial、环境生命周期、
-超时、重试、并发、Verifier、Reward 和 Pass@K 行为仍由 Harbor 负责。
-
-### 非交互式 Runtime 与配置
-
-`aegis run` 在不启动 TUI 的情况下只执行一个任务。它沿用现有 Provider 选择逻辑：`auto`、
-OpenAI 兼容、Anthropic 或显式的测试专用 Fake；创建内存 Session，运行未改变的
-`AgentRuntime`，输出一行 JSON 结果并写入 ExecutionRecord。为隔离评测，Skills、MCP 和 Memory
-默认关闭，Subagent 仍然可用。交互式 `aegis` 行为不变。
-
-Harbor Adapter 通过 `AEGIS_INSTRUCTION` 传递任务指令，通过 `AEGIS_EXECUTION_ID` 传递
-Trial UUID，通过 `AEGIS_SESSION_ID` 传递 Harbor Agent Session Handle。Harbor 的
-`provider/model` 值会映射到 Anthropic 或现有 OpenAI 兼容 Aegis Provider。API Key、Endpoint、
-Langfuse 凭证以及 Proxy/No-Proxy 变量都从 Harbor Agent 环境（`--ae`）转发，没有任何硬编码。
-Harbor 自身的 Trial Timeout 继续包围 Agent 进程。`set -o pipefail` 与 `tee` 在把
-stdout/stderr 保留到 `agent/aegis.txt` 的同时，保留真实退出码。
-
-### 一条事件流，两个消费者
-
-实现没有增加第二套 Runtime Hook。`CompositeObservability` 将现有的
-Agent/Model/Tool/Subagent/Final Observation 分发给：
-
-```text
-Aegis Runtime / Tool Executor / Subagent Runtime
-  -> existing Observability API
-     -> fail-open Langfuse backend
-     -> ExecutionRecorder backend
-```
-
-本地 Recorder 对相同输入/输出做脱敏，保留父 Step ID、Usage 计数桶、错误和耗时，并以原子方式
-持久化 JSON。Langfuse 缺失或上报失败不能阻止记录生成，也不能改变 Turn 结果。
-
-### ExecutionRecord Schema 与数据归属
-
-`ExecutionRecord` Schema 版本 `1.0` 包含：
-
-- `identity`：Execution、Task、Trial、Job、Session 和 Trace ID；
-- `agent`：名称、版本、模型、Provider、配置和 Metadata；
-- `execution`：Runtime 时间、成功状态、最终输出、停止原因和错误；
-- `usage`：普通输入/输出/总量、缓存读写、Harbor 合并缓存和包含缓存的输入字段，以及上游直接成本；
-- `steps`：按顺序排列的 Agent/Model/Tool/Final 节点，包含 Parent ID、脱敏 Payload、时间、
-  Usage、错误和 Metadata；
-- `evaluation`：原始 Verifier 结果、Reward、约定的通过/失败状态和 Metrics；
-- `artifacts`：Harbor Agent/Verifier 日志及 Artifact 路径。
-
-Runtime 在 Verifier 结果产生前创建 `execution-record.runtime.json`。Harbor Trial/Job 完成后，
-Harbor Result Adapter 把 `result.json` 合并到 `execution-record.json` 和中央本地 Store 中。
-Runtime 成功与 Verifier 通过/失败有意分开：有效的 Agent 执行仍可能无法通过 Verifier。缺失字段
-保持 `None`，不猜测 Cost、Total Token、缓存拆分或 Pass 值。
-
-Harbor 的 `AgentContext.n_input_tokens` 包含缓存，并且只暴露一个 `n_cache_tokens` 值。因此
-Adapter 既保留 Aegis 独立的缓存读写计数桶，也把 Harbor 包含缓存/合并后的值保存在专用字段中。
-ATIF 的 Step/Tool/Observation 概念为领域结构提供参考，但本阶段不声称实现了 ATIF 转换。
-
-### 稳定 ID 映射
-
-Harbor 持久的 Trial UUID 同时作为 Aegis 的 `execution_id` 和 `trial_id`。Langfuse 接收一个
-确定性的 128 位 Trace ID，其值为 `SHA-256(execution_id)` 的前 16 字节，与 Langfuse 的 Seeded
-Trace ID 契约一致。Harbor `job_id`、Agent Session Handle 和 Task Identity 在最终合并时补入。
-因此，Trial、本地 Record 和 Trace 可以通过精确 ID 关联，不需要依赖时间戳。
-
-### 确定性验证与环境限制
-
-定向测试覆盖普通 Runtime 记录、Tool 失败后的模型恢复、独立缓存读写与直接成本、缺失 Usage、
-禁用 Langfuse、确定性 Trace ID、非交互 CLI 输出、Harbor 映射、Verifier 失败独立于 Runtime
-成功、Harbor 异常/超时结构、稀疏 TrialResult、Artifact 收集和 ID 不匹配拒绝。
-
-本阶段完成时，当前 WSL 尚未暴露 Docker（`docker: command not found`，Docker Desktop 提示开启
-WSL Integration），因此当时未能运行真实容器化 Harbor Trial。Adapter 遵循仓库内 Harbor 0.22
-接口并隔离 Import Path；确定性的 Runtime 与 TrialResult 边界测试不依赖 Docker。Docker Desktop
-WSL Integration 开启后，README 中的冒烟命令就是剩余的外部端到端验证。
-
-2026-09-01 后续环境验证：Docker Desktop 的 Ubuntu WSL Integration 已开启；WSL 内
-`docker version` 可同时访问 29.2.1 客户端与服务端，`docker info` 返回 Docker Desktop 4.63.0，
-并且 `docker run --rm hello-world` 已成功拉取镜像、创建容器并正常退出。Docker 执行条件已经满足，
-尚待运行的只是真实 Harbor Task/Verifier 端到端 Trial。
-
-实现边界的验证结果：
-
-- `uv run pytest -q tests/test_execution_record.py tests/test_harbor_execution_record.py tests/test_observability.py`
-  → `18 passed in 5.33s`;
-- 所有修改的 Python 模块与测试通过 Ruff：`All checks passed!`；
-- 跳过外部 Import 的定向 mypy 检查结果为 `Success: no issues found in 11 source files`；
-  加入 `runtime.py` 后仍只报告两个既有动态 Manager 属性问题；
-- `git diff --check` 通过；
-- 全量测试在无失败情况下运行超过 74%，随后在已知的全局 Process/MCP 慢测试区域长时间无输出后
-  被中断；阶段开始前最近一次完整基线仍为 `668 passed, 2 skipped`。
-
----
-
-## Agent Quality——本地 Trace 查看页
-
-### 目标与数据源边界
-
-本地查看页用于降低检查 Langfuse Trace 的操作成本，同时避免再建设一套 Trace 数据库。它是以下
-数据源之上的只读展示层：
-
-```text
-~/.aegis/quality/executions/*.json  （主要数据源，立即可用）
-             +
-Langfuse v4 Observations API       （可选的后台补充数据源）
-             ->
-http://127.0.0.1:8765
-```
-
-`aegis quality view` 使用标准库 `ThreadingHTTPServer` 启动服务，不增加 Web Framework 或前端
-依赖。本地 Record 提供稳定的 Execution Identity、Runtime 状态、Verifier 结果、Usage、Artifact
-和脱敏后的 Step Tree。凭证与可选 SDK 均存在时，服务端通过
-`client.api.observations.get_many` 查询逻辑根 Observation 和每个 Trace 的完整 Observation。
-实现不使用 Langfuse v3 Trace Endpoint；Langfuse Cloud 已弃用该接口，推荐改用 v4
-Observations API。
-
-### 交互体验、可靠性与安全
-
-三栏 UI 包含可搜索的 Execution 列表、分层 Agent/Model/Tool/Final Tree、汇总指标和
-Observation 详情。页面先渲染本地数据，再异步加载 Langfuse 根节点和详情。因此 Proxy、TLS 或
-Langfuse Timeout 只会产生可见警告，不会延迟或隐藏本地 Record。本地和云端条目通过精确
-`trace_id` 关联；只有云端 Trace 时也可以独立查看。
-
-服务默认绑定 `127.0.0.1`，只提供 GET 路由，发送 `no-store`、`nosniff`、禁止 Frame 和
-No-Referrer Header，并且没有 CORS 或写入 Endpoint。Langfuse API 调用只发生在 Python 侧，
-Public/Secret Key 永远不会序列化进 API 响应或浏览器 JavaScript。绑定非 Loopback 地址时，程序会
-明确提示当前没有身份认证。
-
-### 验证
-
-- 确定性的 Viewer/Service 测试覆盖立即列出本地记录、独立的 Langfuse v4 补充读取、网络错误
-  隔离、稳定 Trace 关联、Record/Observation 详情、非法 ID 拒绝和安全 Header；
-- Viewer 加阶段 1/2 Observability 测试：`21 passed in 6.29s`；
-- 修改的 Viewer、CLI 和测试通过 Ruff：`All checks passed!`；
-- 应用内浏览器视觉检查确认三栏布局、嵌套 Trace Tree、可滚动详情数据、搜索过滤和节点选择；
-- 模拟 Langfuse TLS Handshake Timeout 时，页面在 500 ms 内显示本地 Record 和 Tree，随后
-  降级为警告，浏览器控制台没有错误。
-
----
-
-## Agent Quality 补充——按 Session 聚合 Turn 与可靠的云端状态
-
-### 问题与目标
-
-交互式 Aegis 把每次用户提交作为独立 `run_turn()` 和独立 Langfuse Trace，这是正确的执行与成本
-边界；但 Trace Viewer 之前把所有根 Trace 平铺展示，导致同一对话中的追问看起来像互不相关的任务。
-同时，Langfuse 成功 Observation 的 Level 默认为 `DEFAULT`，旧查看页只把 `ERROR` 映射为失败，
-所以正常结束的云端 Trace 被显示为 `UNKNOWN`。
-
-### 参考行为与实现决策
-
-本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库。实现依据当前 Aegis 的
-`session_id`/`trace_id` 语义和 Langfuse v4 Observation 字段，是对既有 Viewer 的小范围原创增强：
-保留“一 Turn 一 Trace”，使用 Session 作为展示分组，不把多个 Trace 强行合并为长期 Trace。
-
-### 数据流与主要实现
-
-- `_LangfuseObservation.update()` 在调用方提供 `success` 时，把布尔值写入经过脱敏的
-  `metadata.success`。Error/Fatal Level 仍具有更高失败优先级。
-- `_cloud_summary()` 同时返回 `session_id` 并按兼容顺序推导状态：Error/Fatal Level、显式
-  Success Metadata、Aegis `stop_reason`、Warning Level，最后才用已结束且存在 Output 作为旧数据
-  的成功回退。仍在运行或证据不足的 Trace 保持 `UNKNOWN`。
-- Viewer 左栏从平铺 Execution 改为可折叠 Session 卡片。同一 `session_id` 的 Turn 按时间正序
-  展示为 Turn 1、Turn 2；Session 状态由内部 Turn 聚合。搜索命中任一 Turn 或 Session ID 时会
-  展示整个 Session，而不是把未命中的上下文 Turn 临时隐藏。
-- Session 只负责分组。ExecutionRecord 与 Langfuse 副本仍使用精确 `trace_id` 去重和关联，避免
-  把同一 Turn 展示两次。无 Session ID 的旧记录各自形成独立兜底组。
-- 顶部指标改为 `Sessions / turns`，同时保留成功 Turn、Token 和 Cost 汇总。
-
-### 可靠性、兼容性与验证
-
-- 已有云端数据不需要重传：包含 `stop_reason=final_answer` 的旧 Trace 会立即显示为 `OK`。
-- 新数据使用显式 Success Metadata，避免根据是否存在 Output 猜测正常与失败。
-- `ERROR`、`WARNING`、`error`、`interrupted`、`max_iterations` 均不会误显示为成功；尚未结束的
-  Observation 继续显示 `UNKNOWN`。
-- Viewer、Observability、ExecutionRecord 与 Harbor 定向测试：`22 passed in 3.70s`。
-- 修改文件的 Ruff：`All checks passed!`。
-- Observability 与 Viewer 的定向 mypy：`Success: no issues found in 5 source files`。
-- 全仓 `uv run ruff check .` 仍有 5 个既有问题，位于 `mcp/client.py`、
-  `sessions/__init__.py`、`sessions/titles.py` 和 `tests/test_session_titles.py`；本次修改文件没有新增
-  Ruff 问题。
-- 使用真实 Langfuse 数据做浏览器验证：博物馆 Session 显示 2 个按时间排序的 Turn，Session 和
-  两个 Turn 都为 `OK`；折叠/展开从 2 个 Turn 正确切换为 0/2；搜索“多少钱呢”仍保留完整两轮；
-  浏览器 Console 无 Warning 或 Error。
-- 全量 `uv run pytest -q` 在无失败情况下运行到 73%，随后在仓库开发日志已记录的全局
-  Process/MCP 慢测试区连续数分钟没有产生新测试点，因而中断；本次所有相关定向测试已完整通过。
-
-### 权衡与面试式说明
-
-Session 可能承载多个真正不同的任务，因此本次只做 UI 分组，不改变 Trace、Usage 或 Harbor Trial
-的执行边界，也不把 Session 当成新的 Evaluation 单元。这样既保留每轮调用的独立耗时、错误和
-成本，又让多轮追问在界面中恢复对话上下文。实现完全位于 Observability Metadata 与只读 Viewer，
-不改变 Agent Runtime 语义。
-
----
-
-## Agent Quality 补充——可读消息历程、步骤状态与 Usage 汇总
-
-### 真实数据诊断
-
-针对中文以 `\uXXXX` 形式显示、顶部 Token 为零、Session 历程不直观三个问题，直接读取了同一
-博物馆 Session 的两条真实 Langfuse Trace。结论如下：
-
-- 中文没有在采集或传输阶段损坏；Langfuse v4 把 Model Call Input 作为 JSON 字符串返回，旧 UI
-  直接展示字符串，因而保留了 JSON 的 Unicode 转义。
-- Token 与 Cache Usage 没有丢失，位于子级 `Model Call.usageDetails`，而根级 `Aegis Run` 的
-  Usage 为空。旧 UI 只汇总根级列表，所以显示为零。
-- 第二个 Turn 的最后一次 Model Call Input 已包含完整上下文角色序列：System、第一轮 User、
-  Assistant Tool Call、Tool Result、第一轮 Assistant、第二轮 User、第二轮 Assistant Tool Call、
-  Tool Result；最后一次 Model Call Output 则是本轮最终 Assistant Answer。
-
-真实汇总结果为：第一轮 Input 12,019、Output 470、Cache Read 6,528；第二轮 Input 18,079、
-Output 377、Cache Read 10,880。Provider 没有返回直接 Cost，因此 Cost 保持零，不引入价格表。
-
-### 实现
-
-- Langfuse Reader 在读取最近根 Observation 后，再用一次过滤后的 `Model Call` Observation 查询，
-  按 `traceId` 汇总 Input、Output、Total、Cache Read/Creation 和直接 Cost。失败时只返回 Usage
-  警告，不影响根 Trace 与本地 Record 展示。
-- Trace Detail API 同时返回当前 Trace 的 Model Call Usage 汇总；根 `Aegis Run` 详情显示
-  “Trace usage (model calls)”，子 Model Call 仍保留自己的原始 Usage。
-- 顶部指标拆分为 Input/Output、Cache Read/Write 和 Cost，避免 Cache 命中藏在右侧原始 JSON 中。
-- UI 对看起来像 JSON 的字符串做最多三层安全解析，再通过 `textContent` 展示，因此中文直接可读，
-  同时不引入 HTML 注入。
-- Viewer 在 Python 响应边界再次调用统一 Sanitizer，覆盖 Langfuse SDK 查询结果中后加的 Public
-  Key Metadata；Secret/Public Key 都不会进入浏览器响应。
-- 从选中 Turn 的最后一次 Model Call Input 构造 Session Conversation，并追加该调用的 Output。
-  角色节点按原始顺序展示 System/User/Assistant/Tool，点击后可在右栏检查完整结构。
-- Agent、Model、Tool、Final Observation 节点显示 OK/Warning/Error/Running、开始时钟和真实耗时。
-  Provider Message 没有独立时间戳，因此不为历史消息伪造时间。
-
-### 兼容性与验证
-
-- 没有修改 Runtime、Provider、Tool 或 Trace 上报语义；变更只在只读 Viewer 和其 Langfuse 查询层。
-- `tests/test_trace_viewer.py` 新增 Model Call 多节点 Token/Cache 汇总覆盖，全部 `5 passed`。
-- 修改文件 Ruff 通过；真实 Langfuse API 汇总返回值与上述 Token 数一致。
-- 应用内浏览器打开真实第二轮 Trace 后显示 9 条 Session Message，中文无 `\uXXXX` 转义；执行树
-  显示 Aegis Run、两次 Model Call、Web Search Tool 和 Final Result 的 OK、开始时间与耗时；顶部
-  显示 Input/Output `30.1K / 847`、Cache Read/Write `17.4K / 0`、Cost `$0`。
-
----
-
-## Observability——Trace Viewer 分层统计与结构化详情
-
-### 任务目标与原问题
-
-旧查看页把顶部 Token、Cache 和 Cost 作为所有 Execution 的总和，却没有明确标出全局范围；
-Session、Turn 与单次 Model/Tool Call 又缺少自己的统计，因此很难定位成本、缓存命中、上下文增长和
-错误来源。本次只调整 Observability 查看层与 Langfuse 只读查询，不引入 Harbor/Eval，也不改变
-Runtime 的 Agent Loop。
-
-### 参考关系与实现决策
-
-本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库。实现基于 Aegis 已有的
-`ExecutionRecord`、`ExecutionStep`、Observability Observation 和 Langfuse v4 Observations API，
-属于既有 Viewer 的原创增量增强。保留“一 Turn 一 Trace”和浏览器端按精确 `trace_id` 合并本地/云端
-副本，不新建 Trace 数据库，也不把多个 Turn 改造成一个长期 Trace。
-
-### 数据流与主要设计
-
-- `TraceViewerService` 的本地摘要从 Step Tree 计算 Model Call、Tool Call 和错误 Observation 数；
-  一个 `ExecutionRecord` 继续对应一个 Turn。纯汇总函数再按 `session_id` 生成 Session 与 Global
-  统计，便于确定性测试。
-- Langfuse 列表先读 Root Observation，再分页读取最近的子 Observation，按 `traceId` 聚合 Model、
-  Tool、Error、Usage 和直接 Cost。只对 Model Observation 求和，避免 Root 与 Child 都带 Usage 时
-  重复计算；查询失败返回已获得的部分数据和警告，Local-only 路径不受影响。
-- 浏览器按 `trace_id` 去重 Local + Cloud 条目，使用本地 Runtime Record 为主、云端缺失字段为补充；
-  Cloud-only 仍能独立展示。Session Header、Turn 卡片、Session Summary 和顶部 `ALL SESSIONS`
-  使用统一统计语义。
-- `null`/缺字段始终显示 `—`，真实 `0` 保持为 `0`；Cost `0` 显示 `$0.00`。Global/Session/Turn
-  聚合只累计 Provider 确实提供的数值；若组成项部分未知，已知和使用 `≥` 标成下界，不自行估价或
-  猜测缓存拆分。
-- Global、Session、Turn、Model 和 Usage 详情同时展示缓存命中率，统一采用
-  `Cache Read / Provider 总输入`。优先使用显式 `input_tokens_including_cache`，其次用
-  `total_tokens - output_tokens` 恢复总输入，最后才在三个互斥桶齐全时使用
-  `Input + Cache Read + Cache Write`。这兼容百炼 OpenAI 接口的隐式缓存：响应只提供
-  `prompt_tokens_details.cached_tokens` 而不提供 Cache Write 时，仍能按
-  `cached_tokens / prompt_tokens` 得到精确命中率，同时 Cache Write 本身继续显示 `—`，不会把未知
-  伪装成零。Cache Read 为零但总输入大于零时显示 `0.0%`，分母无法可靠取得或为零时显示 `—`。
-- 每个 Model 节点直接显示 Model、Latency、Input/Output、Cache Read/Write、Cost 和 Status；同一
-  Turn 内只比较严格相邻的 Model Call，第二次及以后显示 Input Token 差值。若相邻一次 Usage
-  未知，就不跨过它与更早调用比较；负差值也会保留，以反映压缩或上下文重建。
-- Tool 节点优先递归提取脱敏后的核心字段：`web_search` 的 Query，以及 `terminal` 的 Command、
-  Exit Code 和 Duration。Model/Tool/Final 详情先展示结构化字段、Usage、Request、Response 和 Error，
-  完整 Raw Payload 放在最后的折叠区。
-- Error/Fatal Level、显式 `metadata.success=false`、本地 Step Error 都被视为错误 Observation；错误节点
-  使用红色样式，并向 Agent/Turn、Session 和 Global Errors 上卷。Turn 的 Runtime 最终成功与
-  “内部出现过错误”仍分别保留，避免掩盖恢复成功前发生的 Tool/Model 错误。
-
-### 安全、兼容与边界
-
-- Sanitizer 的字符串、集合、深度限制和 Secret Redaction 没有放宽。Viewer 只是在 Raw Payload
-  之前优先读取浅层或递归可达的 Query、Command、Model、Usage、Finish Reason 与 Error。
-- Langfuse SDK 返回值和本地历史 Record 在 Python HTTP 响应边界都会再次脱敏；API Key 仍只存在于
-  Python 进程，不进入浏览器。HTTP 服务仍只有 GET、无 CORS/写接口、默认绑定 Loopback。
-- 缺少 Session ID 的旧 Record 独立成组；缺少 Steps、Usage、Cache 或 Cost 的旧 Trace 显示未知而
-  不崩溃。Langfuse 缺失、超时或部分分页失败继续 fail-open。
-- Provider 数据限制保持透明：Anthropic 原生 Usage 通常不提供直接 Cost；OpenAI-compatible 网关
-  是否返回 Cache Write、直接 Cost、Finish Reason 或 Provider 名称并不统一。未提供的字段只能显示
-  `—`，Aegis 不使用内置价格表补算。
-
-### 验证结果
-
-- `uv run pytest -q tests/test_trace_viewer.py tests/test_observability.py tests/test_execution_record.py`
-  → `21 passed in 2.86s`。
-- 定向测试覆盖 Global/Session/Turn 汇总、Model Usage、Cost 0/null、Cache 0/null、Error 上卷、
-  Local/Cloud 关联、旧稀疏 Trace、Langfuse fail-open、安全响应头和本地详情二次脱敏。
-- 修改范围的 Ruff 检查通过，Viewer 内嵌 JavaScript 通过 Node `--check`。
-- `uv run ruff check .` 仍报告 5 个既有问题，位于 `mcp/client.py`、`sessions/__init__.py`、
-  `sessions/titles.py` 和 `tests/test_session_titles.py`，均不在本次 Observability 改动中。
-- 全量 `uv run pytest -q` 在早期 CLI 测试区域超过 6 分钟无失败摘要、无继续进度后停止；本次没有把
-  中断运行记作通过。上述 21 个相关测试已完整结束并通过。
-- 应用内浏览器同时加载合成本地 Record 与真实 Langfuse 数据，确认 `ALL SESSIONS`、Session
-  Summary、Turn 两行摘要、`$0.00`/`—`、红色 Error 节点、Terminal Command/Exit Code、相邻
-  Model Input `3.2K → 6.7K (+3.5K)`、折叠 Raw Payload，以及点击 Session 后自动切到该 Session
-  最新 Turn。浏览器控制台没有错误。
-
-### 面试式总结
-
-这次工作的核心不是增加新的采集链路，而是把已有 Observation 数据按使用者分析问题的顺序重新组织为
-Global → Session → Turn → Model/Tool/Final。后端提供 Provider-neutral、可测试且保留 unknown 的
-摘要，前端负责 Local-first 合并和结构化呈现；错误与上下文增长由子 Observation 向上解释。这样既不
-扰动 Runtime，也保住了 Local-only、Cloud-only、Langfuse fail-open、历史数据兼容和只读安全边界。
-
----
-
-## Observability——修正阿里云百炼缓存命中率
-
-### 原问题与定义核对
-
-百炼 OpenAI 兼容接口的隐式缓存通过
-`usage.prompt_tokens_details.cached_tokens` 返回命中 Token，且该数值包含在
-`usage.prompt_tokens` 中；隐式缓存响应不要求提供 Cache Write。原 Viewer 只有在 Input、Cache Read
-和 Cache Write 三个桶都存在时才计算命中率，因此当前百炼 Trace 虽然已经采集 Cache Read，仍显示
-`—`。
-
-### 实现决策与数据语义
-
-- 命中率统一定义为 `Cache Read / Provider 总输入 Token`。Viewer 优先使用
-  `input_tokens_including_cache` 或百炼原始 `prompt_tokens`；否则使用
-  `total_tokens - output_tokens` 恢复总输入；只有前两者都不可用时，才要求 Input、Cache Read、
-  Cache Write 三个互斥桶齐全后求和。
-- 这没有把缺失的 Cache Write 当成零：百炼隐式缓存的 Cache Write 仍显示 `—`；只是利用 Provider
-  已返回的 Total 和 Output 得到独立、精确的分母。若分母也无法可靠获得，命中率继续显示 `—`。
-- Python 汇总与浏览器端 Global、Session、Turn、Model/Usage 详情采用相同优先级，Local-only、
-  Cloud-only 和 Local + Langfuse 合并路径保持一致。Runtime、Sanitizer、只读 HTTP 边界和凭据处理
-  均未改变。
-
-### 参考关系与验证
-
-本次依据阿里云百炼官方 Context Cache 返回字段定义独立修正 Aegis Viewer，没有迁移 Hermes 或
-Claude Code，也没有修改参考仓库。新增百炼示例回归：`prompt_tokens=3019`、
-`cached_tokens=2048`、`output_tokens=104` 时，Aegis 保留普通 Input `971`、Cache Write `null`，
-Viewer 计算命中率约 `67.8%`。
-
-- `uv run pytest -q tests/test_trace_viewer.py tests/test_observability.py tests/test_execution_record.py tests/test_openai_provider.py`
-  → `40 passed, 1 skipped in 7.03s`。
-- 相关 Python 文件 Ruff、差异空白检查和 Viewer 内嵌 JavaScript 的 Node 语法检查通过。
-- 本轮尝试读取真实 Langfuse usage 形态时 TLS 握手超时；Reader 按既有设计 fail-open，未影响本地
-  验证。仍无法显示的数据只有 Provider 没有上报、且不能由其他明确 Usage 字段精确恢复的字段。
-
----
-
-## Agent Quality——Harbor 评测与日常对话分栏
-
-### 任务目标与产品边界
-
-`aegis quality view` 原来只有 Session/Turn 这一种组织方式。Harbor Trial 虽然已经能通过
-`quality import-harbor` 合并成 `ExecutionRecord`，但进入同一个列表后会被当成普通 Turn，用户无法
-一眼区分聊天、一次性任务和基准评测，也看不到 Job、Trial、Reward 与 Verifier Pass/Fail 的评测
-语义。本次继续使用同一套 Trace/Step 详情层，只在记录分类和查看层建立清晰边界：
-
-- `Conversations`：交互式日常聊天，按 Session → Turn 分组；
-- `Evaluations`：Harbor 评测，按 Job → Trial 分组；
-- `All Runs`：排障和运维使用的合并视图，包含普通一次性 Task。
-
-### 数据模型与兼容策略
-
-- `ExecutionRecord` 新增稳定的 `run_kind`：`conversation`、`task` 或 `evaluation`。普通
-  `aegis run` 默认为 `task`；Harbor Adapter 通过 `AEGIS_RUN_KIND=evaluation` 在 Runtime Record
-  产生时即标记，Verifier 完成后的 Result Adapter 再强制确认该类型。
-- 交互式 Runtime 向 Langfuse 根 Observation 写入 `run_kind=conversation`；一次性运行同时把类型
-  写入本地 Record 和 Trace Metadata。Viewer 对旧云端 Trace 使用已有 `source` Metadata 兼容推导。
-- 旧版已导入的 Harbor JSON 没有 `run_kind`。Viewer 会根据 Job/Trial Identity 或 Evaluation
-  Result/Reward/Pass 字段把它们识别为 `evaluation`，无需用户重新跑评测；缺少这些信号的旧本地
-  Record 仍按普通 `task` 处理。
-- `source=local/langfuse` 继续只表示存储来源，`run_kind` 才表示业务运行类型，避免把数据位置与
-  聊天/评测语义混在一起。Local + Cloud 副本仍以精确 `trace_id` 合并。
-
-### Viewer 呈现
-
-评测视图顶部显示 Jobs/Trials 与 Passed/Failed，Job Header 汇总 Trial 数、平均 Reward、耗时和
-Token；Trial 卡片显示 Task、Trial ID、Reward、PASS/FAIL、模型/工具调用、Cache 与 Runtime Error。
-右侧详情把 Run Type、Job、Trial、可读的结构化 Task ID、Runtime Result、Verifier 和 Reward 分开
-列出，因此“Agent 正常退出但 Verifier 未通过”不会被误报成 Runtime Error。搜索命中一个 Trial 时
-仍保留整个 Job，交互方式与 Conversation 中保留完整 Session 一致。
-
-### 一键增量同步与安全边界
-
-Viewer Header 新增 **Sync Harbor**。默认扫描 `~/harbor/jobs`，可通过
-`--harbor-jobs-dir` 或 `AEGIS_HARBOR_JOBS_DIR` 覆盖。同步器只处理具备 Harbor TrialResult
-特征的 `result.json`：若 Trial 旁的 Final Record 和中央 Store 副本都有效、类型为 Evaluation，且
-修改时间不早于 Result/Runtime Record，则记为 `unchanged`；否则重新 Finalize。一个损坏、稀疏或
-暂时未写完的 Result 只计入该文件的 `failed`，不会中断其他 Trial，错误详情最多返回 20 条。
-
-已有 Trace GET API 继续只读。新增的 `/api/harbor/sync` 是唯一写接口，仅接受 POST，不允许前端
-提交任意路径，并由服务启动时随机生成的 Token 配合自定义 Header 校验；浏览器同源策略、无 CORS
-响应和 CSP 的 `connect-src 'self'` 共同阻止普通跨站页面伪造同步。同步使用非阻塞互斥锁，重复点击或
-并发请求不会同时写同一批 Record。完成后页面刷新数据并自动切到 `Evaluations`。
-
-本次没有迁移 Hermes 或 Claude Code，也没有修改两个参考仓库；实现基于 Aegis 已有的
-`ExecutionRecord`、Harbor Result Adapter 和 Trace Viewer，是现有质量查看层的原创增量设计。
-
-### 验证结果
-
-- `uv run pytest -q tests/test_trace_viewer.py tests/test_harbor_execution_record.py tests/test_execution_record.py tests/test_observability.py`
-  → `35 passed in 3.76s`；覆盖三类 Run Kind、旧 Harbor Record 兼容、Job/Trial/Reward 摘要、CLI
-  校验、Harbor Finalize、同步幂等性、变更重导入、坏文件隔离、同源 Token 拒绝和交互 Trace
-  Metadata。
-- 修改范围 Ruff 检查与 `git diff --check` 通过；Harbor Adapter、Quality Model 和 One-shot Runner
-  的定向 mypy 为 `Success: no issues found in 3 source files`。
-- 将真实成功任务 `/home/nacha/harbor/jobs/2026-09-07__15-54-50` 导入本地 Store 后进行浏览器
-  验收：页面显示 1 Job / 1 Trial、1 Passed / 0 Failed、Reward 1、2 次 Model Call、1 次 Tool Call、
-  Cache Hit 49.4%；Task ID 正确显示为 `examples/tasks/hello-world`，Execution 详情状态为 `PASS`，
-  Runtime Result 为 `SUCCESS`。`Conversations`、`Evaluations`、`All Runs` 切换均正常。
-- 使用真实 `/home/nacha/harbor/jobs` 点击 **Sync Harbor**：第一次显示
-  `5 imported · 1 unchanged · 0 failed` 并自动切到包含 6 个 Job/Trial 的 Evaluations；立即再次点击
-  显示 `0 imported · 6 unchanged · 0 failed`，验证真实目录上的增量与幂等行为。
-
-### 面试式总结
-
-设计重点是“共用证据，不混淆语义”：对话和评测都复用同一套 Provider-neutral Step Tree、Usage、
-脱敏与 Langfuse 补充数据，但在最上层用稳定的 Run Kind 分流。这样不会复制一套 Harbor 专用 Viewer，
-也不会让 Reward/Verifier 状态污染日常聊天的成功定义；新增评测类型或更多数据源时，可以继续沿用
-同一详情层和精确 Trace 关联规则。一键同步则把原来的显式 CLI 导入变成范围固定、幂等且失败隔离的
-用户动作，没有引入后台轮询，也不会在打开页面时悄悄修改结果。
-
----
-
-## Agent Quality 阶段 3——Process Evaluation（过程评测）
-
-### 任务目标与原问题
-
-阶段 0～2 已经具备 Langfuse Trace、Provider-neutral `ExecutionRecord 1.0`、Harbor Runtime/Verifier
-合并和本地 Viewer，但只能回答“任务是否完成、Verifier 是否通过、调用了什么”，还不能离线判断
-“过程是否反复、失败后是否调整、修改后是否验证、是否陷入循环、是否明显低效”。本阶段在不改变
-Agent Loop、Harbor `result.json` 和既有 Outcome 语义的前提下，为已有 Record 增加确定性、可重复、
-可解释且可定位原始 Step 的过程评测。
-
-明确没有实现 Failure Attribution、Bad Case Mining、Regression、Baseline vs Candidate、Quality Gate、
-LLM Judge、实时拦截、新 Trace Storage 或新 Dashboard。
-
-### 参考实现、相关性与迁移决策
-
-检查了 Hermes `agent/tool_guardrails.py`、
-`tests/run_agent/test_tool_call_guardrail_runtime.py` 和
-`tests/tools/test_read_loop_detection.py`。Hermes 的实时 Guardrail 提供了有价值的行为参考：稳定的
-Tool+Args 签名、区分幂等/修改工具、相同失败计数，以及“相同结果才是无进展”的保守原则。但它位于
-执行路径中，会给模型警告或阻断工具；直接迁移会违反本阶段“纯离线、不侵入 Runtime”的边界。
-因此选择“参考行为、Aegis 独立实现”：没有复制其 Controller 或消息注入代码，只把保守判定原则
-适配到 `ExecutionRecord`。同时搜索了 Claude Code 参考仓库，没有找到与 Aegis Record Schema 和
-本阶段范围相符的完整离线 Process Grader 单元。两个参考仓库均未修改。
-
-### 架构、数据模型与主数据流
-
-`quality/process.py` 定义统一 `ProcessGrader` Protocol、`ProcessEvaluatorConfig`、只读
-`EvaluationContext`、6 个默认 Grader 和 `ProcessEvaluator`。数据流是：
-
-```text
-ExecutionRecord 1.0
-  → 按 sequence 构造只读 Step/Tool Action 视图
-  → 6 个相互独立的确定性 Grader
-  → 按实际配置权重做可解释加权平均
-  → 原子替换 quality.process_evaluation
-  → CLI / Viewer 读取派生结果
-```
-
-`ProcessGrade` 保存 `grader_name`、`grader_version`、0～1 `score`（数据不足时为 `null`）、
-`status`（pass/warning/fail/insufficient_data）、`severity`、`category`、`message`、`evidence`、
-`affected_steps` 和 `metadata`。`ProcessEvaluationResult` 保存 Schema/Evaluator 版本、UTC 评测时间、
-Overall Score/Status、摘要、全部 Grade、实际权重、有效配置，以及当时的 Runtime/Harbor Outcome 快照。
-`ExecutionRecord` 只新增默认可空的 `quality.process_evaluation`，`schema_version` 仍为 `1.0`；旧 JSON
-没有 `quality` 时由默认值补齐，原始 Steps、Execution、Usage、Evaluation 和 Artifacts 不被覆盖。
-
-Overall Score 只对有分数且权重大于零的 Grade 求简单加权平均；Overall Status 使用明确优先级：
-任一 Fail → Fail，否则 Warning → Warning，否则有 Pass → Pass，否则 Insufficient Data。结果每次完整
-替换，所以重复运行不会叠加旧 Issue；每个 Grader 版本与实际权重均持久化，支持以后安全重评分。
-
-### 6 个 Grader 的确定性规则
-
-1. **Repeated Tool Call**：同一 Tool、参数规范化后相同或相似度达到阈值、两次均明确成功、结果
-   完全相同，而且中间没有成功或成功未知的修改操作，才判定为无进展重复。失败重试交给 Repeated
-   Failure/Recovery，结果变化或字段不完整时不冒险误报；`affected_steps` 指向成对调用。
-2. **Repeated Failure**：只看按序排列的 Tool Stream；同一 Tool 且参数未调整的连续失败达到默认
-   3 次时 Fail。成功、换工具或参数变化都会重置连续段，避免把 `read(A) fail → list → read(B)
-   success` 误判成重复失败。
-3. **Failure Recovery**：分析失败的 Tool/Model，以及没有更细失败 Step 时的 Runtime Failure。
-   识别改参数、换工具、查询环境、路径变化和后续成功；全部调整后成功为 Pass，成功但没有可观察
-   调整为 Warning，存在未恢复失败为 Fail。Harbor Verifier Fail 不属于 Runtime 过程错误。
-4. **Final Verification**：默认只在明确成功的重要修改后要求验证；识别 write/edit/patch 等 Tool、
-   常见变更命令，以及 pytest/ruff/mypy/test/lint/build/check/git diff 等验证。验证必须位于最后一次
-   修改之后且成功。没有修改的聊天/只读任务直接 Pass；修改 Step 缺少 success 时返回
-   `insufficient_data`。任务 Metadata 可显式关闭/开启要求并扩充 Tool/Command Pattern。
-5. **Loop Detection**：在 Tool Action Stream 中枚举可配置最大周期，检测连续精确签名的 `A×N`、
-   `(A,B)×N` 等模式；默认至少重复 3 次。输出 `loop_detected`、`loop_start_step`、
-   `loop_start_sequence`、`loop_length`、`repeat_count`、Pattern 与全部受影响 Step。
-6. **Execution Efficiency**：统一生成 step/model/tool/failed-tool/repeated-call/token/cost/latency 指标。
-   默认只使用明确的重复调用与达到最小样本量的高失败比例；没有可靠 Baseline 时不设置“超过 15 步”
-   一类任意绝对阈值。任务可配置每个指标的绝对阈值或 Baseline+Multiplier，命中时返回 Warning 和
-   具体 Evidence，不使用 ML 或 LLM Judge。
-
-### 配置、失败处理与兼容性
-
-默认配置可以在代码中通过 `ProcessEvaluatorConfig` 注入；单个任务可在
-`record.metadata.process_evaluation_config` 覆盖参数相似度、重复/循环阈值、修改与验证模式、是否
-需要验证、效率阈值、Baseline、Multiplier 和 Grader Weight。未知 Metadata Key 被忽略，合法字段由
-Pydantic 校验。数据不足时使用 `insufficient_data`，不把未知伪装成零或 Pass/Fail。
-
-Process Evaluation 只在显式 CLI/API 调用时运行；异常不会改变原始 Agent 执行结果。Langfuse 与
-Harbor 都不是运行依赖，也没有新增第三方依赖。Harbor 对发生变化的 Result 重新 Finalize 时，会从
-已有 Final/Central Record 保留 Process Result，仍只读取、不修改 `result.json`。这同时保证
-Outcome PASS + Process FAIL、Outcome FAIL + Process PASS 都是合法状态。
-
-### CLI 与 Viewer
-
-- `uv run aegis quality evaluate <record-or-execution-id>`：评测指定 Record，保存中央副本；若传入
-  外部 JSON 路径，也原子更新该路径。
-- `uv run aegis quality evaluate --all`：批量评测当前 Store。
-- `--json`：输出机器可读结果。Process Fail 当前不改变退出码，因为这不是 Quality Gate；只有
-  Load/Evaluate/Save 操作错误返回非零。
-- `uv run aegis quality view`：Run 卡片增加 Process Score/Status；Execution Detail 将 Outcome、
-  Runtime Result、Harbor Verifier、Process Status 分开展示。Issue 列表包含 Grader、Severity、
-  Message、Affected Steps；点击有 Step 的 Issue 会定位并高亮第一个本地执行节点。旧 Record 没有
-  Process Result 时继续按原方式显示。
-
-### 测试、故障注入与结果
-
-新增 `tests/test_process_evaluation.py`，直接构造 Record，不调用真实模型；包含用户要求的
-`case_repeated_tool_call`、`case_repeated_failure`、`case_good_recovery`、`case_failed_recovery`、
-`case_missing_final_verification`、`case_good_final_verification`、`case_simple_loop`、
-`case_periodic_loop`、`case_no_loop`、`case_low_efficiency` 和 `case_clean_success`，并额外覆盖：
-
-- 相同调用但结果变化、或 success/result 缺失时不误报无进展；
-- 中间修改后重复 pytest 不误报；
-- 配置 Baseline 与默认无任意 Step 上限；
-- 旧版 Record、无 Tool 的纯聊天、Subagent Parent/Child、Runtime Failure、Harbor Evaluation Failure；
-- 重跑完整替换、Grader Version 保存、CLI 单条/批量/JSON/非法参数；
-- Viewer 同时暴露 Harbor Outcome PASS 与 Process FAIL；
-- Harbor 重新 Finalize 保留已有 Process Result。
-
-最终验收结果：
-
-- `tests/test_process_evaluation.py` 共 25 项；Process/Harbor/Viewer/ExecutionRecord 定向套件：
-  `54 passed in 4.30s`。
-- 单次 `uv run pytest -q` 因仓库既有的一分钟级 Runtime/Agent 边界用例超过长命令会话时间，未用
-  其中间输出冒充成功；随后按互斥文件集合完整分批执行全部 54 个测试文件，合计
-  `725 passed, 2 skipped`，零失败（完整分批后的新增 1 项 CLI Quality-Gate 边界测试也在最终定向
-  套件通过）。各批正式摘要分别为 `245 passed, 1 skipped`、`8 passed`、
-  `107 passed`、`25 passed, 1 skipped`、`209 passed`、`130 passed`。
-- 本次相关 Quality/CLI/Test 文件的 Ruff：`All checks passed!`；`git diff --check` 通过。
-- 全仓 `uv run ruff check .` 仍为 5 个既有问题：`mcp/client.py` 1 个、`sessions/__init__.py` 1 个、
-  `sessions/titles.py` 2 个、`tests/test_session_titles.py` 1 个；本阶段没有修改这些文件。
-- `quality/models.py`、`quality/process.py`、Harbor Adapter 和 Store 的定向 mypy：
-  `Success: no issues found in 4 source files`。全仓 `uv run mypy src` 仍有 39 个既有错误，分布在可选
-  Web/Harbor Import、MCP、旧 Viewer 汇总类型、Session、Skill、Tool、Runtime/Agent 和 CLI；新
-  Process 模块没有新增错误。
-- 从 `viewer_ui.py` 提取内嵌脚本并用 Windows Node `v24.14.0` 执行 `node --check -`，语法通过。
-- Hermes 工作树为 clean。Claude Code 参考仓库保留其开始前已有的未提交文件；本阶段所有参考仓库
-  操作均为 `grep`/`sed`/`find`/`git status` 只读检查，没有修改参考仓库。
-
-### 权衡、限制与阶段 4 预留
-
-- ExecutionRecord 目前没有通用的“工具是否修改状态”语义标签，第一版使用保守默认 Pattern 与任务
-  Metadata；自定义工具最好提供配置。外部系统在两次读取间改变状态只能通过结果变化避免误报，无法
-  归因是谁改变的。
-- 相似参数使用字符级确定性比较，适合离线复现，但不是语义相似度；阈值可配置。循环检测只判断连续
-  精确 Tool+Args 周期，不推断语义循环，以降低误报。
-- 没有可靠 Baseline 时 Efficiency 不根据绝对步数、Token、Cost 或 Latency 判低效；这会漏掉某些
-  “很长但没有重复/失败”的过程，是有意的保守选择。
-- `ProcessGrader`、独立 `category`/`severity`、结构化 Evidence、Affected Steps、每次 Grade Metadata
-  和统一 EvaluationContext 是阶段 4 Failure Attribution 的扩展接口。后续可新增 Attribution
-  Grader/证据图或消费现有失败/恢复 Assessment，而无需修改 Agent Loop、原始 Step 或 Harbor Outcome。
-
-### 面试式总结
-
-本阶段把“任务做没做成”和“过程做得好不好”拆成两个独立事实：Harbor/Runtime 继续提供 Outcome，
-ProcessEvaluator 在执行后只读地重放 Step 证据，给出 6 个可解释 Grade 和稳定聚合。关键设计不是
-堆规则，而是为每个结论保留版本、Evidence 和 Step 地址，对缺失数据明确说不知道，并把阈值与任务
-语义放进配置而非硬编码。这样既能马上用于人工分析，又为下一阶段 Failure Attribution 留下稳定、
-不污染原始轨迹的证据接口。
-
-## Agent Quality 补充——Trace Viewer 全量 Root、测试隔离与错误口径
-
-### 任务目标与原始问题
-
-实际运行 `uv run aegis quality view` 时，Conversations 页显示 `15 / 85`，但左侧可见内容与用户
-预期不符。现场检查确认这是三个问题叠加：Viewer 只请求最近 100 个 Langfuse Root；pytest 会从
-项目 `.env` 继承真实 Langfuse 凭据并上传测试 Trace；前端按 `trace_id` 合并时会静默丢弃同一 Trace
-下的重复 Root。顶部 `ERRORS 51` 又把 24 个失败 Run 内的 51 个错误 Observation 当成一个单值，
-容易被理解为 51 个失败会话。
-
-### 参考实现与迁移决策
-
-只读搜索了 Hermes 与 Claude Code 参考仓库，没有找到可复用的 Langfuse v4 Root 分页或本地
-Viewer 实现。本次采用 Aegis 独立增量实现，没有复制或改写参考仓库代码；Hermes 保持 clean，
-Claude Code 只保留任务开始前已有的未提交内容。
-
-### 设计、数据流与失败处理
-
-- `LangfuseReader.list_roots()` 在安全上限内跟随 SDK Cursor 自动分页；Viewer 默认最多读取
-  1,000 个 Root，并返回 `loaded_root_count`、`root_limit` 和 `has_more`。达到上限时 UI 明确显示
-  “first N roots”，不把部分窗口伪装为完整总数。
-- 云端列表项改用 `langfuse:<root_observation_id>` 作为唯一 UI ID；`trace_id` 继续用于读取 Trace
-  详情。本地/云端合并每个 Trace 最多消费一个云端 Root，其余 Root 独立保留，避免重复 Execution ID
-  导致静默丢数。详情页读取共享 Trace 时不会把整条 Trace 的 Aggregate 回写到任一单独 Root，避免
-  用户点开详情后污染列表汇总。
-- 新增按 Root 子树聚合：通过 `parentObservationId` 向上寻找最近的请求 Root，Model/Tool/Error/Usage
-  只计入所属 Root。多个 Root 共用一个 Trace 时，不再把整个 Trace 的统计重复乘到每个 Root 上。
-- UI 汇总改为 `FAILED RUNS / ERROR OBS`，同时展示失败 Run 数和错误 Observation 数；Session/Job
-  Summary 使用相同口径。
-- `tests/conftest.py` 的 autouse Fixture 把 Langfuse Public/Secret Key 设为空。`python-dotenv` 默认不
-  覆盖已存在环境变量，因此即使生产路径在测试中加载项目或用户 `.env`，单元测试也不会连接真实
-  Langfuse；显式 Fake Client 测试不受影响。
-
-现场数据从原页面的最近 100 个 Root 窗口恢复为完整 247 个 Root、247 个唯一 Root ID；其中
-Conversations 为 31 Sessions / 221 Turns。完整数据仍包含修复前已经上传的 pytest 历史，本次没有
-擅自删除云端数据。修复后全量测试前后 Root 数均为 247，证明测试隔离生效。
-
-### 测试与验证
-
-- Viewer + Observability 最终定向套件：`25 passed in 1.25s`。
-- 全仓测试：`728 passed, 2 skipped in 2057.53s`，零失败。
-- 本次相关文件 Ruff：`All checks passed!`。
-- 全仓 Ruff 仍有 5 个既有问题，位于 `mcp/client.py`、`sessions/__init__.py`、
-  `sessions/titles.py` 和 `tests/test_session_titles.py`；本次未修改这些位置。
-- 从 `viewer_ui.py` 提取内嵌 JavaScript 后由 Windows Node 执行 `node --check -`，语法通过；
-  `git diff --check` 通过。
-- 临时 `:8766` Viewer 实测显示 `Local + Langfuse · 247 roots`、`31 / 221`，错误卡片显示
-  `44 / 86`；API 返回 `has_more: false`、247 个唯一 ID。临时服务验证后已正常关闭。
-
-### 权衡、限制与后续
-
-1,000 Root 是避免本地页无界扫描的安全上限；超过时当前版本明确提示，但尚未提供用户点击继续加载
-下一窗口的按钮。历史 pytest 污染已在后续补充任务中按精确预览完成清理，测试隔离本身仍不会自动
-修改已有 Langfuse 数据。Root 子树统计依赖 SDK 返回 `parentObservationId`；无法关联到请求 Root
-的孤立 Observation 不会被猜测归属。
-
-### 面试式总结
-
-这次修复先区分了“数据窗口不完整”“测试遥测污染”和“UI 去重/统计口径”三个独立问题：Reader
-负责可靠分页和截断信号，Service 用 Root Observation ID 与 Parent 链建立准确统计边界，UI 分开
-呈现失败 Run 与错误节点，测试层则从源头阻断真实遥测。最终用现场 247 条数据、浏览器渲染、完整
-测试套件和云端前后计数共同验证，既没有继续污染 Langfuse，也没有删除用户历史数据。
-
-## Agent Quality 补充——历史 pytest Trace 清理
-
-用户明确授权直接清除历史 pytest Trace。清理前再次读取 Langfuse 全量 Root 与 Observation，并把
-候选限定为 pytest 临时目录标记、测试专用 Session ID 或测试专用 `trial-cli` Execution ID。随后用
-本地 `~/.aegis/state.db` Session 和 ExecutionRecord Trace ID 做反向保护，同时保留 Harbor
-`hello-world__*` 记录；两个同时命中测试标记与真实 Session 的 Trace 被排除，没有删除。
-
-最终通过 Langfuse v4 SDK 分五批删除 205 个纯测试 Trace，对应 228 个 Root Observation。删除后
-重新分页读取远端数据，确认剩余 19 个 Root / 19 个唯一 Trace：17 个本地真实会话 Root 和 2 个
-Harbor `hello-world` Root。此次为一次性远端数据清理，没有新增运行时代码；此前加入的 pytest
-凭据隔离继续负责阻止后续测试 Trace 上传，但不会自动删除历史数据。
-
-## Agent Quality 阶段 3 增量——Failure Recovery 规则 + LLM Judge 混合评测
-
-### 任务目标与原始问题
-
-原 `FailureRecoveryGrader` 在 Tool Failure 后顺序扫描后续动作，并把遇到的第一个成功 Tool Step
-直接当成 Recovery。这会把成功的 `read/search/find/status/inspect` 诊断动作、无关文件写入，甚至只凭
-最终 Runtime Success 误判为“原失败已经恢复”。本次保持 Process Evaluation 的离线、规则优先、
-可解释和可定位框架不变，只为 Failure Recovery 增加一个轻量、显式启用、失败安全的 LLM Judge；
-Repeated Tool Call、Repeated Failure、Final Verification、Loop Detection 和 Execution Efficiency
-继续完全使用确定性规则。
-
-### 参考关系与迁移决策
-
-本次没有从 Hermes 或 Claude Code 迁移 Grader。Failure Episode、Recovery 关联规则、Judge Prompt、
-响应校验和聚合评分均为 Aegis 独立实现。模型调用复用 Aegis 已有的 provider-neutral
-`ModelProvider`、`collect_response` 边界，以及 Memory Side Query 已采用的“单次调用、结构化 JSON、
-任何异常均 fail-open”架构模式；该内部模式最初受 Claude Code Side Query 行为启发，但本次没有复制
-Claude Code 代码。参考仓库只做状态检查，没有写入。
-
-### 设计与主数据流
-
-```text
-ExecutionRecord
-  → 5 个既有确定性 Grader（保持不变）
-  → FailureRecoveryGrader 提取 Failure Episode 并给出规则结果
-       failure step
-       + 完整后续 timeline
-       + diagnosis / mutation 标记
-       + tool / argument / path 调整
-       + related retries 及 success/result
-  → 未配置 Judge 或没有 Failure：直接保留规则结果
-  → 已配置 Judge 且存在 Failure：所有 Episode 合并为一次 Side Query
-       effective_diagnosis
-       adjustment_targets_failure
-       target_recovered + grounded recovery_step_id
-  → 合法响应精炼同一个 failure_recovery Grade
-  → 调用/解析/校验失败：Score、Status、Message 回退到规则结果
-  → 仍然汇总为 6 个 Grade，不改变 CLI/Viewer 数据形状
-```
-
-`FailureEpisode` 保留失败 Step 和直到规则确认恢复或 Trace 结束的事件序列。每个事件标记是否为
-Diagnostic、Mutation、Related Retry、Same Tool、Same Target，以及可观察到的调整。Metadata 同时保留
-完整 Timeline、诊断 Step、Mutation Step、相关重试、调整清单和 Rule Recovery Step，便于 Viewer、
-调试和未来 Attribution 消费。
-
-规则确认 Recovery 的条件被收紧为：后续 Step 明确成功、与原失败为同一 Tool 和同一 Target，且不是
-诊断动作。存在 Path/Target 字段时按 Target 关联；缺少显式 Target 时才回退到既有 Tool+Args 高相似
-签名。成功的诊断、Mutation、无关动作和最终 Runtime Success 都不单独构成恢复。Model Failure 仍只
-把后续成功 Model Call 当作同类重试；Runtime Failure 没有更细证据时保持未恢复。
-
-### LLM Judge、配置与失败处理
-
-`FailureRecoveryLLMGrader` 不新增第七个 Grade，而是可选精炼已有 `failure_recovery`，因此权重、Viewer、
-持久化 Schema 和下游消费者无需迁移。Judge 一次处理所有 Episode，并要求每项返回：
-
-- `effective_diagnosis`：诊断是否提供了有效信息；
-- `adjustment_targets_failure`：调整是否针对原失败目标；
-- `target_recovered`：原目标是否有证据证明恢复；
-- `recovery_step_id`：必须落在对应 Episode 的后续 Step 中；
-- 可选 Confidence 和简短 Reason。
-
-Judge Score 对三项分别使用 0.25 / 0.25 / 0.5 权重，突出“实际恢复”。任一 Target 未恢复为 Fail；
-全部恢复但诊断或定向调整不足为 Warning；三项均满足才 Pass。响应必须覆盖且仅覆盖输入 Failure ID，
-不能重复 ID；声称恢复时必须给出 Episode 内真实存在的 Recovery Step。未配置模型时直接使用规则；
-非法 JSON、ID 不匹配、虚构 Step 或 Provider 异常会记录 `llm_judge.status=fallback`，并保留规则层的
-Score/Status/Message，因此可选 Judge 不会破坏原有 Process Evaluation。
-
-API 通过 `ProcessEvaluator(failure_recovery_judge=provider)` 显式注入；CLI 通过
-`--failure-recovery-judge auto|openai|anthropic` 或 `AEGIS_FAILURE_RECOVERY_JUDGE` 启用。默认不配置时
-零模型调用；存在 Provider 但 Record 没有 Failure 时也不调用。单条 Record 可在
-`metadata.process_evaluation_config` 设置 `failure_recovery_llm_enabled=false` 禁用，或调整
-`failure_recovery_llm_max_prompt_chars`。输入先经过统一 Secret Sanitizer 和单值长度预览，整体 Prompt
-再有硬上限并记录是否截断，避免凭据外发或异常 Trace 导致无界 Judge 成本。
-
-### 兼容性、测试与验证
-
-- `ExecutionRecord` 和 `ProcessEvaluationResult` Schema 保持 `1.0`，没有新增必填字段；只把
-  `ProcessGrade` 文档语义从“确定性结果”放宽为“规则或可选 Judge 结果”。
-- Evaluator 升级为 `1.1.0`，只有 Failure Recovery Grader 升级为 `1.1.0`；其余五项仍为 `1.0.0`。
-- 默认仍返回 6 个 Grade；重跑继续完整替换派生结果，不修改原始 Step、Runtime Outcome 或 Harbor
-  Verifier。
-- 新增测试覆盖：诊断成功不算恢复、换 Read Target 不算恢复、Episode 中的诊断/Mutation/相关重试、
-  Model 重试、Judge 只在 Failure 时调用、按 Record 禁用、一次调用精炼、无关成功的否定判断、非法
-  JSON、Provider 异常、规则结果安全回退，以及 CLI 可选 Judge 接线。
-- 定向 `tests/test_process_evaluation.py`：`34 passed`；Process/Harbor/Viewer/ExecutionRecord 联合套件：
-  `66 passed`；相关 Ruff、Process/Models 定向 mypy 和 `git diff --check` 均通过。
-- 全仓 pytest：`737 passed, 2 skipped in 526.02s`，零失败。全仓 Ruff 的 18 项来自已下载的官方
-  Terminal-Bench Sample 文件 13 项，以及本任务开始前已有的 Aegis 5 项；相关修改文件 Ruff 为零。
-  全仓 mypy 仍报告 40 项可选依赖/既有模块类型问题，均不落在新增 Hybrid/Episode 逻辑；本次
-  Process/Models 定向 mypy 为零。
-
-### 权衡、限制与后续
-
-规则层故意只确认高置信度的同 Tool/同 Target 非诊断重试；例如换成另一个测试工具后成功，规则结果会
-偏保守，由可选 Judge 判断语义关联。LLM 判断仍可能受 Trace 文本质量、Prompt Injection 或截断影响，
-因此所有结论保留 Rule Result、Judge Version、Provider、Grounded Step 和 Reason，且 LLM 不参与另外
-五项确定性评分。当前没有引入多数投票、Judge 校准集或 Quality Gate；如以后需要，应先用真实 Harbor
-Failure Episode 建立离线标注集，再评估模型一致性和成本。
-
-### 面试式总结
-
-这次改动先修正了一个关键证据错误：成功动作不等于失败恢复，诊断和修复也不等于原目标已经重新通过。
-规则层现在负责完整、可复现地整理 Failure Episode 和高置信关联，LLM 只处理规则难以可靠回答的语义
-问题，并通过一次调用、严格 JSON/Step Grounding 和全路径 Fail-open 控制成本与风险。结果保持原有六项
-结构和 CLI/Viewer 兼容性，同时让 Failure Recovery 从“顺序上的第一个成功”提升为“原目标有证据地
-恢复”。
-
-## Agent Quality 阶段 3 增量——普通对话按 Turn 记录、历史回填与持久 Judge 配置
-
-### 目标与原问题
-
-此前 Process Evaluation 只能消费 `aegis run` 或 Harbor 已生成的 `ExecutionRecord`。普通交互 REPL
-虽然把原始消息保存在 SessionRepository，并可选发送 Langfuse Trace，却没有本地 Record，因此既不能
-按 `execution_id` 离线评测，也不能从已有 `session_id` 补录。与此同时 Failure Recovery Judge 只能靠
-每次 CLI 参数或 Provider 环境变量启用，Provider/Model 偏好不能作为普通应用配置持久保存。
-
-本次增量保持“默认不记录、默认纯规则”的兼容行为，增加两个显式入口：实时对话可选择每个 Turn 记录或
-记录后自动评测；已有 SQLite 会话可按 `session_id` 确定性重建。Judge 的启用状态、Provider、Model 和
-可选 Base URL 进入同一个 `~/.aegis/config.yaml`，API Key 仍只从环境或 `.env` 读取。
-
-### 参考关系与迁移决策
-
-这次功能直接组合 Aegis 已有的 `Observability`、`ExecutionRecorder`、`SessionRepository`、
-`ExecutionRecordStore` 和 `ProcessEvaluator` 边界，不需要 Hermes 或 Claude Code 的新实现单元，也没有
-读取或修改参考仓库。迁移决策是 Aegis 原创增量：保留单任务 Recorder 的职责，在外层增加按根 Turn
-创建 Recorder 的动态 Backend；历史数据只从 Aegis 自己的原始 Session 消息重建。
-
-### 设计与数据流
-
-实时路径为：
-
-```text
-显式 --record-conversations / 持久 record: true
-  → REPL 为 Turn 生成 UUID execution_id
-  → deterministic_trace_id(execution_id)
-  → Langfuse 与 ConversationExecutionRecorder 接收相同 ID
-  → ContextVar 将 Model/Tool/Subagent/Final 事件路由到当前 Turn Recorder
-  → 根 Agent Run 结束后原子保存 conversation ExecutionRecord
-  → 若 evaluate: true，再在保存前运行 ProcessEvaluator
-```
-
-`ConversationExecutionRecorder` 是长生命周期 Observability Backend，但内部仍复用现有单 Record
-`ExecutionRecorder`。每个根 Turn 创建新 Record；嵌套子 Agent 沿 ContextVar 写入父 Turn；没有活动根
-Turn 的孤立子 Agent 事件不会误建主对话 Record。评测异常被隔离并仍保存原始 Record，存储异常继续沿用
-Observability 的 fail-open 日志边界，不中断用户已经得到的回复。
-
-历史路径由 `aegis quality record-session <session-id>` 触发：按每条 User Message 切分 Turn，使用
-`session_id + client_msg_id/seq` 生成 UUIDv5，因此重复运行只覆盖同一文件。Assistant ToolCall 与 Tool
-Message 按 `tool_call_id` 配对；显式 `error`、失败 Status 或无语义豁免的非零 Exit Code 被保守识别为
-失败。每个 Record 标记 `source=session-backfill` 和 `reconstructed_from_session=true`。
-
-历史 Session 没有保存完整 Observability 数据，因此 Provider/Model、Usage、Cost、精确模型输入上下文
-和真实调用耗时保持 `null`；可用的 SQLite Message Timestamp 只用于事件定位。重建限制写入 Metadata，
-Tool Success 也标记为 `success_inferred`，避免把推导数据伪装为现场遥测。
-
-### 配置与优先级
-
-新增持久配置结构：
-
-```yaml
-quality:
-  conversations:
-    record: false
-    evaluate: false
-  failure_recovery_judge:
-    enabled: true
-    provider: openai
-    model: <judge-model>
-    base_url: null
-```
-
-显式 CLI/`AEGIS_FAILURE_RECOVERY_JUDGE` 覆盖 YAML Provider；YAML `model`/`base_url` 覆盖相应 Provider
-的默认环境值。OpenAI-compatible Key 使用 `AEGIS_API_KEY`，Anthropic Key 使用
-`ANTHROPIC_API_KEY`，密钥不会进入普通配置文件。配置缺失、Provider 无效或模型不可用时打印 Warning
-并回退规则结果。`quality evaluate --config`、`quality record-session --config` 和 REPL 的
-`--mcp-config` 可选择非默认配置文件。
-
-### 可靠性、不变量与边界
-
-- 未显式开启时，普通 REPL 的记录、存储和模型调用行为完全不变。
-- 一个用户 Turn 对应一个 Record；同 Session 的 Turn 共享 `session_id`，但 Execution/Trace ID 不同。
-- 实时本地 Record 和 Langfuse 使用相同确定性 Trace ID，Viewer 可精确关联。
-- 历史回填 ID 稳定，重跑不产生重复 Record，也不修改 Session 原始消息。
-- `--process-evaluate-conversations` 隐含开启记录；Judge 仍仅在存在 Failure Episode 时调用。
-- 自动评测失败不丢 Record、不影响聊天；Judge 不可用继续安全降级规则。
-- 历史缺失字段保持未知；不估算 Token、Cost、Provider 或精确 Latency。
-- 实时与历史 Record 都经过统一 Observability Sanitizer，Session 回填不会绕过密钥脱敏和大小上限。
-- `ExecutionRecord` / `ProcessEvaluationResult` Schema 继续保持 `1.0`，现有 Grader 和 Agent Loop 无需修改。
-
-### 测试与验证
-
-新增 `tests/test_conversation_quality.py`，覆盖两个实时 Turn 的 Record 隔离与共享 Session、Trace ID
-确定性、评测异常仍保存、历史 Tool Failure 重建、稳定回填 ID、SQLite CLI 回填并评测、REPL 显式记录、
-YAML Judge Provider/Model 构建及关闭配置。定向 Conversation/Process/ExecutionRecord 联合测试为
-`47 passed`，包含 Config/Viewer/Observability/Runtime 的相关联合套件为 `93 passed`；新增/相关源文件
-Ruff 通过，Conversation 与 Config 定向 mypy 通过。全仓 pytest 为
-`745 passed, 2 skipped in 537.40s`，零失败。全仓 Ruff 仍为本任务开始前已有的 18 项：官方
-Terminal-Bench Sample 13 项和既有 Aegis 文件 5 项；本次相关文件没有新增 Ruff 问题。全仓 mypy
-报告 39 项既有可选依赖/旧模块类型问题，均不在新增 Conversation Quality 模块；本次模块定向 mypy
-为零。
-
-### 权衡、限制与后续
-
-实时自动评测在 Turn 结束后同步执行；纯规则成本很低，但启用 Judge 的 Failure Turn 会增加一次模型调用
-延迟和费用，因此默认关闭。历史回填无法恢复未持久化的真实观测边界，适合规则分析和故障样本整理，不能
-替代实时记录用于精确性能/成本评测。当前 CLI 按整个 Session 回填全部有效 Turn；未来若超长 Session
-需要增量操作，可在不改变 ID 规则的前提下增加 Turn 范围过滤。
-
-### 面试式总结
-
-这次把 Process Evaluation 从“只评测专门任务和 Harbor Trial”扩展到显式选择的日常对话，同时没有让
-所有聊天默认承担存储或 Judge 成本。实时路径利用 Observability 事件保留完整证据，历史路径利用原始
-Session Message 做可审计、幂等、保守的降级重建；两条路径最终都进入同一个 ExecutionRecord 和
-ProcessEvaluator。Judge 的运行策略变成可持久配置但密钥仍与偏好分离，兼顾易用性、安全性和失败隔离。
-
-## Harbor 容器代理继承修复
-
-### 目标与原问题
-
-在 WSL 宿主机使用 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:10808` 时，Harbor
-适配器会通过进程环境回退自动把该代理转发进任务容器。容器中的回环地址指向容器自身，
-导致 Aegis 第一次模型调用在执行任何工具前以 `APIConnectionError` 失败。宿主机和容器
-直连 DashScope 均能得到预期 HTTP 响应，确认故障来自错误代理继承而非模型名、密钥或
-Provider 网络。
-
-### 实现与可靠性边界
-
-`src/aegis_agent/integrations/harbor.py` 继续允许 API Key、Base URL、Model 和
-Langfuse 设置从显式 Agent 环境或 Harbor 启动进程继承；八个大小写代理变量改为仅接受
-显式 `--ae` 值。这样宿主机回环代理不会无意进入容器，同时需要代理的用户仍能传入一个
-容器可达的代理地址。改动不改变 Agent Loop、Provider 或 Harbor 网络策略。
-
-### 参考关系与迁移决策
-
-这是根据本地 Harbor 作业日志、Docker/WSL 网络实测和 Aegis 适配器数据流独立完成的
-Aegis 修复；没有使用 Hermes 或 Claude Code 实现，也没有修改两个参考仓库。
-
-### 测试与验证
-
-新增可选 Harbor 适配器测试，覆盖八个大小写代理变量：宿主进程代理不得隐式继承，
-显式 Agent 代理必须保留。另以任务基础镜像验证容器可直连 DashScope，并确认返回预期的
-未认证 HTTP 状态而不是连接错误。Harbor 环境中的定向测试为 `16 passed`；Aegis 全仓
-测试为 `745 passed, 3 skipped`；相关源文件和测试 Ruff、`git diff --check` 均通过。
-
-### 权衡与后续
-
-如果模型端点只能通过代理访问，调用方必须把代理监听到容器可达的地址并显式使用 `--ae`
-传入；Aegis 不猜测宿主机地址，也不自动重写回环 URL。这样牺牲隐式便利性，换取跨 Docker、
-WSL 和远程 Harbor 环境的一致语义与更安全的凭据/网络边界。
-
-### 面试式总结
-
-问题不是 Provider 不可用，而是宿主和容器对 `127.0.0.1` 的网络命名空间语义不同。
-修复将代理配置从“环境回退”改为“显式跨边界传递”，并用正反测试锁定行为：宿主代理
-不会泄漏，用户明确配置的容器可达代理仍能工作。
-
-## Harbor/Terminal-Bench 工具结果语义与验收提示加固
-
-### 目标与原问题
-
-Harbor 轨迹暴露了五个相互放大的证据问题：`terminal` 为所有退出码 1 添加通用
-`exit_code_meaning`，随后又把“存在解释字段”当作成功豁免，导致 Python、pytest、git 等真实失败在
-Trace 中显示成功；历史 Session 重建也复制了同一豁免。长运行提示对整条命令做子串搜索，使普通参数
-`/git/server.git` 因包含 `serve` 被误报。POSIX 前台和后台均使用 `/bin/sh -c`，管道末端成功可覆盖
-上游失败。System prompt 只要求实际执行，没有把用户明确验收项变成完成门槛。最后，Docker Desktop
-容器共享 WSL2 内核版本字符串，单纯检查 `/proc/version` 会把容器误报为 WSL 并注入宿主 `/mnt/c`
-提示。
-
-### 参考关系与迁移决策
-
-本次是在 Aegis 已有 Terminal、ProcessRegistry、Prompt Contributor 和 Quality Reconstruction 边界内
-独立完成的最小加固，没有复制 Hermes 或 Claude Code 新代码，也没有读取或修改两个参考仓库。原有
-`terminal.py`、`process_registry.py` 和 prompt contributor 中已注明的 Hermes 来源与 MIT attribution
-继续保留；新增的退出语义、命令解析、shell 选择、验收规则和容器优先检测均记为 Aegis 原创增量。
-
-### 设计与行为变化
-
-- `terminal` 现在对每个非零返回码设置 `ToolResult.is_error=True`，JSON 同时保留 stdout/stderr、数值
-  `exit_code` 和明确的 `error`。退出码 1 的说明改成命令感知：grep/diff 可获得约定说明，其他命令只
-  得到保守的“命令特定失败或否定结果”；说明字段不再改变成功状态。
-- 历史 Conversation Record 重建对所有非零整数退出码保守判失败，即使旧结果含
-  `exit_code_meaning`；仅由 exit code 推导出的错误先统一脱敏再转为字符串，保持 Schema 类型稳定。
-- 长运行判断先按 shell 控制操作符切分，再只检查每段的真实可执行程序、子命令、模块或 watch 参数；
-  支持常见 server/watch 命令及 `uv run`/`npx` 等包装器，但不扫描普通路径和参数的任意子串。尾随真实
-  `&` 仍提示使用托管后台模式。
-- 新增共享 `tools/shell.py`。Windows 完全保留 `cmd /c`；POSIX 无管道命令保留 `/bin/sh -c`；只有
-  检测到未引用、未转义的真实管道时，才在 Bash 可用时使用 `bash -o pipefail -c`。Bash 不存在则兼容
-  回退 `/bin/sh`。前台 terminal 与后台 ProcessRegistry 共用同一选择逻辑。
-- `TASK_COMPLETION_GUIDANCE` 明确要求开始时识别用户验收条件、结束前逐项用当前真实工具输出验证；任何
-  未被用户明确允许失败的测试或验收项仍失败时不得宣布完成，也不得自行降级为历史、既有或无关问题。
-- 环境提示先检测 Linux 容器的环境变量、Docker/Podman 标记和常见 cgroup 标记，再检测 WSL。因而
-  Docker-on-WSL 显示 `Host: Linux container`，保留真实 home/cwd，但不再注入 `/mnt/c` 宿主提示。
-- 危险命令检测和 operator-only `allow_dangerous_shell` 没有改动；`rm -rf` 等保护保持原语义。
-
-### 测试、验收与文档
-
-新增回归覆盖 Python `SystemExit(1)`、真实 pytest 失败、真实 git commit 退出 1、grep 解释不豁免错误、
-`/git/server.git` 不提示、真实 HTTP server/watch 提示、前台与托管后台管道上游失败、System prompt
-验收规则、容器优先于 WSL，以及旧 Session 中“解释字段 + 非零退出码”的保守重建。定向核心套件为
-`58 passed`；MCP/Session lint 相关小套件为 `22 passed`；全仓为
-`757 passed, 3 skipped in 527.97s`。修改文件 Ruff 与最终 `uv run ruff check .` 均通过，
-`git diff --check` 通过。
-
-为遵守“不修改 benchmark 文件”，Ruff 将仓库内 byte-for-byte 保存的
-`benchmarks/terminal-bench-sample` 明确排除为外部评测输入；样例内容未改。此前全仓 Ruff 还暴露 5 个
-Aegis 既有 lint，均以无行为变化的最小修正处理：进程生命周期 devnull 句柄加意图注释、导出/导入
-排序，以及对有意把参数当字符集合的 `str.strip` 加局部说明。README 英中版本同步更新了里程碑说明、
-terminal 语义、pipefail 与 Harbor 容器提示；source map 记录了原创加固边界。
-
-### 权衡、限制与尚存风险
-
-`pipefail` 只在 Bash 可用时启用；极简 POSIX 系统若没有 Bash 会安全回退 `/bin/sh`，此时管道仍可能
-保留传统“最后命令决定状态”的语义。`pipefail` 也会把预期的 SIGPIPE（例如无限输出接 `head`）显示为
-非零；这是为避免掩盖上游失败而选择的保守行为，模型仍可根据输出判断。长运行识别刻意采用常见命令
-白名单，未知框架可能不会获得提示，但普通路径不会再误触发。容器检测覆盖主流 Docker、Podman、
-Kubernetes 和 LXC 标记，无法保证识别没有这些标记的定制容器。
-
-### 面试式总结
-
-这次修复的核心是把“解释证据”和“成功判定”彻底分离：退出码与命令约定仍完整交给模型，但任何非零
-状态都不会在遥测层伪装成成功。随后从两端补齐证据链——执行端用 pipefail 防止管道吞错，提示端把
-用户验收项设为不可自行降级的完成门槛；同时用结构化命令识别消除路径子串误报，并让容器身份优先于
-共享的 WSL 内核信息。所有变更都留在 Aegis，既没有削弱危险命令保护，也没有修改外部 benchmark。
-
-## Process Evaluation 默认启用 Failure-Recovery LLM Judge
-
-### 目标与原问题
-
-过程评测已经支持规则优先、LLM 辅助的 Failure Recovery Grader，但没有显式 CLI 参数或 YAML
-配置时，Judge 默认关闭。这与预期的日常运行方式不符：操作者希望直接执行
-`aegis quality evaluate --all`，在已有模型配置可用时自动获得 LLM 对失败诊断、针对性调整和目标恢复的
-精炼判断。
-
-### 设计与行为变化
-
-- Judge 的缺省设置由关闭改为 `enabled: true`、`provider: auto`。现有的 CLI/环境 Provider 覆盖和
-  YAML 中的 model/base URL 覆盖优先级保持不变。
-- LLM 调用边界不变：只有 Record 中至少存在一个 Failure Episode 时才进行一次 Side Query，其余五个
-  Grader 始终为确定性规则。
-- Fail-open 语义不变：没有真实模型配置、Provider 初始化或调用失败、JSON 非法或证据无法映射回 Trace
-  时，保留规则分数与状态，整批评测继续运行。完全隐式的默认配置在模型不可用时静默降级，以保持
-  `--json` 输出纯净；显式 CLI/YAML Judge 配置不可用时仍输出警告。
-- `quality.failure_recovery_judge.enabled: false` 仍是明确的纯规则模式开关。
-- 单元测试现在显式清空可能从开发者 `.env` 继承的 Aegis/Anthropic 模型凭据，避免默认开启后测试误调
-  真实外部 API；需要 Judge 的测试自行注入假凭据或 Fake Provider。
-
-### 参考关系与验证
-
-这是 Aegis Process Evaluation 配置策略的原创调整，没有读取、复制或修改 Hermes、Claude Code。
-新增回归验证无 Quality 配置时能从标准 Aegis 环境自动建立 Judge，并保留显式关闭契约；中英文 README
-同步说明默认开启、按 Failure Episode 调用及安全降级行为。Process/Conversation 定向套件为
-`44 passed`；全仓回归为 `759 passed, 3 skipped in 528.32s`；全仓 Ruff 与 `git diff --check` 均通过。
-
-### 权衡与剩余风险
-
-默认开启意味着含 Failure Episode 的真实评测会产生一次额外模型调用及相应成本；操作者可用
-`enabled: false` 全局关闭，或在单条 Record 的 `process_evaluation_config` 中禁用。`provider: auto`
-依赖可用凭据和模型配置；配置不完整时只给出警告并回退规则结果，不会把 Process Evaluation 变成硬失败。
-
-## Harbor Agent Setup 显式代理贯通
-
-### 目标与原问题
-
-为扩充 Process Evaluation 样本并行启动 5 个 Terminal-Bench Trial 时，所有 Trial 都在进入 Agent
-Loop 前失败：3 个 `AgentSetupTimeoutError`、1 个 Debian 下载 `NetworkConnectionError`、1 个随后产生的
-非零 Setup 退出。宿主 WSL 使用 `127.0.0.1:10808`，该回环地址在容器中指向容器自身；与此同时，Aegis
-原先只把显式代理送入 Runtime，Harbor 的 `apt-get` 与 Aegis Wheel 的 pip 安装收不到代理。已有评测
-脚本传入的 pip 镜像、超时和重试参数也没有进入 pip 子进程。
-
-### 设计与行为变化
-
-- Harbor `BaseInstalledAgent.ensure_system_dependencies()` 新增显式 `env` 边界；缺依赖时把该环境合并到
-  apt/dnf/yum/apk 安装命令，apt 仍强制 `DEBIAN_FRONTEND=noninteractive`。默认调用不传环境，旧行为不变。
-- Aegis Adapter 只读取 `extra_env` 中用户显式提供的代理，不继承宿主代理；同一代理现在传入系统包安装、
-  pip Wheel 安装和 Runtime。
-- pip 安装阶段同时接收显式 `PIP_INDEX_URL`、Extra Index、Timeout、Retries、CA/证书以及离线
-  `PIP_NO_INDEX`/`PIP_FIND_LINKS` 设置。
-- 显式 `localhost`、IPv4/IPv6 回环代理在 Setup 前直接报错，避免等待 360 秒后才得到模糊 timeout；错误
-  不回显完整代理 URL，避免代理凭据泄露。
-- `scripts/aegis-eval.sh` 新增 `AEGIS_HARBOR_PROXY`/`AEGIS_HARBOR_NO_PROXY` 映射。只有专用变量存在时
-  才传代理，不会把宿主 `127.0.0.1` 自动复制进容器。
-
-### 参考关系、验证与权衡
-
-这是基于真实 Harbor 失败日志完成的 Aegis/Harbor 原创可靠性修复，没有使用 Hermes 或 Claude Code。
-Harbor 系统依赖定向测试验证默认兼容与 apt 环境合并；Aegis 适配器测试验证宿主代理隔离、显式代理贯通、
-三种回环地址拒绝及 pip 设置传递。操作者仍需让代理监听容器可达地址；代码不会自动开放本地代理
-端口。Timeout multiplier 只作为慢网兜底，不再承担代理配置修复职责。
-
-### 真实运行发现与追加修复
-
-第一轮代理贯通后 Setup 完成，模型完成第一次调用并写文件，第二次调用超时。排查时原代理 URL
-使用的 `172.20.10.2` 已不可达，WSL 接口显示为 `10.25.20.239`，证明固定局域网 IP 不适合长 Trial。
-这支持网络变化导致中断的判断，但不能据此断言模型本身需要更大的超时。
-
-当显式代理 URL 使用 `host.docker.internal` 且容器没有解析该名字时，Adapter 使用容器默认路由的
-网关补充 `/etc/hosts`；已有解析保持不变。这个方案针对本地 Linux/WSL Docker，不承诺其他远程
-容器后端的网关就是操作者的本机。主机名映射不改变监听接口或防火墙。
-
-两种模型 Provider 新增 `AEGIS_MODEL_TIMEOUT`，默认仍是 60 秒，显式调用参数优先；非法、非正数、
-NaN/Infinity 在创建 Provider 前报错。Harbor wrapper 缺省传 300 秒。它是 SDK 传输超时，
-不是整条 Agent 运行的总时限，SDK 重试或持续收到流式数据可让总耗时超过该值。
-
-第二轮稳定代理试验 `d2ebf469-f9e4-44f1-92d3-bbeab70bef25` 完成 5 次模型调用、4 次工具调用，
-Runtime success=true；但 Verifier 下载 uv 超时。Verifier 环境独立于 Agent，因此 wrapper
-进一步为两者都传入大小写 HTTP(S) 代理和 NO_PROXY；小写形式也覆盖 apt/curl 的环境约定。
-测试用临时 TCP 转发，仅用于本次验收，不写入用户持久配置。
-
-### 验证结果与范围
-
-- Aegis 全仓：`uv run pytest -q` → `764 passed, 3 skipped`；最后的有限数校验追加后，
-  Provider/Harbor record 定向套件 → `44 passed, 1 skipped`；`uv run ruff check .` 通过。
-- 在 Harbor 环境加载 Aegis Adapter 的定向测试 → `22 passed`，避免 Aegis 默认环境因 Harbor
-  可选依赖缺失而把整个 Adapter 文件跳过。
-- Harbor 系统依赖与 wrapper 定向测试 → `18 passed`；修改文件 Ruff、格式和 base.py 的 ty 通过。
-- Harbor 全量 unit 尝试在收集阶段遇到 12 个缺可选依赖错误（如 pandas、anthropic、hypothesis、
-  云环境 SDK）；全仓 ty 为 160 个诊断，包含可选依赖缺失及其他模块类型问题，不能报告全仓通过。
-- 原始 Trial、Runtime Record 与 verifier 日志保留；评测结果通过正常 import/evaluate 写入中央
-  Store。未修改 benchmark、奖励或评分算法来让样例通过。
-- Hermes 工作树干净；Claude Code 既有改动列表与之前一致，本次没有对参考仓库执行写操作。
-
-### 过程评测复核
-
-`docs/process-evaluator-review-20260918.md` 记录原始样例、当前评分、人工复核依据和 P0–P3
-改进顺序。确认 Setup 失败的空轨迹可被当前规则给 1.0 PASS，自定义 Python 自测可被漏判，
-网络中断触发的真实 LLM Judge 仍缺少“是否有恢复机会”的归责信息。网络修复为扩充有效样例
-提供基础；评分算法改动保持为可审阅方案。
-
-### 面试式总结
-
-把超时拆解成安装、模型传输、独立验证三个阶段，用真实日志定位代理边界、动态宿主 IP 和
-Verifier 隔离问题。通过显式代理传递、按需网关映射及独立可配置模型超时修复运行链路，
-同时用真实失败与成功轨迹检查评测器本身，区分缺证据、错误行为和基础设施中断。
-
-### 本轮变更文件与验证命令
-
-网络与超时实现涉及 Aegis `src/aegis_agent/integrations/harbor.py`、
-`src/aegis_agent/models/openai_compat.py`、`src/aegis_agent/models/anthropic.py`，以及对应的
-`tests/test_harbor_adapter.py`、`tests/test_openai_provider.py`、`tests/test_anthropic_provider.py`；
-Harbor 涉及 `src/harbor/agents/installed/base.py`、
-`tests/unit/agents/installed/test_system_dependencies.py`、`scripts/aegis-eval.sh`、
-`tests/unit/test_aegis_eval_script.py`。文档涉及中英文 README、source-map、本开发日志和
-`docs/process-evaluator-review-20260918.md`。未提交 Git，也未覆盖同工作树中的其他既有修改。
-
-主要命令为 `uv run pytest -q`、Provider/Harbor 相关的定向 pytest、`uv run ruff check .`、
-Harbor `uv run --with pytest --with pytest-asyncio python -m pytest` 的定向及全量 unit 尝试、
-`uv run --with ruff ruff format --check <changed-files>`、`uv run --with ty ty check`
-以及 base.py 的定向检查、两仓 `git diff --check`。真实验收用 wrapper 启动 Harbor，
-随后执行 `uv run aegis quality import-harbor <job>` 和 `uv run aegis quality evaluate <id>`。
-
-Harbor 全仓 Ruff 已通过。原始 verifier uv 安装地址预检曾返回 403，三条最终样例额外预装了
-GitHub 官方相同版本 uv 0.7.13，并校验同 Release 的 SHA256；随后日志汇总任务的原始 installer
-也成功运行，因此这不是已证实的永久站点不可达。环境准备和复现限制详见样例报告。
-
-### 最终三条 Harbor 验收样例
-
-- log-summary-date-ranges：`bbc25635-6d91-4f6a-b035-467a5c7cffad`，Harbor reward=1、官方
-  2 项测试通过，Process=1.0 PASS。人工复核发现其 Final Verification 的 `required=false`
-  理由有误，未识别内联 Python 写 CSV。
-- regex-log：`acd1dc0e-cdce-410f-848b-5edef2e1c37d`，Harbor reward=1、官方 1 项测试通过，
-  Process=0.8333 FAIL。实际 Python heredoc 自测被遗漏，再现 Final Verification 误报。
-- polyglot-c-py：`d23d64b7-159f-4a73-ada3-01e37384a8a7`，Harbor reward=0、官方目录约束失败，
-  Process=0.8333 FAIL。LLM Judge 确实应用并确认 SyntaxError 已恢复；本地做过数值验证，
-  但多余 `cmain`、`test_warn.c` 未清理，因此评分需要表达“部分验收覆盖”而非“未验证”。
-
-三条均无 Harbor 基础设施异常，已导入并评分。测试用临时 TCP 转发已停止，Docker 无运行中的
-测试容器，原始 Job/记录仍保留。方案完成在报告中，评分规则本身尚未实施上述改进。
-
-## 2026-09-19：修复 chess-best-move 环境启动超时并保留诊断
-
-### 原始问题与证据
-
-Job `2026-09-18__21-23-49` 在 Docker Compose up 阶段等待 600 秒后抛出
-`EnvironmentStartTimeoutError`，Agent 尚未运行。任务包 digest 为
-`9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da`，指定镜像
-`alexgshaw/chess-best-move:20251031`。Docker daemon 同时记录镜像站
-`docker.xuanyuan.me` 返回 403，另一镜像站出现 Host doesn't match；重复拉取卡在
-`c38c7b25e3de` 层（约 144 MB）。这说明以前针对 pip/模型/Verifier 的修复不覆盖此阶段。
-
-### 修复、来源与数据流
-
-从 `registry-1.docker.io/alexgshaw/chess-best-move:20251031` 成功获取原镜像，随后
-将同一镜像标记为任务要求的名称。拉取 digest 为
-`sha256:bb447f94d9e2a8ed879f85c85a514b213b7418f9fe11fd7b2428a0b0e436e647`。
-没有拿旧 GHCR 镜像替代，也没有改任务内容、镜像站全局配置或历史结果。
-
-Harbor `DockerEnvironment.start` 将 build/up 输出交给已有流式收集器，逐行写入
-trial logger；外层启动超时后依然保留已收到的下载进度。缓冲收集器新增外部取消时的
-子进程终止与等待，随后原样抛出 CancelledError，保留 Trial 的超时分类。
-现有流式收集器已支持取消清理。测试覆盖真实子进程的取消清理及启动日志在取消前可见。
-本次是 Harbor 独立缺陷修复，未参考、复制或改编 Hermes / Claude Code；不涉及迁移。
-
-### 变更文件
-
-- Harbor：`src/harbor/environments/docker/docker.py`、`tests/unit/environments/test_docker.py`。
-- Aegis：`README.md`、`README.zh-CN.md`、`docs/source-map.md`、`docs/development-log.md`。
-- 验收产物：Harbor `jobs/chess-startup-recovery-20260919/`，不改写原 Job。
-
-### 验证与命令
-
-执行 `docker pull registry-1.docker.io/alexgshaw/chess-best-move:20251031`、
-`docker tag registry-1.docker.io/alexgshaw/chess-best-move:20251031 alexgshaw/chess-best-move:20251031`。
-使用原 digest 对应的本地缓存任务执行 `uv run --no-sync harbor run -p <原任务缓存目录>
--a nop --disable-verification --job-name chess-startup-recovery-20260919 -n 1 -k 1`。
-验收 19 秒完成，异常数为 0，容器进入 Healthy 并正常清理；不调用付费模型、不运行评分器，
-因此这不是 Qwen 解题通过的证据，显示 Mean=0 属于禁用验证后的结果。
-
-Docker/Podman 定向回归：157 passed、1 skipped。相关文件 Ruff 检查及格式化通过，
-`uv run --with ty ty check src/harbor/environments/docker/docker.py` 通过。
-完整 environments 测试收集被七个可选云 SDK 缺失阻断；全仓 ty 有 160 条既有/缺依赖诊断，
-未为此修改无关模块。两仓 `git diff --check` 通过。
-`git status --porcelain` 确认 Hermes 保持干净、Claude Code 既有修改列表与检查前一致。
-
-### 限制与面试总结
-
-当前任务镜像已经缓存，重跑无需再次下载；其他未缓存镜像仍可能受镜像站或网络影响。
-没有增加重试或盲目拉长所有超时；后续可根据实时下载日志判断是否需要独立环境启动预算。
-没有重新执行完整 Qwen 评测，也没有宣称修复所有其他错误。保留已有工作树修改，不提交。
-本次将问题定位到模型执行之前的镜像下载，恢复准确的输入镜像，同时修复诊断日志与取消
-清理，使基础设施失败可被定位且不会留下未回收的 Compose 客户端。
-
-最终全仓静态检查：Harbor `uv run --with ruff ruff check .` 全部通过；`uv run --with ruff ruff format --check .` 确认 1356 个文件无需格式化。Aegis 本轮仅改文档，未重复运行其运行时全套测试。
+## 报告维护约定
+
+- 本文是累计的面试导向技术报告，不是 commit log、逐文件 changelog 或任务完成回执。
+- 每个新阶段都应包含原始问题、参考来源与迁移决策、数据流与关键接口、可靠性边界、验证证据、权衡，以及独立的 **Interview summary**。
+- 历史测试数字只在能说明技术证据时保留；当前状态以实际执行结果为准。
+- 逐文件来源关系统一维护在 `docs/source-map.md`，第三方许可统一维护在 `THIRD_PARTY_NOTICES.md`。
+- 计划能力不得写成已交付；Hermes 与 Claude Code reference repositories 保持只读。

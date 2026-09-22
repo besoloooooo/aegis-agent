@@ -6,9 +6,10 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from time import perf_counter
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -25,9 +26,9 @@ from aegis_agent.quality.models import (
     ProcessStatus,
 )
 
-EVALUATOR_VERSION = "1.1.0"
+EVALUATOR_VERSION = "1.2.0"
 GRADER_VERSION = "1.0.0"
-FAILURE_RECOVERY_GRADER_VERSION = "1.1.0"
+FAILURE_RECOVERY_GRADER_VERSION = "1.2.0"
 FAILURE_RECOVERY_LLM_GRADER_VERSION = "1.0.0"
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class ProcessEvaluatorConfig(BaseModel):
             r"(?:^|\s)git\s+(?:status|diff|log|show)\b",
         ]
     )
+    final_verification_llm_enabled: bool = True
     failure_recovery_llm_enabled: bool = True
     failure_recovery_llm_max_prompt_chars: int = Field(
         default=16_000,
@@ -115,6 +117,8 @@ class ProcessEvaluatorConfig(BaseModel):
     )
     efficiency_thresholds: dict[str, float] = Field(default_factory=dict)
     baseline_metrics: dict[str, float] = Field(default_factory=dict)
+    baseline_sample_count: int = 0
+    baseline_sample_target: int = 5
     grader_weights: dict[str, float] = Field(default_factory=_default_weights)
 
 
@@ -151,10 +155,15 @@ class FailureEpisode:
     failure_step: ExecutionStep
     events: tuple[_EpisodeEvent, ...]
     rule_recovery_step: ExecutionStep | None = None
+    error_source: str = "tool"
+    exposed_to_agent: bool = False
+    recovery_opportunity: bool = False
+    retry_owner: str = "agent"
 
 
 class _FailureEpisodeJudgment(BaseModel):
     failure_step_id: str
+    episode_id: str | None = None
     effective_diagnosis: bool
     adjustment_targets_failure: bool
     target_recovered: bool
@@ -297,6 +306,23 @@ class FailureRecoveryGrader:
             )
 
         episode_data = [_episode_metadata(episode) for episode in episodes]
+        episodes = [episode for episode in episodes if episode.recovery_opportunity]
+        if not episodes:
+            return _insufficient_grade(
+                self,
+                "Failures had no observed Agent recovery opportunity.",
+                [
+                    "Runtime/provider failures or terminal failures were not actionable by the Agent."
+                ],
+                [item["failure"]["step_id"] for item in episode_data],
+                metadata={
+                    "failure_count": len(episode_data),
+                    "episodes": episode_data,
+                    "evaluation_mode": "skipped",
+                    "skip_reason": "no_recovery_opportunity",
+                    "eligible_failure_count": 0,
+                },
+            )
         recovered = [episode for episode in episodes if episode.rule_recovery_step]
         adjusted = [episode for episode in recovered if _episode_adjustments(episode)]
         affected = _unique(
@@ -331,7 +357,9 @@ class FailureRecoveryGrader:
         recovered_ratio = len(recovered) / len(episodes)
         adjustment_ratio = len(adjusted) / len(episodes)
         score = 0.75 * recovered_ratio + 0.25 * adjustment_ratio
-        assessments = [_episode_assessment(item) for item in episode_data]
+        assessments = [
+            _episode_assessment(_episode_metadata(item)) for item in episodes
+        ]
         return ProcessGrade(
             grader_name=self.grader_name,
             grader_version=self.grader_version,
@@ -370,24 +398,29 @@ class FailureRecoveryLLMGrader:
         fallback: ProcessGrade | None = None,
     ) -> ProcessGrade:
         rule_grade = fallback or FailureRecoveryGrader().grade(context)
-        episodes = _extract_failure_episodes(context)
+        episodes = [
+            item
+            for item in _extract_failure_episodes(context)
+            if item.recovery_opportunity
+        ]
         if not episodes or not context.config.failure_recovery_llm_enabled:
             return rule_grade
 
-        judgments, error, prompt_truncated = _judge_failure_episodes(
+        judgments, error, telemetry = _judge_failure_episodes(
             self.provider,
             context,
             episodes,
         )
         if judgments is None:
             metadata = dict(rule_grade.metadata)
+            metadata["evaluation_mode"] = "fallback"
             metadata["llm_judge"] = {
                 "status": "fallback",
                 "judge_version": self.judge_version,
                 "provider": getattr(self.provider, "name", "unknown"),
                 "model": getattr(self.provider, "model", None),
                 "reason": error or "invalid_response",
-                "prompt_truncated": prompt_truncated,
+                **telemetry,
             }
             return rule_grade.model_copy(update={"metadata": metadata})
 
@@ -445,7 +478,7 @@ class FailureRecoveryLLMGrader:
                     "judge_version": self.judge_version,
                     "provider": getattr(self.provider, "name", "unknown"),
                     "model": getattr(self.provider, "model", None),
-                    "prompt_truncated": prompt_truncated,
+                    **telemetry,
                     "judgments": [item.model_dump(mode="json") for item in verdicts],
                 },
             }
@@ -470,131 +503,9 @@ class FinalVerificationGrader:
     category = "verification"
 
     def grade(self, context: EvaluationContext) -> ProcessGrade:
-        config = context.config
-        if config.requires_verification is False:
-            return _pass_grade(
-                self,
-                "Final verification was explicitly disabled for this task.",
-                [
-                    "record.metadata process-evaluation configuration sets requires_verification=false."
-                ],
-                metadata={"required": False, "source": "task_metadata"},
-            )
+        from aegis_agent.quality.verification import grade_verification
 
-        candidates = [
-            action for action in context.actions if _is_mutation(action, config)
-        ]
-        successful = [action for action in candidates if action.step.success is True]
-        unknown = [action for action in candidates if action.step.success is None]
-        required = config.requires_verification is True or bool(successful)
-        if unknown and not successful:
-            return _insufficient_grade(
-                self,
-                "Mutation-like steps exist, but their success fields are missing.",
-                [
-                    f"Cannot establish whether steps {_sequence_range(unknown)} changed state."
-                ],
-                [action.step.step_id for action in unknown],
-                metadata={"required": None, "missing_field": "steps[].success"},
-            )
-        if config.requires_verification is True and not context.steps:
-            return _insufficient_grade(
-                self,
-                "Final verification is required, but the record contains no steps.",
-                [
-                    "Cannot locate a modification or verification step in an empty trace."
-                ],
-                [],
-                metadata={"required": True, "missing_field": "steps"},
-            )
-        if not required:
-            return _pass_grade(
-                self,
-                "No material state modification requiring final verification was observed.",
-                [
-                    "The default mutation heuristic found no successful mutation tool or command."
-                ],
-                metadata={"required": False, "source": "default_heuristic"},
-            )
-
-        last_mutation_sequence = max(
-            (action.step.sequence for action in successful),
-            default=-1,
-        )
-        following = [
-            action
-            for action in context.actions
-            if action.step.sequence > last_mutation_sequence
-            and _is_verification(action, config)
-        ]
-        passed = [action for action in following if action.step.success is True]
-        affected = [action.step.step_id for action in successful]
-        if passed:
-            verification = passed[-1]
-            return ProcessGrade(
-                grader_name=self.grader_name,
-                grader_version=self.grader_version,
-                score=1.0,
-                status="pass",
-                severity="info",
-                category=self.category,
-                message="A successful final verification followed the last material modification.",
-                evidence=[
-                    (
-                        f"Last mutation was sequence {last_mutation_sequence}; successful "
-                        f"verification was step {verification.step.step_id} "
-                        f"(sequence {verification.step.sequence})."
-                    )
-                ],
-                affected_steps=_unique([*affected, verification.step.step_id]),
-                metadata={
-                    "required": True,
-                    "last_mutation_sequence": last_mutation_sequence,
-                    "verification_step": verification.step.step_id,
-                    "source": "task_metadata"
-                    if config.requires_verification
-                    else "default_heuristic",
-                },
-            )
-        failed_verifications = [
-            action for action in following if action.step.success is False
-        ]
-        if not affected and not failed_verifications:
-            affected = [step.step_id for step in context.steps]
-        message = (
-            "Final verification ran after the last modification but did not succeed."
-            if failed_verifications
-            else "Missing final verification after a material state modification."
-        )
-        evidence = [
-            (
-                f"Last successful mutation was sequence {last_mutation_sequence}; no later "
-                "successful verification tool or command was recorded."
-            )
-        ]
-        return ProcessGrade(
-            grader_name=self.grader_name,
-            grader_version=self.grader_version,
-            score=0.0,
-            status="fail",
-            severity="high" if failed_verifications else "medium",
-            category=self.category,
-            message=message,
-            evidence=evidence,
-            affected_steps=_unique(
-                [*affected, *(item.step.step_id for item in failed_verifications)]
-            ),
-            metadata={
-                "required": True,
-                "last_mutation_sequence": last_mutation_sequence,
-                "failed_verification_steps": [
-                    action.step.step_id for action in failed_verifications
-                ],
-                "source": "task_metadata"
-                if config.requires_verification
-                else "default_heuristic",
-            },
-        )
+        return grade_verification(context)
 
 
 class LoopDetectionGrader:
@@ -680,6 +591,29 @@ class ExecutionEfficiencyGrader:
                     f"baseline ({baseline:g})"
                 )
 
+        calibrated = bool(
+            context.config.efficiency_thresholds or context.config.baseline_metrics
+        )
+        if not calibrated:
+            return ProcessGrade(
+                grader_name=self.grader_name,
+                grader_version=GRADER_VERSION,
+                score=None,
+                status="not_scored",
+                severity="info",
+                category=self.category,
+                message="No calibrated baseline available.",
+                evidence=[
+                    "Usage describes this execution; absence of redundancy does not prove efficiency."
+                ],
+                metadata={
+                    "metrics": metrics,
+                    "signals": reasons,
+                    "calibration_status": "uncalibrated",
+                    "baseline_sample_count": context.config.baseline_sample_count,
+                    "baseline_sample_target": context.config.baseline_sample_target,
+                },
+            )
         if not reasons:
             return _pass_grade(
                 self,
@@ -690,7 +624,11 @@ class ExecutionEfficiencyGrader:
                         "without a configured threshold or baseline."
                     )
                 ],
-                metadata={"metrics": metrics, "signals": []},
+                metadata={
+                    "metrics": metrics,
+                    "signals": [],
+                    "calibration_status": "calibrated",
+                },
             )
         repeat_ratio = repeat_count / max(tool_count, 1)
         penalty = min(0.75, max(repeat_ratio, failed_ratio) + 0.1 * (len(reasons) - 1))
@@ -722,7 +660,11 @@ class ExecutionEfficiencyGrader:
             message="Execution contains deterministic inefficiency signals.",
             evidence=reasons,
             affected_steps=affected,
-            metadata={"metrics": metrics, "signals": reasons},
+            metadata={
+                "metrics": metrics,
+                "signals": reasons,
+                "calibration_status": "calibrated" if calibrated else "uncalibrated",
+            },
         )
 
 
@@ -744,9 +686,14 @@ class ProcessEvaluator:
         graders: Sequence[ProcessGrader] = DEFAULT_GRADERS,
         config: ProcessEvaluatorConfig | None = None,
         failure_recovery_judge: ModelProvider | None = None,
+        final_verification_judge: ModelProvider | None = None,
     ) -> None:
+        self.final_verification_judge = (
+            final_verification_judge or failure_recovery_judge
+        )
         self.graders = tuple(graders)
         self.config = config or ProcessEvaluatorConfig()
+        self.calibration_records: list[ExecutionRecord] | None = None
         self.failure_recovery_judge = (
             FailureRecoveryLLMGrader(failure_recovery_judge)
             if failure_recovery_judge is not None
@@ -755,6 +702,19 @@ class ProcessEvaluator:
 
     def evaluate(self, record: ExecutionRecord) -> ProcessEvaluationResult:
         config = _config_for_record(self.config, record)
+        if self.calibration_records is not None and not config.baseline_metrics:
+            from aegis_agent.quality.calibration import build_baseline
+
+            calibration = build_baseline(
+                self.calibration_records,
+                record.identity.task_id,
+                exclude_execution_id=record.identity.execution_id,
+                minimum_samples=config.baseline_sample_target,
+            )
+            config = config.model_copy(update={
+                "baseline_metrics": calibration["baseline_metrics"],
+                "baseline_sample_count": calibration["successful_sample_count"],
+            })
         steps = tuple(sorted(record.steps, key=lambda step: step.sequence))
         context = EvaluationContext(
             record=record,
@@ -762,12 +722,60 @@ class ProcessEvaluator:
             steps=steps,
             actions=tuple(_action(step) for step in steps if step.type == "tool"),
         )
-        grades = [grader.grade(context) for grader in self.graders]
-        if self.failure_recovery_judge is not None:
+        evidence = _evidence_state(record)
+        if evidence["evidence_status"] == "missing":
+            grades = [
+                _insufficient_grade(
+                    grader,
+                    "Agent trace evidence is missing.",
+                    [evidence["evidence_reason"]],
+                    [],
+                    metadata={
+                        "evaluation_mode": "skipped",
+                        "skip_reason": "missing_evidence",
+                    },
+                )
+                for grader in self.graders
+            ]
+        else:
+            grades = [grader.grade(context) for grader in self.graders]
+        if (
+            self.failure_recovery_judge is not None
+            and evidence["evidence_status"] != "missing"
+        ):
             for index, grade in enumerate(grades):
                 if grade.grader_name == "failure_recovery":
                     grades[index] = self.failure_recovery_judge.grade(context, grade)
                     break
+        if (
+            self.final_verification_judge is not None
+            and evidence["evidence_status"] != "missing"
+            and config.final_verification_llm_enabled
+        ):
+            from aegis_agent.quality.verification import grade_verification
+
+            for index, grade in enumerate(grades):
+                if grade.grader_name == "final_verification":
+                    grades[index] = grade_verification(
+                        context, self.final_verification_judge
+                    )
+        for grade in grades:
+            grade.metadata.setdefault("evaluation_mode", "rules")
+            if (
+                grade.grader_name == "failure_recovery"
+                and "llm_judge" not in grade.metadata
+            ):
+                reason = (
+                    "disabled"
+                    if not config.failure_recovery_llm_enabled
+                    else grade.metadata.get("skip_reason")
+                    or (
+                        "no_failures"
+                        if not _failure_steps(context)
+                        else "no_model_configured"
+                    )
+                )
+                grade.metadata["llm_judge"] = {"status": "skipped", "reason": reason}
         weights = {
             grade.grader_name: max(
                 config.grader_weights.get(grade.grader_name, 1.0), 0.0
@@ -778,6 +786,7 @@ class ProcessEvaluator:
             (grade.score, weights[grade.grader_name])
             for grade in grades
             if grade.score is not None and weights[grade.grader_name] > 0
+            and grade.status != "not_scored"
         ]
         denominator = sum(weight for _, weight in scored)
         overall_score = (
@@ -787,7 +796,21 @@ class ProcessEvaluator:
             if denominator
             else None
         )
+        if any(
+            grade.status == "insufficient_data"
+            and not (
+                grade.grader_name == "execution_efficiency"
+                and grade.status == "not_scored"
+                and grade.metadata.get("calibration_status") == "uncalibrated"
+            )
+            for grade in grades
+        ):
+            overall_score = None
         status = _overall_status(grades)
+        if evidence["evidence_status"] == "partial":
+            overall_score = None
+            if status == "pass":
+                status = "insufficient_data"
         issue_count = sum(grade.status in {"warning", "fail"} for grade in grades)
         unavailable_count = sum(grade.status == "insufficient_data" for grade in grades)
         summary = f"{issue_count} process issue(s); {unavailable_count} grader(s) lacked sufficient data."
@@ -799,9 +822,9 @@ class ProcessEvaluator:
             summary=summary,
             grades=grades,
             metadata={
+                **evidence,
                 "weights": weights,
                 "config": config.model_dump(mode="json"),
-                "outcome_success": record.execution.success,
                 "harbor_passed": record.evaluation.passed,
                 "failure_recovery_judge_configured": (
                     self.failure_recovery_judge is not None
@@ -810,6 +833,66 @@ class ProcessEvaluator:
         )
         record.quality.process_evaluation = result
         return result
+
+
+def _evidence_state(record: ExecutionRecord) -> dict[str, Any]:
+    """Derive evaluation provenance without rewriting the source execution record."""
+    metadata = record.metadata
+    exception = record.execution.exception_type or ""
+    phase = metadata.get("failure_phase")
+    if phase not in {"setup", "agent", "verifier"}:
+        if "setup" in exception.casefold():
+            phase = "setup"
+        elif "verifier" in exception.casefold():
+            phase = "verifier"
+        elif record.execution.success is False:
+            phase = "agent"
+        else:
+            phase = None
+    runtime_success = metadata.get("runtime_success", record.execution.success)
+    if phase == "verifier" and record.execution.stop_reason == "final_answer":
+        runtime_success = True
+    if phase == "setup":
+        runtime_success = None
+    state = metadata.get("evidence_status")
+    if not record.steps:
+        # A complete no-tool answer still needs actual answer evidence, not a success flag.
+        answer = record.execution.final_output
+        state = (
+            "complete"
+            if runtime_success is True
+            and answer not in (None, "", {}, [])
+            and phase != "setup"
+            else "missing"
+        )
+    elif state not in {"complete", "partial", "missing"}:
+        state = (
+            "partial"
+            if runtime_success is False or runtime_success is None
+            else "complete"
+        )
+    reasons = {
+        "missing": "No Agent trace or completed answer evidence is available.",
+        "partial": "Agent trace is available but execution completion is not established.",
+        "complete": "Agent trace or a completed no-tool answer is available.",
+    }
+    infrastructure = metadata.get("infrastructure_error")
+    if infrastructure is None and phase in {"setup", "verifier"}:
+        infrastructure = {
+            "exception_type": exception or None,
+            "error": record.execution.error,
+        }
+    outcome = metadata.get("outcome_success", record.evaluation.passed)
+    if phase in {"setup", "verifier"}:
+        outcome = None
+    return {
+        "evidence_status": state,
+        "evidence_reason": reasons[state],
+        "failure_phase": phase,
+        "runtime_success": runtime_success,
+        "outcome_success": outcome,
+        "infrastructure_error": infrastructure,
+    }
 
 
 def _config_for_record(
@@ -962,6 +1045,29 @@ def _extract_failure_episodes(context: EvaluationContext) -> list[FailureEpisode
                 failure_step=failure,
                 events=tuple(events),
                 rule_recovery_step=recovery,
+                error_source=str(
+                    failure.metadata.get(
+                        "error_source",
+                        failure.type
+                        if failure.type in {"tool", "model"}
+                        else "runtime",
+                    )
+                ),
+                exposed_to_agent=bool(
+                    failure.metadata.get(
+                        "exposed_to_agent",
+                        failure.type == "tool"
+                        and any(
+                            event.step.type in {"model", "tool"} for event in events
+                        ),
+                    )
+                ),
+                recovery_opportunity=(
+                    failure.metadata.get("exposed_to_agent") is not False
+                    and failure.type == "tool"
+                    and any(event.step.type in {"model", "tool"} for event in events)
+                ),
+                retry_owner="agent" if failure.type == "tool" else "runtime",
             )
         )
     return episodes
@@ -1077,6 +1183,12 @@ def _episode_metadata(episode: FailureEpisode) -> dict[str, Any]:
         for event in episode.events
     ]
     return {
+        "episode_id": f"episode:{episode.failure_step.step_id}",
+        "failure_step_id": episode.failure_step.step_id,
+        "error_source": episode.error_source,
+        "exposed_to_agent": episode.exposed_to_agent,
+        "recovery_opportunity": episode.recovery_opportunity,
+        "retry_owner": episode.retry_owner,
         "failure": _episode_step_data(episode.failure_step),
         "timeline": timeline,
         "diagnostic_steps": [
@@ -1130,6 +1242,7 @@ def _episode_assessment(episode: Mapping[str, Any]) -> dict[str, Any]:
             "non-diagnostic retry that rules can tie to the original target."
         )
     return {
+        "episode_id": episode.get("episode_id", f"episode:{failure['step_id']}"),
         "failure_step": failure["step_id"],
         "failure_sequence": failure["sequence"],
         "failure_type": failure["type"],
@@ -1158,11 +1271,15 @@ def _judge_failure_episodes(
     provider: ModelProvider,
     context: EvaluationContext,
     episodes: Sequence[FailureEpisode],
-) -> tuple[_FailureRecoveryJudgments | None, str | None, bool]:
+) -> tuple[_FailureRecoveryJudgments | None, str | None, dict[str, Any]]:
     payload = {
         "task_name": context.record.identity.task_name,
         "runtime_success": context.record.execution.success,
-        "episodes": [_episode_prompt_data(episode) for episode in episodes],
+        "episodes": [
+            {**_episode_prompt_data(episode),
+             "episode_id": f"episode:{episode.failure_step.step_id}"}
+            for episode in episodes
+        ],
     }
     payload = sanitize(
         payload,
@@ -1179,19 +1296,28 @@ def _judge_failure_episodes(
         Message(role=Role.SYSTEM, content=_FAILURE_RECOVERY_JUDGE_SYSTEM_PROMPT),
         Message(role=Role.USER, content=serialized),
     ]
+    telemetry: dict[str, Any] = {
+        "prompt_version": "failure-recovery-1.1",
+        "prompt_truncated": prompt_truncated,
+        "usage": None,
+    }
+    started = perf_counter()
     try:
         response = collect_response(provider.stream(messages, tools=None))
+        telemetry["usage"] = asdict(response.usage) if response.usage else None
         raw = _extract_json_object(response.content)
         if raw is None:
-            return None, "invalid_json_response", prompt_truncated
+            return None, "invalid_json_response", telemetry
         judgments = _FailureRecoveryJudgments.model_validate(raw)
         error = _validate_failure_judgments(judgments, episodes)
         if error:
-            return None, error, prompt_truncated
-        return judgments, None, prompt_truncated
+            return None, error, telemetry
+        return judgments, None, telemetry
     except Exception as exc:
         logger.debug("failure-recovery LLM judge failed", exc_info=True)
-        return None, f"{type(exc).__name__}", prompt_truncated
+        return None, f"{type(exc).__name__}", telemetry
+    finally:
+        telemetry["latency_ms"] = round((perf_counter() - started) * 1000, 3)
 
 
 def _episode_prompt_data(episode: FailureEpisode) -> dict[str, Any]:
@@ -1238,10 +1364,17 @@ def _validate_failure_judgments(
 ) -> str | None:
     expected = [episode.failure_step.step_id for episode in episodes]
     actual = [item.failure_step_id for item in judgments.episodes]
-    if len(actual) != len(set(actual)) or set(actual) != set(expected):
+    episode_ids = [item.episode_id or f"episode:{item.failure_step_id}" for item in judgments.episodes]
+    expected_episode_ids = [f"episode:{step_id}" for step_id in expected]
+    if (len(actual) != len(set(actual)) or set(actual) != set(expected)
+            or len(episode_ids) != len(set(episode_ids))
+            or set(episode_ids) != set(expected_episode_ids)):
         return "episode_id_mismatch"
     events_by_failure = {
-        episode.failure_step.step_id: {event.step.step_id for event in episode.events}
+        episode.failure_step.step_id: {
+            event.step.step_id for event in episode.events
+            if event.step.sequence > episode.failure_step.sequence
+        }
         for episode in episodes
     }
     for item in judgments.episodes:
@@ -1329,6 +1462,10 @@ def _is_diagnostic(action: _Action, config: ProcessEvaluatorConfig) -> bool:
 
 
 def _is_mutation(action: _Action, config: ProcessEvaluatorConfig) -> bool:
+    from aegis_agent.quality.verification import mutation_artifacts
+
+    if mutation_artifacts(action):
+        return True
     if _matches_name(action.tool_name, config.mutation_tool_patterns):
         return True
     command = _command(action)
@@ -1459,11 +1596,17 @@ def _insufficient_grade(
 
 
 def _overall_status(grades: Sequence[ProcessGrade]) -> ProcessStatus:
+    grades = [grade for grade in grades if grade.status != "not_scored"]
     statuses = {grade.status for grade in grades}
     if "fail" in statuses:
         return "fail"
     if "warning" in statuses:
         return "warning"
+    if any(
+        grade.status == "insufficient_data"
+        for grade in grades
+    ):
+        return "insufficient_data"
     if "pass" in statuses:
         return "pass"
     return "insufficient_data"

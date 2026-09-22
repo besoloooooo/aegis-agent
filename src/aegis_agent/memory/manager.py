@@ -7,11 +7,10 @@
 #     ``Claude-Code/docs/08-memory.md``.
 #
 # Aegis differences (see the development log):
-#   * Recall injection is via a stateful ``PromptContributor`` instead of an
-#     attachment message — the derived context rebuilds the system prompt each
-#     call, so the contributor is set at the collect point and read on the next
-#     build.  Nothing in ``run_turn``'s loop body changes; the loop just adds a
-#     non-blocking collect point.
+#   * Recall collection returns one rendered block to the runtime.  The runtime
+#     inserts it as a transient user-context attachment at a fixed point in the
+#     current turn, preserving the stable system/history prompt prefix without
+#     ever creating a ``role=tool`` message.
 #   * Extraction runs on a single background worker thread, serialised by a
 #     queue (mirroring Claude's stash queue), and a ``drain()`` lets the CLI wait
 #     for in-flight work before exit.  Extraction never blocks a turn.
@@ -23,8 +22,9 @@ future — and exposes the hooks the runtime calls:
 
 * :meth:`before_turn` — *start* a background recall for the query (non-blocking).
 * :meth:`collect_recall` — a non-blocking collect point the runtime calls before
-  each model request: if the recall finished, inject it; otherwise skip (aligning
-  Claude Code's "didn't make it in time → skip" semantics).
+  each model request: if the recall finished, return one rendered transient
+  attachment; otherwise skip (aligning Claude Code's "didn't make it in time →
+  skip" semantics).
 * :meth:`after_turn` — enqueue a background extraction for after the final reply.
 * :meth:`drain` — wait for in-flight recall/extract work to finish (CLI exit).
 
@@ -48,7 +48,6 @@ from aegis_agent.memory.extractor import (
     extract_memories,
 )
 from aegis_agent.memory.paths import memory_dir
-from aegis_agent.memory.prompt import RelevantMemoriesContributor
 from aegis_agent.memory.retriever import (
     RecallResult,
     recall_memories,
@@ -100,10 +99,6 @@ class MemoryManager:
 
     Parameters
     ----------
-    contributor:
-        The :class:`RelevantMemoriesContributor` already registered on the
-        system-prompt builder; recall sets its block at the collect point, and it
-        is cleared after the turn so recall stays per-turn.
     recall_provider / extract_provider:
         The (usually cheaper) providers for the side queries.  Either may be
         ``None`` to disable that channel.
@@ -119,7 +114,6 @@ class MemoryManager:
 
     def __init__(
         self,
-        contributor: RelevantMemoriesContributor,
         *,
         recall_provider: ModelProvider | None = None,
         extract_provider: ModelProvider | None = None,
@@ -127,7 +121,6 @@ class MemoryManager:
         project: bool = False,
         on_event: Callable[[MemoryEvent], None] | None = None,
     ) -> None:
-        self._contributor = contributor
         self._recall_provider = recall_provider
         self._extract_provider = extract_provider
         self._home = home
@@ -165,13 +158,11 @@ class MemoryManager:
     def before_turn(self, session_id: str, user_query: str) -> None:
         """Start a background recall for ``user_query``; return immediately.
 
-        Clears any injected block first, then (if a recall provider is
-        configured) submits the recall to the pool and stores its future.  The
-        result is applied by :meth:`collect_recall` once it finishes — if it is
-        not done by the next model request it is skipped (Claude Code's
-        "didn't make it in time → skip").
+        If a recall provider is configured, submits the recall to the pool and
+        stores its future.  The result is consumed by :meth:`collect_recall`
+        once it finishes — if it is not done by the next model request it is
+        skipped (Claude Code's "didn't make it in time → skip").
         """
-        self._contributor.clear()
         if self._recall_provider is None:
             return
         state = self._state(session_id)
@@ -198,24 +189,25 @@ class MemoryManager:
             logger.debug("memory recall failed", exc_info=True)
             return RecallResult(failure_reason="recall_error")
 
-    def collect_recall(self, session_id: str) -> None:
-        """Non-blocking collect point: inject the recall if it has finished.
+    def collect_recall(self, session_id: str) -> str | None:
+        """Return one rendered recall attachment when the future has finished.
 
         Called before each model request.  If the pending recall is still
-        running, do nothing (skip this turn's injection).  Once done, render the
-        block, set the contributor, and record the surfaced filenames.
+        running, return ``None`` without blocking.  Once done, consume the
+        future, render the block, record the surfaced filenames, and return the
+        block exactly once.  The runtime owns placement in the derived context.
         """
         state = self._state(session_id)
         future = state.pending_recall
         if future is None:
-            return
+            return None
         if not future.done():
-            return  # still running — skip, never block the main loop
+            return None  # still running — skip, never block the main loop
         state.pending_recall = None
         try:
             result = future.result()
         except Exception:  # noqa: BLE001
-            return
+            return None
         if result is None or not result.memories:
             if result is not None and result.failure_reason:
                 self._emit(
@@ -225,8 +217,8 @@ class MemoryManager:
                         failure_reason=result.failure_reason,
                     )
                 )
-            return
-        self._contributor.set_block(render_recall_block(result.memories))
+            return None
+        block = render_recall_block(result.memories)
         for m in result.memories:
             state.already_surfaced.add(m.filename)
         self._emit(
@@ -238,6 +230,7 @@ class MemoryManager:
                 failure_reason=result.failure_reason,
             )
         )
+        return block
 
     def note_surfaced(self, session_id: str, filenames: Sequence[str]) -> None:
         """Record memories the main agent read itself so recall won't re-inject.
@@ -262,13 +255,11 @@ class MemoryManager:
     ) -> None:
         """Enqueue a background extraction; return immediately (fire-and-forget).
 
-        Always clears the per-turn recall block first (so it never leaks into
-        the next turn).  When ``extract`` is False (interrupted / errored turn)
-        it stops there — a partial turn is not mined for memory.  Otherwise the
-        turn is snapshotted onto the serial extraction queue; the worker runs it
-        asynchronously.
+        When ``extract`` is False (interrupted / errored turn), a partial turn
+        is not mined for memory.  Otherwise the turn is snapshotted onto the
+        serial extraction queue; the worker runs it asynchronously.  Recall
+        attachments are runtime-local and therefore need no cleanup here.
         """
-        self._contributor.clear()  # recall is per-turn; never leak into the next
         if self._extract_provider is None or not extract:
             return
         self._ensure_extract_worker()

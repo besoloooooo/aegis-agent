@@ -801,6 +801,7 @@ def evaluate_quality_process(
     )
 
     evaluator = ProcessEvaluator(failure_recovery_judge=judge_provider)
+    evaluator.calibration_records = store.list()
     rendered: list[dict[str, object]] = []
     failures: list[str] = []
     for current, target in zip(records, targets):
@@ -865,6 +866,19 @@ def _print_process_evaluation(item: dict[str, object]) -> None:
     typer.echo("")
     typer.echo(f"Overall Score: {score_text}")
     typer.echo(f"Process Status: {str(payload.get('status', 'unknown')).upper()}")
+    metadata = payload.get("metadata") or {}
+    evidence_status = payload.get("evidence_status") or metadata.get("evidence_status")
+    failure_phase = payload.get("failure_phase") or metadata.get("failure_phase")
+    if evidence_status:
+        typer.echo(f"Evidence: {evidence_status}")
+    if failure_phase:
+        typer.echo(f"Failure phase: {failure_phase}")
+    infrastructure_error = metadata.get("infrastructure_error")
+    if infrastructure_error:
+        typer.echo(
+            "Infrastructure error: "
+            + json.dumps(infrastructure_error, ensure_ascii=False)
+        )
     typer.echo("")
     grades = payload.get("grades")
     if not isinstance(grades, list):
@@ -873,7 +887,30 @@ def _print_process_evaluation(item: dict[str, object]) -> None:
         if not isinstance(grade, dict):
             continue
         label = str(grade.get("grader_name", "grader")).replace("_", " ").title()
-        typer.echo(f"{str(grade.get('status', 'unknown')).upper():<17} {label}")
+        grade_metadata = grade.get("metadata") or {}
+        judge = grade_metadata.get("llm_judge") or {}
+        mode = grade_metadata.get("evaluation_mode", "rules")
+        if judge.get("status") in {"fallback", "skipped"}:
+            mode = judge["status"]
+        typer.echo(f"{str(grade.get('status', 'unknown')).upper():<17} {label} [{mode}]")
+        reason = judge.get("reason") or grade.get("message")
+        if reason:
+            typer.echo(f"  {reason}")
+        if grade.get("status") == "not_scored":
+            sample_count = grade_metadata.get("baseline_sample_count", 0)
+            sample_target = grade_metadata.get("baseline_sample_target", 5)
+            typer.echo(f"  Successful baseline samples: {sample_count} / {sample_target}")
+        if judge:
+            telemetry = {
+                key: judge[key]
+                for key in (
+                    "provider", "model", "latency_ms", "usage", "prompt_version",
+                    "judge_version", "prompt_truncated",
+                )
+                if key in judge
+            }
+            if telemetry:
+                typer.echo("  Judge: " + json.dumps(telemetry, ensure_ascii=False))
     issues = [
         grade
         for grade in grades

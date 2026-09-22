@@ -538,9 +538,17 @@ def _local_summary(record: ExecutionRecord) -> dict[str, Any]:
         "source": "local",
         "task": sanitize(record.identity.task_name),
         "started_at": _iso(record.execution.started_at),
-        "success": record.execution.success,
+        "success": (
+            process.metadata.get("runtime_success", record.execution.success)
+            if process is not None else record.execution.success
+        ),
         "has_error": errors > 0,
-        "passed": record.evaluation.passed,
+        "passed": (
+            process.metadata.get("outcome_success", record.evaluation.passed)
+            if process is not None else record.evaluation.passed
+        ),
+        "evidence_status": process.metadata.get("evidence_status") if process else None,
+        "failure_phase": process.metadata.get("failure_phase") if process else None,
         "process_score": process.overall_score if process is not None else None,
         "process_status": process.status if process is not None else None,
         "process_issue_count": (
@@ -766,8 +774,6 @@ def _cloud_summary(
     run_kind = _cloud_run_kind(metadata)
     trace_stats = dict(stats or {})
     success = _cloud_success(observation)
-    if int(trace_stats.get("errors") or 0) > 0:
-        success = False
     return {
         # Reused external execution ids can create multiple root observations
         # in one trace.  Keep each root addressable instead of dropping all but

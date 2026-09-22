@@ -19,6 +19,7 @@ from aegis_agent.quality.store import ExecutionRecordStore
 
 RUNTIME_RECORD_NAME = "execution-record.runtime.json"
 FINAL_RECORD_NAME = "execution-record.json"
+HARBOR_IMPORT_VERSION = "2"
 
 
 def finalize_harbor_trial(
@@ -76,6 +77,7 @@ def finalize_harbor_trial(
     record.metadata["harbor_trial_name"] = raw.get("trial_name")
     record.metadata["harbor_trial_uri"] = raw.get("trial_uri")
     record.metadata["harbor_source"] = raw.get("source")
+    record.metadata["harbor_import_version"] = HARBOR_IMPORT_VERSION
 
     agent_info = raw.get("agent_info") or {}
     model_info = agent_info.get("model_info") or {}
@@ -93,12 +95,27 @@ def finalize_harbor_trial(
     started_at = record.execution.started_at or harbor_started_at
     finished_at = record.execution.finished_at or harbor_finished_at
     exception = raw.get("exception_info") or {}
-    if exception:
+    failure_phase = (
+        _failure_phase(raw, record) if exception
+        else "agent" if record.execution.success is False else None
+    )
+    if exception and failure_phase != "verifier":
         record.execution.success = False
         record.execution.error = _string_or_none(exception.get("exception_message"))
         record.execution.exception_type = _string_or_none(
             exception.get("exception_type")
         )
+    record.metadata["failure_phase"] = failure_phase
+    record.metadata["runtime_success"] = record.execution.success
+    record.metadata["evidence_status"] = (
+        "missing" if not runtime_path.is_file() or not (
+            record.steps or record.execution.final_output
+        ) else "complete" if record.execution.success is True
+        and failure_phase not in {"setup", "agent"} else "partial"
+    )
+    record.metadata["infrastructure_error"] = (
+        {"phase": failure_phase, **exception} if exception else None
+    )
     record.execution.started_at = started_at
     record.execution.finished_at = finished_at
     if started_at is not None and finished_at is not None:
@@ -130,9 +147,10 @@ def finalize_harbor_trial(
     record.evaluation = EvaluationSummary(
         verifier_result=verifier if isinstance(verifier, dict) else None,
         rewards=rewards if isinstance(rewards, dict) else None,
-        passed=_conventional_pass(rewards),
+        passed=None if exception else _conventional_pass(rewards),
         metrics=record.evaluation.metrics,
     )
+    record.metadata["outcome_success"] = record.evaluation.passed
     record.artifacts = _artifacts(trial_dir, record.artifacts)
 
     local_store.save(record, final_path)
@@ -235,7 +253,29 @@ def _current_harbor_record(path: Path, trial_id: str, source_mtime: int) -> bool
         record = ExecutionRecord.model_validate_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return record.identity.execution_id == trial_id and record.run_kind == "evaluation"
+    return (
+        record.identity.execution_id == trial_id
+        and record.run_kind == "evaluation"
+        and record.metadata.get("harbor_import_version") == HARBOR_IMPORT_VERSION
+    )
+
+
+def _failure_phase(raw: dict[str, Any], record: ExecutionRecord) -> str:
+    """Use Harbor phase timings, with conservative legacy-record fallbacks."""
+    sources = [raw, *(raw.get("step_results") or [])]
+    for source in reversed(sources):
+        if not isinstance(source, dict):
+            continue
+        for phase, field in (("verifier", "verifier"), ("agent", "agent_execution")):
+            timing = source.get(field)
+            if isinstance(timing, dict) and timing.get("started_at"):
+                return phase
+    exception_type = str((raw.get("exception_info") or {}).get("exception_type", ""))
+    if any(word in exception_type.lower() for word in ("verifier", "reward")):
+        return "verifier"
+    if record.steps or record.execution.success is not None or raw.get("agent_result"):
+        return "agent"
+    return "setup"
 
 
 def _record_sync_error(

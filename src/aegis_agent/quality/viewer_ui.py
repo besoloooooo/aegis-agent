@@ -73,6 +73,7 @@ VIEWER_HTML = r"""<!doctype html>
     .refresh:hover { border-color: #40534d; }
     .refresh.sync { color: var(--amber); border-color: rgba(245, 197, 107, .3); }
     .refresh:disabled { opacity: .45; cursor: not-allowed; }
+    .refresh-icon { display: inline-block; margin-right: 4px; }
     .summary { padding: 10px 24px 12px; border-bottom: 1px solid var(--line-soft); }
     .summary-title { margin-bottom: 7px; color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .14em; }
     .summary-grid { display: grid; grid-template-columns: repeat(6, minmax(125px, 1fr)); gap: 9px; }
@@ -204,7 +205,7 @@ VIEWER_HTML = r"""<!doctype html>
     details summary { padding: 12px 0; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
     .error-banner { margin: 10px 12px; padding: 10px 12px; border: 1px solid rgba(245, 197, 107, .28); border-radius: 9px; color: var(--amber); background: rgba(245, 197, 107, .07); font-size: 11px; }
     .notice-banner { margin: 10px 12px; padding: 10px 12px; border: 1px solid rgba(101, 230, 173, .28); border-radius: 9px; color: var(--accent); background: rgba(101, 230, 173, .07); font-size: 11px; }
-    .spin { animation: spin .85s linear infinite; }
+    .refresh-icon.spin { animation: spin .85s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (max-width: 1200px) {
       .workspace { grid-template-columns: 300px minmax(370px, 1fr) 330px; }
@@ -227,7 +228,7 @@ VIEWER_HTML = r"""<!doctype html>
     <div class="actions">
       <input id="search" class="search" type="search" placeholder="Filter session, task, model, execution id…">
       <button id="sync-harbor" class="refresh sync" type="button" disabled>⇄ Sync Harbor</button>
-      <button id="refresh" class="refresh" type="button">↻ Refresh</button>
+      <button id="refresh" class="refresh" type="button"><span id="refresh-icon" class="refresh-icon" aria-hidden="true">↻</span> Refresh</button>
     </div>
   </header>
   <section class="summary">
@@ -260,7 +261,7 @@ VIEWER_HTML = r"""<!doctype html>
   </main>
 </div>
 <script>
-  const state = { executions: [], filtered: [], view: "conversation", selected: null, selectedSession: null, detail: null, node: null, errorRollups: new WeakSet(), expandedSessions: new Set(), initializedViews: new Set(), syncToken: null, harborJobsDir: null, harborJobsExists: false };
+  const state = { executions: [], filtered: [], view: "conversation", selected: null, selectedSession: null, detail: null, node: null, expandedSessions: new Set(), initializedViews: new Set(), syncToken: null, harborJobsDir: null, harborJobsExists: false };
   const $ = (id) => document.getElementById(id);
   const text = (value, fallback = "—") => value === null || value === undefined || value === "" ? fallback : String(value);
   const optionalNumber = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
@@ -376,7 +377,7 @@ VIEWER_HTML = r"""<!doctype html>
   const aggregateExecutions = (items) => {
     const usages = items.map(usageOf);
     const stats = items.map(statsOf);
-    const errorValues = stats.map((item, index) => item.errors ?? (items[index].has_error || items[index].success === false ? 1 : null));
+    const errorValues = stats.map((item, index) => item.errors ?? (items[index].has_error || runFailed(items[index]) ? 1 : null));
     const input = sumState(usages.map((item) => item.input));
     const cacheRead = sumState(usages.map((item) => item.cacheRead));
     const cacheWrite = sumState(usages.map((item) => item.cacheWrite));
@@ -386,7 +387,7 @@ VIEWER_HTML = r"""<!doctype html>
       : cacheHitRate({cacheRead: cacheRead.value, inputIncludingCache: cacheInput.value, total: null, output: null, input: null, cacheWrite: null});
     return {
       turns: items.length,
-      failedRuns: items.filter((item) => item.has_error || optionalNumber(item.stats?.errors) > 0 || item.success === false).length,
+      failedRuns: items.filter(runFailed).length,
       duration: sumState(items.map((item) => item.latency_ms)),
       modelCalls: sumState(stats.map((item) => item.modelCalls)),
       toolCalls: sumState(stats.map((item) => item.toolCalls)),
@@ -415,14 +416,15 @@ VIEWER_HTML = r"""<!doctype html>
     }
     return merged;
   };
+  const runFailed = (item) => item.success === false;
   const statusOf = (items) => {
-    if (items.some((item) => item.has_error || optionalNumber(item.stats?.errors) > 0 || item.success === false)) return {label: "ERROR", className: "bad"};
+    if (items.some(runFailed)) return {label: "ERROR", className: "bad"};
     if (items.some((item) => item.passed === false)) return {label: "FAIL", className: "warn"};
     if (items.length && items.every((item) => item.success === true)) return {label: "OK", className: "ok"};
     return {label: "UNKNOWN", className: ""};
   };
   const evaluationStatusOf = (items) => {
-    if (items.some((item) => item.has_error || optionalNumber(item.stats?.errors) > 0 || item.success === false)) return {label: "ERROR", className: "bad"};
+    if (items.some(runFailed)) return {label: "ERROR", className: "bad"};
     if (items.length && items.every((item) => item.passed === true)) return {label: "PASS", className: "ok"};
     if (items.some((item) => item.passed === false)) return {label: "FAIL", className: "warn"};
     return {label: "UNSCORED", className: ""};
@@ -480,7 +482,7 @@ VIEWER_HTML = r"""<!doctype html>
   }
 
   async function loadExecutions(keepSelection = true) {
-    $("refresh").classList.add("spin");
+    $("refresh-icon").classList.add("spin");
     try {
       const payload = await fetchJSON("/api/executions");
       state.executions = payload.executions || [];
@@ -507,7 +509,7 @@ VIEWER_HTML = r"""<!doctype html>
     } catch (error) {
       errorBanner($("list-error"), error.message);
     } finally {
-      $("refresh").classList.remove("spin");
+      $("refresh-icon").classList.remove("spin");
     }
   }
 
@@ -784,7 +786,6 @@ VIEWER_HTML = r"""<!doctype html>
     const langfuse = state.detail?.langfuse || {};
     $("trace-id").textContent = langfuse.trace_id ? `…${langfuse.trace_id.slice(-10)}` : "";
     errorBanner($("trace-error"), langfuse.error ? `Langfuse: ${langfuse.error}` : null);
-    state.errorRollups = new WeakSet();
     let rendered = false;
     if (state.selectedSession) {
       const sessionItems = state.executions.filter((item) => groupKey(item) === state.selectedSession);
@@ -958,10 +959,6 @@ VIEWER_HTML = r"""<!doctype html>
     return {label: "OK", className: "ok"};
   }
 
-  const rolledNodeStatus = (item, source) => state.errorRollups.has(item)
-    ? {label: "ERROR", className: "bad"}
-    : nodeStatus(item, source);
-
   function latencyOf(item, source) {
     if (source === "local") return optionalNumber(item.latency_ms);
     const seconds = optionalNumber(item.latency);
@@ -996,22 +993,11 @@ VIEWER_HTML = r"""<!doctype html>
     const parentOf = (item) => source === "local" ? item.parent_step_id : item.parentObservationId;
     const byParent = new Map();
     const known = new Set(items.map(idOf));
-    const byId = new Map(items.map((item) => [idOf(item), item]));
     for (const item of items) {
       const rawParent = parentOf(item);
       const parent = rawParent && known.has(rawParent) ? rawParent : null;
       if (!byParent.has(parent)) byParent.set(parent, []);
       byParent.get(parent).push(item);
-    }
-    for (const item of items) {
-      if (nodeStatus(item, source).className !== "bad") continue;
-      let parent = parentOf(item);
-      const visited = new Set();
-      while (parent && byId.has(parent) && !visited.has(parent)) {
-        visited.add(parent);
-        state.errorRollups.add(byId.get(parent));
-        parent = parentOf(byId.get(parent));
-      }
     }
     for (const children of byParent.values()) {
       children.sort((a, b) => text(a.sequence ?? a.startTime, "").localeCompare(text(b.sequence ?? b.startTime, ""), undefined, { numeric: true }));
@@ -1031,7 +1017,7 @@ VIEWER_HTML = r"""<!doctype html>
         const id = idOf(item);
         if (seen.has(id)) continue;
         seen.add(id);
-        const status = rolledNodeStatus(item, source);
+        const status = nodeStatus(item, source);
         const node = element("button", `node${depth === 0 ? " root" : ""}${status.className === "bad" ? " error" : ""}`);
         node.type = "button";
         if (source === "local" && id) node.dataset.stepId = id;
@@ -1126,8 +1112,28 @@ VIEWER_HTML = r"""<!doctype html>
     head.append(stateNode);
     box.append(head);
     box.append(element("div", "node-sub", text(evaluation.summary)));
+    const provenance = evaluation.metadata || {};
+    appendField(box, "Evidence", provenance.evidence_status);
+    appendField(box, "Evidence reason", provenance.evidence_reason);
+    appendField(box, "Failure phase", provenance.failure_phase);
+    appendBlock(box, "Infrastructure error", provenance.infrastructure_error);
     const grades = Array.isArray(evaluation.grades) ? evaluation.grades : [];
-    const issues = grades.filter((grade) => grade.status !== "pass");
+    for (const grade of grades) {
+      const metadata = grade.metadata || {};
+      const judge = metadata.llm_judge || {};
+      const mode = judge.status === "fallback" ? "fallback" : metadata.evaluation_mode || "rules";
+      appendField(box, text(grade.grader_name).replaceAll("_", " "), `${mode} · ${text(judge.reason || metadata.reason || grade.message)}`);
+      if (grade.status === "not_scored") {
+        appendField(box, "Baseline samples", `${text(metadata.baseline_sample_count ?? 0)} / ${text(metadata.baseline_sample_target ?? 5)}`);
+      }
+      if (judge.status) {
+        const fold = element("details", "");
+        fold.append(element("summary", "", "Judge evidence and telemetry"));
+        fold.append(element("pre", "", formatted(judge)));
+        box.append(fold);
+      }
+    }
+    const issues = grades.filter((grade) => !["pass", "not_scored"].includes(grade.status));
     for (const grade of issues) {
       const issue = element("button", "process-issue");
       issue.type = "button";
@@ -1173,7 +1179,7 @@ VIEWER_HTML = r"""<!doctype html>
     target.append(chips);
 
     if (kind === "model") {
-      const status = rolledNodeStatus(item, sourceKind);
+      const status = nodeStatus(item, sourceKind);
       appendField(target, "Model", modelOf(item));
       appendField(target, "Provider", providerOf(item));
       appendField(target, "Status", status.label);
@@ -1189,7 +1195,7 @@ VIEWER_HTML = r"""<!doctype html>
     }
 
     if (kind === "tool") {
-      const status = rolledNodeStatus(item, sourceKind);
+      const status = nodeStatus(item, sourceKind);
       const query = coreValue(item.input, ["query"]);
       const command = coreValue(item.input, ["command", "cmd"]);
       appendField(target, "Tool", toolNameOf(item));
@@ -1232,8 +1238,11 @@ VIEWER_HTML = r"""<!doctype html>
       appendField(target, "Outcome", summary
         ? (runKind(summary) === "evaluation" ? evaluationStatusOf([summary]) : statusOf([summary])).label
         : item.execution?.success === true ? "OK" : item.execution?.success === false ? "ERROR" : "UNKNOWN");
-      appendField(target, "Runtime Result", item.execution?.success === true ? "SUCCESS" : item.execution?.success === false ? "FAILED" : "UNKNOWN");
-      appendField(target, "Harbor Verifier", item.evaluation?.passed === true ? "PASS" : item.evaluation?.passed === false ? "FAIL" : null);
+      const processMetadata = item.quality?.process_evaluation?.metadata || {};
+      const runtimeSuccess = Object.hasOwn(processMetadata, "runtime_success") ? processMetadata.runtime_success : item.execution?.success;
+      const outcomeSuccess = Object.hasOwn(processMetadata, "outcome_success") ? processMetadata.outcome_success : item.evaluation?.passed;
+      appendField(target, "Runtime Result", runtimeSuccess === true ? "SUCCESS" : runtimeSuccess === false ? "FAILED" : "UNKNOWN");
+      appendField(target, "Harbor Verifier", outcomeSuccess === true ? "PASS" : outcomeSuccess === false ? "FAIL" : "UNKNOWN");
       appendField(target, "Reward", primaryReward(item.evaluation));
       appendField(target, "Duration", elapsed(item.execution?.latency_ms));
       appendProcessEvaluation(target, item.quality?.process_evaluation);
@@ -1245,7 +1254,7 @@ VIEWER_HTML = r"""<!doctype html>
       return;
     }
 
-    const status = rolledNodeStatus(item, sourceKind);
+    const status = nodeStatus(item, sourceKind);
     appendField(target, "Status", status.label);
     appendField(target, "Latency", elapsed(latencyOf(item, sourceKind)));
     appendField(target, "Finish Reason", finishReasonOf(item));

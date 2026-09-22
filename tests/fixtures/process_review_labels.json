@@ -1,0 +1,13 @@
+{
+  "review_date": "2026-09-18",
+  "provenance": "Human review in process-evaluator-review-20260918; labels describe process evidence, never Harbor reward. Raw local traces are not redistributed.",
+  "cases": [
+    {"execution_id": "302189be-9aea-4325-9aba-ec77afd1c89b", "labels": {"final_verification": "pass"}, "reason": "cancel-async-tasks: custom python3 test_run.py performed verification."},
+    {"execution_id": "64d31502-a1d6-456e-b9f1-5e7b87f0d853", "labels": {"final_verification": "unknown", "failure_recovery": "unknown"}, "reason": "chess-best-move: setup failed without Agent evidence."},
+    {"execution_id": "e365b0fb-e5e5-443b-9814-107c112a1bfa", "labels": {"final_verification": "unknown", "failure_recovery": "unknown"}, "reason": "regex-log: model connection failure terminated runtime without an Agent recovery opportunity."},
+    {"execution_id": "d2ebf469-f9e4-44f1-92d3-bbeab70bef25", "labels": {"final_verification": "pass"}, "reason": "regex-log: custom self-tests passed; separate Verifier download timed out."},
+    {"execution_id": "bbc25635-6d91-4f6a-b035-467a5c7cffad", "labels": {"final_verification": "partial"}, "reason": "log-summary-date-ranges: inline Python writes and reads summary.csv; readback is evidence but does not establish all acceptance criteria."},
+    {"execution_id": "acd1dc0e-cdce-410f-848b-5edef2e1c37d", "labels": {"final_verification": "pass"}, "reason": "regex-log: Python heredoc compares inputs with expected results and output confirms pass."},
+    {"execution_id": "d23d64b7-159f-4a73-ada3-01e37384a8a7", "labels": {"final_verification": "partial", "failure_recovery": "pass"}, "reason": "polyglot: numerical self-tests and SyntaxError recovery occurred; directory contents were not validated. Reward=0 does not prove numerical failure."}
+  ]
+}

@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 
 from aegis_agent.memory.manager import MemoryManager
-from aegis_agent.memory.prompt import RelevantMemoriesContributor
 from aegis_agent.memory.retriever import (
     MAX_RECALL_FILES,
     recall_memories,
@@ -45,6 +44,36 @@ def _write_memory(home, filename, name, description, mtype, body="body"):
 def _json_provider(files: list[str]) -> FakeModelProvider:
     """A fake provider that returns a JSON side-query response selecting files."""
     return FakeModelProvider(script=[FakeReply(text=json.dumps({"files": files}))])
+
+
+class _CapturingProvider(FakeModelProvider):
+    """Scripted main provider that retains every derived request."""
+
+    def __init__(self, script):
+        super().__init__(script=script)
+        self.requests = []
+
+    def stream(self, messages, tools=None):
+        self.requests.append(list(messages))
+        yield from super().stream(messages, tools)
+
+
+class _StagedRecallManager:
+    """Expose a recall block only at the second non-blocking collect point."""
+
+    def __init__(self, block: str) -> None:
+        self._block = block
+        self._collects = 0
+
+    def before_turn(self, session_id: str, user_query: str) -> None:
+        pass
+
+    def collect_recall(self, session_id: str) -> str | None:
+        self._collects += 1
+        return self._block if self._collects == 2 else None
+
+    def after_turn(self, session_id, messages, *, tool_calls=(), extract=True) -> None:
+        pass
 
 
 class TestScan:
@@ -137,7 +166,7 @@ class TestRecall:
 
 
 class TestRecallIntegration:
-    def test_recalled_memory_injected_into_context(self, tmp_path, repository):
+    def test_collect_returns_transient_block_not_system_prompt(self, tmp_path, repository):
         _write_memory(tmp_path, "a.md", "A", "prefers uv", "feedback", "use uv always")
         runtime = AgentRuntime.with_defaults(
             repository=repository,
@@ -151,10 +180,12 @@ class TestRecallIntegration:
         # Recall is now async: wait for the background future, then hit the
         # collect point (as run_turn does before each model request).
         manager.drain()
-        manager.collect_recall("s1")
-        prompt = runtime._context.system_prompt
-        assert "Relevant memories" in prompt
-        assert "use uv always" in prompt
+        block = manager.collect_recall("s1")
+        assert block is not None
+        assert "Relevant memories" in block
+        assert "use uv always" in block
+        assert "Relevant memories" not in runtime._context.system_prompt
+        assert manager.collect_recall("s1") is None
 
     def test_original_history_not_modified(self, tmp_path, repository):
         _write_memory(tmp_path, "a.md", "A", "prefers uv", "feedback", "use uv always")
@@ -170,6 +201,39 @@ class TestRecallIntegration:
         # Only user + assistant (no injected memory message in history).
         assert [m.role for m in msgs] == [Role.USER, Role.ASSISTANT]
         assert all("use uv always" not in m.content for m in msgs)
+
+    def test_transient_attachment_keeps_fixed_tool_loop_position(self, tmp_path, repository):
+        main = _CapturingProvider(
+            [
+                FakeReply.tool("list_directory", {"path": str(tmp_path)}, call_id="c1"),
+                FakeReply.tool("list_directory", {"path": str(tmp_path)}, call_id="c2"),
+                FakeReply(text="done"),
+            ]
+        )
+        runtime = AgentRuntime.with_defaults(
+            provider=main,
+            repository=repository,
+            enable_skills=False,
+            enable_mcp=False,
+            enable_memory=False,
+        )
+        block = "## Relevant memories\n\n<memory>use uv always</memory>"
+        runtime._memory_manager = _StagedRecallManager(block)
+
+        result = runtime.run_turn("s1", "inspect")
+
+        assert result.final_text == "done"
+        assert len(main.requests) == 3
+        second_contents = [m.content for m in main.requests[1]]
+        third_contents = [m.content for m in main.requests[2]]
+        second_index = second_contents.index(block)
+        third_index = third_contents.index(block)
+        assert second_index == third_index
+        assert second_contents[: second_index + 1] == third_contents[: third_index + 1]
+        assert third_contents.count(block) == 1
+        assert main.requests[2][third_index].role is Role.USER
+        assert any(m.role is Role.ASSISTANT for m in main.requests[2][third_index + 1 :])
+        assert all(block not in m.content for m in repository.list_messages("s1"))
 
     def test_already_surfaced_not_reinjected(self, tmp_path):
         _write_memory(tmp_path, "a.md", "A", "a", "user", "body A")
@@ -192,9 +256,7 @@ class TestManagerMutexAndEvents:
         from aegis_agent.memory.paths import memory_dir
 
         events = []
-        contributor = RelevantMemoriesContributor()
         manager = MemoryManager(
-            contributor,
             recall_provider=None,
             extract_provider=_json_provider([]),
             home=str(tmp_path),

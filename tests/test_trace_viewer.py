@@ -22,6 +22,7 @@ from aegis_agent.quality.store import ExecutionRecordStore
 from aegis_agent.quality.viewer import (
     LangfuseReader,
     TraceViewerService,
+    _cloud_summary,
     _stats_by_root,
     _stats_by_trace,
     _summarize_executions,
@@ -276,6 +277,24 @@ def test_service_classifies_legacy_harbor_record_without_run_kind(tmp_path):
     assert listing["executions"][0]["run_kind"] == "evaluation"
 
 
+def test_viewer_keeps_legacy_verifier_interruption_separate_from_runtime(tmp_path):
+    store = ExecutionRecordStore(tmp_path)
+    record = _evaluation_record()
+    record.execution.success = False
+    record.execution.stop_reason = "final_answer"
+    record.execution.exception_type = "VerifierTimeoutError"
+    record.evaluation.passed = False
+    ProcessEvaluator().evaluate(record)
+    store.save(record)
+
+    summary = TraceViewerService(store, _FakeLangfuse()).list_executions()["executions"][0]
+
+    assert summary["success"] is True
+    assert summary["passed"] is None
+    assert summary["failure_phase"] == "verifier"
+    assert record.execution.success is False  # Original evidence is unchanged.
+
+
 def test_cloud_run_kind_prefers_metadata_and_defaults_to_conversation(tmp_path):
     conversation = _observation("conversation")
     task = _observation("task")
@@ -470,6 +489,10 @@ def test_http_viewer_is_read_only_and_serves_record_detail(tmp_path):
             assert "Sessions / Turns" in html
             assert "Model / Tool Calls" in html
             assert "Failed Runs / Error Obs" in html
+            assert 'const runFailed = (item) => item.success === false' in html
+            assert 'id="refresh-icon"' in html
+            assert '$("refresh-icon").classList.add("spin")' in html
+            assert "errorRollups" not in html
             assert "matchedLocalTraces" in html
             assert "matchingSummaries.length === 1" in html
             assert "expandedSessions" in html
@@ -683,7 +706,7 @@ def test_global_session_and_turn_summaries_preserve_zero_and_unknown():
     )
 
 
-def test_local_observation_error_rolls_up_to_turn_and_session(tmp_path):
+def test_recovered_local_observation_error_does_not_fail_run(tmp_path):
     record = _record()
     record.steps.append(
         ExecutionStep(
@@ -708,6 +731,19 @@ def test_local_observation_error_rolls_up_to_turn_and_session(tmp_path):
     assert turn["stats"]["errors"] == 1
     assert listing["summary"]["errors"] == 1
     assert listing["sessions"][0]["errors"] == 1
+
+
+def test_recovered_cloud_observation_error_does_not_fail_root():
+    root = _observation("root", stop_reason="final_answer")
+
+    summary = _cloud_summary(
+        root,
+        stats={"model_calls": 1, "tool_calls": 1, "errors": 1, "usage": {}},
+    )
+
+    assert summary["success"] is True
+    assert summary["has_error"] is True
+    assert summary["stats"]["errors"] == 1
 
 
 def test_model_usage_cost_cache_and_error_keep_zero_distinct_from_unknown():

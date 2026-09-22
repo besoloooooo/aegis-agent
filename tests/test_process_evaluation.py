@@ -16,7 +16,7 @@ from aegis_agent.quality.models import (
     ExecutionSummary,
     UsageSummary,
 )
-from aegis_agent.quality.process import ProcessEvaluator
+from aegis_agent.quality.process import ProcessEvaluator, ProcessEvaluatorConfig
 from aegis_agent.quality.store import ExecutionRecordStore
 
 NOW = datetime(2026, 9, 8, tzinfo=UTC)
@@ -235,7 +235,7 @@ def test_case_failed_recovery():
     assert grades["failure_recovery"].metadata["recovered_count"] == 0
 
 
-def test_model_failure_can_recover_on_a_later_model_call():
+def test_model_retry_is_runtime_owned_and_not_agent_recovery():
     record = _record(
         _non_tool(1, "model", success=False, error="temporary provider error"),
         _non_tool(2, "model", success=True),
@@ -245,8 +245,11 @@ def test_model_failure_can_recover_on_a_later_model_call():
     _, grades = _grades(record)
 
     recovery = grades["failure_recovery"]
-    assert recovery.status == "pass"
-    assert recovery.metadata["assessments"][0]["adjustments"] == ["retried_model_call"]
+    assert recovery.status == "insufficient_data"
+    episode = recovery.metadata["episodes"][0]
+    assert episode["retry_owner"] == "runtime"
+    assert episode["rule_recovered"] is True
+    assert episode["recovery_opportunity"] is False
 
 
 def test_llm_judge_refines_only_failure_recovery_with_one_call():
@@ -284,7 +287,10 @@ def test_llm_judge_refines_only_failure_recovery_with_one_call():
         ]
     )
 
-    result = ProcessEvaluator(failure_recovery_judge=provider).evaluate(record)
+    result = ProcessEvaluator(
+        failure_recovery_judge=provider,
+        config=ProcessEvaluatorConfig(final_verification_llm_enabled=False),
+    ).evaluate(record)
     grades = {grade.grader_name: grade for grade in result.grades}
 
     recovery = grades["failure_recovery"]
@@ -317,7 +323,7 @@ def test_llm_judge_is_not_called_without_failure_or_when_disabled():
     recovery = next(
         grade for grade in result.grades if grade.grader_name == "failure_recovery"
     )
-    assert recovery.metadata["evaluation_mode"] == "rules"
+    assert recovery.metadata["evaluation_mode"] == "skipped"
 
 
 def test_llm_judge_invalid_response_safely_preserves_rule_result():
@@ -351,6 +357,7 @@ def test_llm_judge_invalid_response_safely_preserves_rule_result():
 def test_llm_judge_provider_failure_safely_preserves_rule_result():
     record = _record(
         _step(1, "terminal", {"command": "pytest"}, success=False, error="failed"),
+        _non_tool(2, "model"),
         success=False,
     )
     rule_result = ProcessEvaluator().evaluate(record)
@@ -457,8 +464,11 @@ def test_case_missing_final_verification():
 
     _, grades = _grades(record)
 
-    assert grades["final_verification"].status == "fail"
-    assert "Missing final verification" in grades["final_verification"].message
+    verification = grades["final_verification"]
+    assert verification.status == "insufficient_data"
+    assert verification.score is None
+    assert "does not establish final verification" in verification.message
+    assert verification.metadata["coverage"] == "unknown"
 
 
 def test_case_good_final_verification():
@@ -484,7 +494,7 @@ def test_failed_final_verification_is_distinct_from_missing_verification():
 
     verification = grades["final_verification"]
     assert verification.status == "fail"
-    assert "did not succeed" in verification.message
+    assert "reported failure" in verification.message
     assert verification.metadata["failed_verification_steps"] == ["step-2"]
 
 
@@ -527,6 +537,7 @@ def test_case_simple_loop():
     loop = grades["loop_detection"]
     assert loop.status == "fail"
     assert loop.metadata == {
+        "evaluation_mode": "rules",
         "loop_detected": True,
         "loop_start_step": "step-1",
         "loop_start_sequence": 1,
@@ -578,9 +589,9 @@ def test_case_low_efficiency():
     _, grades = _grades(record)
 
     efficiency = grades["execution_efficiency"]
-    assert efficiency.status == "warning"
+    assert efficiency.status == "not_scored"
     assert efficiency.metadata["metrics"]["failed_tool_call_count"] == 2
-    assert any("50%" in evidence for evidence in efficiency.evidence)
+    assert efficiency.metadata["calibration_status"] == "uncalibrated"
 
 
 def test_efficiency_uses_configured_baseline_but_has_no_default_step_limit():
@@ -601,7 +612,8 @@ def test_efficiency_uses_configured_baseline_but_has_no_default_step_limit():
     _, normal = _grades(without_baseline)
     _, compared = _grades(with_baseline)
 
-    assert normal["execution_efficiency"].status == "pass"
+    assert normal["execution_efficiency"].status == "not_scored"
+    assert normal["execution_efficiency"].score is None
     assert compared["execution_efficiency"].status == "warning"
 
 
@@ -619,7 +631,14 @@ def test_case_clean_success():
 
     assert result.status == "pass"
     assert result.overall_score == 1.0
-    assert all(grade.status == "pass" for grade in grades.values())
+    assert all(
+        grade.status == "pass"
+        for name, grade in grades.items()
+        if name != "execution_efficiency"
+    )
+    assert (
+        grades["execution_efficiency"].metadata["calibration_status"] == "uncalibrated"
+    )
 
 
 def test_missing_mutation_success_is_insufficient_data():
@@ -647,7 +666,12 @@ def test_old_execution_record_and_pure_chat_remain_compatible():
     result, grades = _grades(record)
 
     assert record.quality.process_evaluation == result
-    assert grades["final_verification"].status == "pass"
+    assert grades["final_verification"].status == "insufficient_data"
+    assert result.status == "insufficient_data"
+    assert result.overall_score is None
+    record.execution.final_output = "Complete answer"
+    result, _ = _grades(record)
+    assert result.metadata["evidence_status"] == "complete"
     assert result.status == "pass"
 
 
@@ -686,8 +710,9 @@ def test_runtime_failure_is_not_confused_with_harbor_outcome():
     runtime_result, runtime_grades = _grades(runtime_failed)
     harbor_result, harbor_grades = _grades(harbor_failed)
 
-    assert runtime_grades["failure_recovery"].status == "fail"
-    assert runtime_result.metadata["outcome_success"] is False
+    assert runtime_grades["failure_recovery"].status == "insufficient_data"
+    assert runtime_result.metadata["runtime_success"] is False
+    assert runtime_result.metadata["outcome_success"] is None
     assert harbor_grades["failure_recovery"].status == "pass"
     assert harbor_result.metadata["harbor_passed"] is False
     assert harbor_result.status == "pass"
@@ -704,9 +729,11 @@ def test_evaluation_is_repeatable_and_saves_grader_versions():
         grade.model_dump() for grade in second.grades
     ]
     versions = {grade.grader_name: grade.grader_version for grade in second.grades}
-    assert versions["failure_recovery"] == "1.1.0"
+    assert versions["failure_recovery"] == "1.2.0"
     assert {
-        version for name, version in versions.items() if name != "failure_recovery"
+        version
+        for name, version in versions.items()
+        if name not in {"failure_recovery", "final_verification"}
     } == {"1.0.0"}
     assert record.quality.process_evaluation == second
 
@@ -847,7 +874,7 @@ def test_quality_evaluate_cli_missing_judge_model_falls_back_to_rules(
     recovery = next(
         grade for grade in saved.grades if grade.grader_name == "failure_recovery"
     )
-    assert recovery.metadata["evaluation_mode"] == "rules"
+    assert recovery.metadata["evaluation_mode"] == "skipped"
 
 
 def test_quality_evaluate_cli_rejects_ambiguous_selection(tmp_path):

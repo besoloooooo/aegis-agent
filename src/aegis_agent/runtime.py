@@ -42,7 +42,6 @@ from aegis_agent.memory.manager import MemoryEvent, MemoryManager
 from aegis_agent.memory.paths import MemoryScope, memory_dir, resolve_scope
 from aegis_agent.memory.prompt import (
     MemoryBehaviorContributor,
-    RelevantMemoriesContributor,
     UserProfileContributor,
     default_memory_index_contributor,
 )
@@ -77,6 +76,25 @@ DEFAULT_MAX_ITERATIONS = 50
 #: distinct name so the two are distinguishable in logs / events without any
 #: change to the engine itself.
 MAIN_AGENT_NAME = "main"
+
+
+def _insert_transient_context(
+    source: list[Message],
+    attachment: Message | None,
+    anchor: int | None,
+) -> list[Message]:
+    """Insert one runtime-only message at its fixed source-history boundary.
+
+    ``anchor`` is the number of persisted messages that existed when the
+    attachment became available.  Keeping that boundary stable preserves both
+    chronological causality and the prompt-cache prefix across later tool
+    iterations.  The returned list is derived; neither ``source`` nor the
+    repository is mutated.
+    """
+    if attachment is None or anchor is None:
+        return source
+    boundary = min(max(anchor, 0), len(source))
+    return [*source[:boundary], attachment, *source[boundary:]]
 
 
 @dataclass(frozen=True)
@@ -270,8 +288,9 @@ class AgentRuntime:
         self._startup_info = startup_info or {}
         # Personal long-term memory (Stage 2/3): recall before the turn, extract
         # after the final reply.  ``None`` disables both channels (Stage-1
-        # behaviour).  The manager only shapes the derived context and writes to
-        # the memory dir — it never mutates session history.
+        # behaviour).  The manager returns a transient recall attachment for the
+        # runtime's derived view and writes extraction results to the memory dir;
+        # it never mutates session history.
         self._memory_manager = memory_manager
         # Subagent task manager (``None`` when subagents are disabled).  Typed as
         # ``object`` at the constructor to keep the runtime free of an agents
@@ -498,11 +517,12 @@ class AgentRuntime:
             registry.register(SendMessageTool(team_manager, team_id=None, sender=LEAD_NAME))
 
         # ---- Long-term memory (personal or project scope) ----------------
-        # Stage-1 sections (behaviour rules, USER.md profile, MEMORY.md index) +
-        # the Stage-2/3 relevant-memories slot.  Each renders on every build so
-        # file edits show up next turn; missing files render nothing (memory
-        # never blocks startup).  When recall/extract are enabled a
-        # MemoryManager is built to drive the side-query channels.
+        # Stage-1 sections (behaviour rules, USER.md profile, MEMORY.md index).
+        # Each renders on every build so file edits show up next turn; missing
+        # files render nothing (memory never blocks startup).  Stage-2 recall is
+        # deliberately NOT a system-prompt contributor: the runtime inserts the
+        # result as transient tail context so the stable prompt prefix remains
+        # cacheable.  MemoryManager drives the recall/extraction side channels.
         #
         # ``USER.md`` is ALWAYS the global profile; only the memory index +
         # bodies switch to the project dir when a project scope is resolved.
@@ -524,8 +544,6 @@ class AgentRuntime:
             index_contrib = default_memory_index_contributor(scope.memory_home)
             prompt_builder.add(profile_contrib)
             prompt_builder.add(index_contrib)
-            relevant_contrib = RelevantMemoriesContributor()
-            prompt_builder.add(relevant_contrib)
             memory_present = bool(profile_contrib.render() or index_contrib.render())
 
             if enable_memory_recall or enable_memory_extract:
@@ -533,7 +551,6 @@ class AgentRuntime:
                 # explicit (usually cheaper) one is supplied.
                 side = memory_side_provider or provider
                 memory_manager = MemoryManager(
-                    relevant_contrib,
                     recall_provider=side if enable_memory_recall else None,
                     extract_provider=side if enable_memory_extract else None,
                     home=str(scope.memory_home),
@@ -777,6 +794,8 @@ class AgentRuntime:
         iterations = 0
         tool_calls_made = 0
         turn_tool_calls: list[ToolCall] = []
+        recall_attachment: Message | None = None
+        recall_anchor: int | None = None
         final_text = ""
         stop_reason = StopReason.FINAL_ANSWER
 
@@ -816,14 +835,24 @@ class AgentRuntime:
 
             iterations += 1
             # Recall collect point (non-blocking): if the background recall for
-            # this query has finished, inject it before building context.  On the
-            # first iteration it usually hasn't finished yet (side query takes
-            # longer than build); it lands on a later iteration after a tool
-            # round, mirroring Claude Code's prefetch/collect timing.
+            # this query has finished, create one transient user-context message
+            # at the current end of persisted history.  Its anchor never moves:
+            # later assistant/tool messages are appended after it, preserving
+            # chronology and a byte-stable cache prefix.  The attachment is only
+            # part of this turn's derived view and is never persisted.
+            recalled_block: str | None = None
             if self._memory_manager is not None:
-                self._memory_manager.collect_recall(session_id)
+                recalled_block = self._memory_manager.collect_recall(session_id)
             source = self._repository.list_messages(session_id)
-            api_messages = self._context.build(source)
+            if recalled_block and recall_attachment is None:
+                recall_attachment = Message(role=Role.USER, content=recalled_block)
+                recall_anchor = len(source)
+            model_source = _insert_transient_context(
+                source,
+                recall_attachment,
+                recall_anchor,
+            )
+            api_messages = self._context.build(model_source)
             if self._context_token_budget is not None:
                 # Compress the DERIVED view only; the source history is untouched.
                 api_messages = compress_context(

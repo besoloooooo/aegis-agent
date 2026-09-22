@@ -215,30 +215,6 @@ class MemoryIndexContributor:
         return f"{_MEMORY_INDEX_HEADER}\n\n{content.strip()}"
 
 
-class RelevantMemoriesContributor:
-    """Inject per-turn recalled memories into the system prompt.
-
-    Unlike the other contributors this one is *stateful*: the manager runs
-    recall before a turn and calls :meth:`set_block` with the rendered
-    ``Relevant memories`` text (or ``None`` to clear).  Because the system
-    prompt is rebuilt every model call, whatever is set here is what the current
-    turn sees; clearing it before the next turn keeps recall strictly per-turn
-    and never mutates the source history.
-    """
-
-    def __init__(self) -> None:
-        self._block: str | None = None
-
-    def set_block(self, block: str | None) -> None:
-        self._block = block if (block and block.strip()) else None
-
-    def clear(self) -> None:
-        self._block = None
-
-    def render(self) -> str | None:
-        return self._block
-
-
 def default_user_profile_contributor(
     home: str | Path | None = None,
 ) -> UserProfileContributor:
@@ -258,7 +234,6 @@ __all__ = [
     "MEMORY_BEHAVIOR_GUIDANCE_PROJECT",
     "MemoryBehaviorContributor",
     "MemoryIndexContributor",
-    "RelevantMemoriesContributor",
     "UserProfileContributor",
     "default_memory_index_contributor",
     "default_user_profile_contributor",
